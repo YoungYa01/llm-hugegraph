@@ -1,0 +1,16 @@
+services:
+  server:
+    image: hugegraph/hugegraph:1.7.0
+    container_name: server
+    ports:
+      - "8080:8080"
+    environment:
+      - PRELOAD=false
+
+  hubble:
+    image: hugegraph/hubble:1.7.0
+    container_name: hubble
+    ports:
+      - "8088:8088"
+    depends_on:
+      - server

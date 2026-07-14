@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LogSys Knowledge Graph</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <div>
+          <strong>LogSys Knowledge Graph</strong>
+          <em>系统架构知识图谱</em>
+        </div>
+      </div>
+      <div class="toolbar">
+        <label class="button primary" id="uploadLabel">
+          <input id="fileInput" type="file" accept=".txt,.md,.yaml,.yml" />
+          上传文件
+        </label>
+        <button id="refreshBtn" class="button" type="button">刷新</button>
+        <button id="fitBtn" class="button" type="button">居中</button>
+        <button id="clearBtn" class="button danger" type="button">清空</button>
+      </div>
+    </header>
+
+    <main class="graph-stage" id="graphStage">
+      <canvas id="graphCanvas"></canvas>
+      <div id="emptyState" class="empty-state">
+        <div class="empty-orbit"></div>
+        <h1>上传系统说明文件，生成知识图谱</h1>
+        <p>支持 .txt / .md / .yaml / .yml。图谱会直接展示在当前画布中。</p>
+      </div>
+      <div id="statusBar" class="status-bar">
+        <span id="statusPulse" class="status-pulse"></span>
+        <b id="statusText">正在连接图谱服务...</b>
+        <i id="statusMeta">—</i>
+      </div>
+      <div id="tooltip" class="tooltip hidden"></div>
+      <div id="detailPanel" class="detail-panel hidden">
+        <button id="detailClose" type="button">×</button>
+        <span id="detailKind" class="detail-kicker"></span>
+        <h2 id="detailTitle"></h2>
+        <p id="detailDesc"></p>
+        <dl id="detailMeta"></dl>
+      </div>
+      <div id="toast" class="toast hidden"></div>
+    </main>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>

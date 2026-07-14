@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+python-dotenv
+langchain-openai
+langchain-core
+json-repair
+pydantic

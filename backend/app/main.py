@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from urllib.parse import unquote
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,13 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from .analyzer import LLMAnalyzer
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
-from .models import GraphResponse
+from .log_integration import IncidentGraphIntegrator, LogFaultRunner
+from .models import EdgeDeleteRequest, EdgeUpsertRequest, GraphResponse, NodeUpdateRequest, NodeUpsertRequest
 from .service import GraphBuilderService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("logsys-kg-demo")
 
-app = FastAPI(title="LogSys Knowledge Graph Demo", version="5.0.0")
+app = FastAPI(title="LogSys Knowledge Graph Demo", version="6.0.0")
 settings = get_settings()
 
 app.add_middleware(
@@ -52,6 +54,11 @@ def health() -> dict:
         "llm_enabled": settings.llm_enabled,
         "llm_use_langchain_first": settings.llm_use_langchain_first,
         "llm_disable_env_proxy": settings.llm_disable_env_proxy,
+        "logfault": {
+            "project_path": settings.logfault_project_path,
+            "config_path": settings.logfault_config_path,
+            "output_root": settings.logfault_output_root,
+        },
         "hugegraph": {
             "host": settings.hugegraph_host,
             "port": settings.hugegraph_port,
@@ -115,14 +122,93 @@ async def import_file(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/api/incidents/import")
+async def import_incident_bundle(file: UploadFile = File(...)) -> dict:
+    logger.info("INCIDENT IMPORT START filename=%s content_type=%s", file.filename, file.content_type)
+    try:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory(prefix="logsys-upload-incident-") as temp:
+            path = Path(temp) / (file.filename or "incident_details.json")
+            path.write_bytes(await file.read())
+            result = IncidentGraphIntegrator().import_path(path, source_name=file.filename or "incident_upload")
+            graph = HugeGraphRestClient().read_graph(limit=1500)
+            return {"message": "incident_imported", **result.model_dump(), "graph": graph.model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("INCIDENT IMPORT FAILED filename=%s", file.filename)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/logs/analyze")
+async def analyze_logs(file: UploadFile = File(...), train_file: UploadFile | None = File(None)) -> dict:
+    logger.info("LOG ANALYZE START filename=%s train=%s", file.filename, train_file.filename if train_file else "-")
+    try:
+        result = await LogFaultRunner().analyze_upload(file=file, train_file=train_file)
+        graph = HugeGraphRestClient().read_graph(limit=1500)
+        return {"message": "log_analyzed", **result, "graph": graph.model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("LOG ANALYZE FAILED filename=%s", file.filename)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/graph", response_model=GraphResponse)
 def get_graph(limit: int = 800) -> GraphResponse:
-    # Page-load uses REST only and never calls /gremlin.
     try:
         client = HugeGraphRestClient()
         return client.read_graph(limit=max(1, min(limit, 5000)))
     except Exception as exc:  # noqa: BLE001
         return GraphResponse(nodes=[], edges=[], warnings=[str(exc)])
+
+
+@app.post("/api/nodes")
+def upsert_node(payload: NodeUpsertRequest) -> dict:
+    try:
+        client = HugeGraphRestClient()
+        result = client.upsert_node(**payload.model_dump())
+        return {"message": "node_saved", "node": result, "graph": client.read_graph(limit=1200).model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.put("/api/nodes/{name}")
+def update_node(name: str, payload: NodeUpdateRequest) -> dict:
+    try:
+        client = HugeGraphRestClient()
+        result = client.update_node_by_name(unquote(name), payload.model_dump(exclude_unset=True))
+        return {"message": "node_updated", "node": result, "graph": client.read_graph(limit=1200).model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/nodes/{name}")
+def delete_node(name: str) -> dict:
+    try:
+        client = HugeGraphRestClient()
+        deleted = client.delete_node_by_name(unquote(name))
+        return {"message": "node_deleted" if deleted else "node_not_found", "deleted": deleted, "graph": client.read_graph(limit=1200).model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/edges")
+def upsert_edge(payload: EdgeUpsertRequest) -> dict:
+    try:
+        client = HugeGraphRestClient()
+        result = client.add_edge_by_names(payload.source, payload.target, payload.type, payload.description, payload.meta)
+        return {"message": "edge_saved", "edge": result, "graph": client.read_graph(limit=1200).model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/edges/delete")
+def delete_edge(payload: EdgeDeleteRequest) -> dict:
+    try:
+        client = HugeGraphRestClient()
+        deleted = client.delete_edge_by_tuple(payload.source, payload.target, payload.type)
+        return {"message": "edge_deleted" if deleted else "edge_not_found", "deleted": deleted, "graph": client.read_graph(limit=1200).model_dump()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/clear")

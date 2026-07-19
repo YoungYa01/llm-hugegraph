@@ -67,8 +67,15 @@ class Settings:
     hugegraph_timeout_seconds: int = _int_env("HUGEGRAPH_TIMEOUT_SECONDS", 30)
 
     # Versioned schema names avoid collisions with earlier broken local attempts.
-    node_label: str = _env("HUGEGRAPH_NODE_LABEL", "LogSysKGNodeV5")
-    edge_label: str = _env("HUGEGRAPH_EDGE_LABEL", "LOGSYS_KG_RELATION_V5")
+    node_label: str = _env("HUGEGRAPH_NODE_LABEL", "LogSysKGNodeV6")
+    edge_label: str = _env("HUGEGRAPH_EDGE_LABEL", "LOGSYS_KG_RELATION_V6")
+
+
+    # Optional integration with the v1-goat sliding-window logfault package.
+    logfault_project_path: str = _env("LOGFAULT_PROJECT_PATH", "")
+    logfault_config_path: str = _env("LOGFAULT_CONFIG_PATH", "")
+    logfault_output_root: str = _env("LOGFAULT_OUTPUT_ROOT", "./runs/kg")
+    incident_timeline_limit: int = _int_env("INCIDENT_TIMELINE_LIMIT", 120)
 
     @property
     def llm_openai_base_url(self) -> str:

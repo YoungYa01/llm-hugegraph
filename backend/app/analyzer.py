@@ -18,7 +18,10 @@ from .config import get_settings
 from .models import ExtractedCall, ExtractedGraph, ExtractedNode
 
 
-ALLOWED_KINDS = {"System", "Layer", "Service", "Database", "Middleware", "Queue", "API", "Function", "Component"}
+ALLOWED_KINDS = {
+    "System", "Layer", "Service", "Database", "Middleware", "Queue", "API", "Function", "Component",
+    "Incident", "Trace", "LogEvent", "Exception", "Window", "Metric", "Host", "Pod",
+}
 ALLOWED_RELATIONS = {
     "CALLS",
     "USES_DB",
@@ -30,7 +33,10 @@ ALLOWED_RELATIONS = {
     "WRITES",
     "PUBLISHES",
     "SUBSCRIBES",
+    "HAS_TRACE", "HAS_EVENT", "OBSERVED_IN", "ROOT_CAUSE", "ROOT_SERVICE", "EMITS",
+    "CAUSES", "PROPAGATES_TO", "ERROR_PROPAGATES_TO", "TRIGGERED_BY", "AFFECTS",
 }
+
 
 SYSTEM_PROMPT = """
 你是系统架构知识图谱抽取器。禁止输出思考过程，只输出一个 JSON 对象。

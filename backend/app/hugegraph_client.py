@@ -15,16 +15,34 @@ class HugeGraphRestError(RuntimeError):
     pass
 
 
+def _json_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            data = json.loads(value)
+            return data if isinstance(data, dict) else {"value": data}
+        except Exception:
+            return {"text": value}
+    return {"value": value}
+
+
 class HugeGraphRestClient:
-    """HugeGraph REST API client, no Gremlin involved.
+    """HugeGraph REST API client used by the KG UI.
 
-    It supports both URL styles:
-    - HugeGraph 1.7+ graphspace: /graphspaces/DEFAULT/graphs/hugegraph
-    - legacy: /graphs/hugegraph
-
-    This class intentionally uses REST vertex/edge APIs like the referenced
-    logsys project's database.py, not /gremlin, so there are no g/__g_hugegraph
-    binding errors.
+    The class stays REST-only, because the referenced project already uses a
+    direct REST style and this avoids Gremlin binding/version problems. It also
+    adds small CRUD helpers so the UI can edit architecture and incident nodes.
     """
 
     def __init__(self) -> None:
@@ -38,6 +56,7 @@ class HugeGraphRestClient:
         self.session = requests.Session()
         self.session.trust_env = False
         self._base_url: str | None = None
+        self._schema_ready = False
 
         self.node_label = self.settings.node_label
         self.edge_label = self.settings.edge_label
@@ -47,9 +66,11 @@ class HugeGraphRestClient:
         self.pk_kind = "logsys_kg_kind"
         self.pk_desc = "logsys_kg_description"
         self.pk_source_file = "logsys_kg_source_file"
+        self.pk_meta = "logsys_kg_meta"
         self.pk_relation_key = "logsys_kg_relation_key"
         self.pk_relation_type = "logsys_kg_relation_type"
         self.pk_relation_desc = "logsys_kg_relation_desc"
+        self.pk_relation_meta = "logsys_kg_relation_meta"
 
     def base_candidates(self) -> list[str]:
         root = f"http://{self.host}:{self.port}"
@@ -186,32 +207,41 @@ class HugeGraphRestClient:
         existing = self._get_schema_item("edgelabels", self.edge_label)
         if not existing:
             return
-
         props = set(existing.get("properties") or [])
         sort_keys = set(existing.get("sort_keys") or existing.get("sortKeys") or [])
-        ok = self.pk_relation_key in props and self.pk_relation_key in sort_keys
+        ok = self.pk_relation_key in props and self.pk_relation_key in sort_keys and self.pk_relation_meta in props
         if ok:
             return
-
         old = self.edge_label
-        self.edge_label = f"{old}_V3_FIXED"
-        logs.append(
-            f"检测到旧边类型 {old} 缺少 sort_keys 或 relation_key，自动切换到新边类型 {self.edge_label}。"
-        )
+        self.edge_label = f"{old}_CRUD_FIXED"
+        logs.append(f"检测到旧边类型 {old} 缺少 relation_key/sort_keys/meta，自动切换到 {self.edge_label}。")
+
+    def _ensure_vertex_label_compatible_or_switch(self, logs: list[str]) -> None:
+        existing = self._get_schema_item("vertexlabels", self.node_label)
+        if not existing:
+            return
+        props = set(existing.get("properties") or [])
+        if self.pk_meta in props:
+            return
+        old = self.node_label
+        self.node_label = f"{old}_CRUD_FIXED"
+        logs.append(f"检测到旧点类型 {old} 缺少 meta 字段，自动切换到 {self.node_label}。")
 
     def ensure_schema(self) -> list[str]:
+        if self._schema_ready:
+            return []
         logs: list[str] = []
-
-        # 1) Property keys
         for name in [
             self.pk_name,
             self.pk_layer,
             self.pk_kind,
             self.pk_desc,
             self.pk_source_file,
+            self.pk_meta,
             self.pk_relation_key,
             self.pk_relation_type,
             self.pk_relation_desc,
+            self.pk_relation_meta,
         ]:
             logs.append(
                 self._post_schema_ignore_exists(
@@ -220,7 +250,7 @@ class HugeGraphRestClient:
                 )
             )
 
-        # 2) Vertex label
+        self._ensure_vertex_label_compatible_or_switch(logs)
         logs.append(
             self._post_schema_ignore_exists(
                 "schema/vertexlabels",
@@ -228,15 +258,12 @@ class HugeGraphRestClient:
                     "name": self.node_label,
                     "id_strategy": "PRIMARY_KEY",
                     "primary_keys": [self.pk_name],
-                    "properties": [self.pk_name, self.pk_layer, self.pk_kind, self.pk_desc, self.pk_source_file],
-                    "nullable_keys": [self.pk_layer, self.pk_kind, self.pk_desc, self.pk_source_file],
+                    "properties": [self.pk_name, self.pk_layer, self.pk_kind, self.pk_desc, self.pk_source_file, self.pk_meta],
+                    "nullable_keys": [self.pk_layer, self.pk_kind, self.pk_desc, self.pk_source_file, self.pk_meta],
                 },
             )
         )
 
-        # 3) Edge label. HugeGraph requires sort_keys for MULTIPLE edge labels.
-        # Earlier code omitted it, causing: EdgeLabel must contain sortKeys when
-        # the cardinality/frequency is multiple.
         self._ensure_edge_label_compatible_or_switch(logs)
         logs.append(
             self._post_schema_ignore_exists(
@@ -247,39 +274,26 @@ class HugeGraphRestClient:
                     "target_label": self.node_label,
                     "frequency": "MULTIPLE",
                     "sort_keys": [self.pk_relation_key],
-                    "properties": [self.pk_relation_key, self.pk_relation_type, self.pk_relation_desc],
-                    "nullable_keys": [self.pk_relation_desc],
+                    "properties": [self.pk_relation_key, self.pk_relation_type, self.pk_relation_desc, self.pk_relation_meta],
+                    "nullable_keys": [self.pk_relation_desc, self.pk_relation_meta],
                 },
             )
         )
 
-        # 4) Optional indexes. If a HugeGraph version rejects these or they
-        # already exist with another schema, skip; rendering does not depend on them.
         index_prefix = self._schema_safe_name(f"{self.node_label}_{self.edge_label}")
         for payload in [
-            {
-                "name": f"{index_prefix}_node_kind",
-                "base_type": "VERTEX_LABEL",
-                "base_value": self.node_label,
-                "index_type": "SECONDARY",
-                "fields": [self.pk_kind],
-            },
-            {
-                "name": f"{index_prefix}_edge_type",
-                "base_type": "EDGE_LABEL",
-                "base_value": self.edge_label,
-                "index_type": "SECONDARY",
-                "fields": [self.pk_relation_type],
-            },
+            {"name": f"{index_prefix}_node_kind", "base_type": "VERTEX_LABEL", "base_value": self.node_label, "index_type": "SECONDARY", "fields": [self.pk_kind]},
+            {"name": f"{index_prefix}_edge_type", "base_type": "EDGE_LABEL", "base_value": self.edge_label, "index_type": "SECONDARY", "fields": [self.pk_relation_type]},
         ]:
             try:
                 logs.append(self._post_schema_ignore_exists("schema/indexlabels", payload))
             except HugeGraphRestError as exc:
                 logs.append(f"skip optional index {payload['name']}: {exc}")
+        self._schema_ready = True
         return logs
 
-    def upsert_node(self, name: str, layer: str, kind: str, description: str, source_file: str) -> dict[str, Any]:
-        payload = {
+    def _node_payload(self, name: str, layer: str, kind: str, description: str, source_file: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
             "label": self.node_label,
             "properties": {
                 self.pk_name: name,
@@ -287,8 +301,21 @@ class HugeGraphRestClient:
                 self.pk_kind: kind or "Component",
                 self.pk_desc: description or "",
                 self.pk_source_file: source_file or "",
+                self.pk_meta: _json_text(meta or {}),
             },
         }
+
+    def upsert_node(
+        self,
+        name: str,
+        layer: str = "Component层",
+        kind: str = "Component",
+        description: str = "",
+        source_file: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_schema()
+        payload = self._node_payload(name, layer, kind, description, source_file, meta)
         try:
             return self._request("POST", "graph/vertices", json_body=payload, expected=(200, 201, 202))
         except HugeGraphRestError as exc:
@@ -296,8 +323,95 @@ class HugeGraphRestClient:
             if "exist" in msg or "duplicate" in msg or "already" in msg:
                 existing = self.find_node_by_name(name)
                 if existing:
-                    return existing
+                    return self.update_node_by_id(str(existing.get("id") or ""), name, layer, kind, description, source_file, meta)
             raise
+
+    def _encoded_id_candidates(self, vertex_id: str) -> list[str]:
+        if not vertex_id:
+            return []
+        candidates = [
+            urllib.parse.quote(vertex_id, safe=""),
+            urllib.parse.quote(json.dumps(vertex_id, ensure_ascii=False), safe=""),
+        ]
+        # HugeGraph primary-key id is often like 1:name. Some versions expect the
+        # quoted URL form exactly for string IDs.
+        if not (vertex_id.startswith('"') and vertex_id.endswith('"')):
+            candidates.append(urllib.parse.quote(f'"{vertex_id}"', safe=""))
+        deduped: list[str] = []
+        for item in candidates:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    def update_node_by_id(
+        self,
+        vertex_id: str,
+        name: str,
+        layer: str = "Component层",
+        kind: str = "Component",
+        description: str = "",
+        source_file: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._node_payload(name, layer, kind, description, source_file, meta)
+        # Do not try to update the primary key name when editing an existing id.
+        payload["properties"].pop(self.pk_name, None)
+        last_error: Exception | None = None
+        for encoded in self._encoded_id_candidates(vertex_id):
+            try:
+                return self._request("PUT", f"graph/vertices/{encoded}", params={"action": "append"}, json_body=payload, expected=(200, 201, 202))
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if last_error:
+            raise last_error
+        raise HugeGraphRestError("节点 id 为空，无法更新。")
+
+    def update_node_by_name(self, original_name: str, data: dict[str, Any]) -> dict[str, Any]:
+        self.ensure_schema()
+        existing = self.find_node_by_name(original_name)
+        if not existing:
+            raise HugeGraphRestError(f"未找到节点: {original_name}")
+        props = existing.get("properties", {}) or {}
+        name = str(data.get("name") or props.get(self.pk_name) or original_name)
+        if name != original_name:
+            # HugeGraph primary key cannot be changed in place. Create the new node,
+            # then keep the old node unless the caller explicitly deletes it.
+            return self.upsert_node(
+                name=name,
+                layer=str(data.get("layer") if data.get("layer") is not None else props.get(self.pk_layer) or "Component层"),
+                kind=str(data.get("kind") if data.get("kind") is not None else props.get(self.pk_kind) or "Component"),
+                description=str(data.get("description") if data.get("description") is not None else props.get(self.pk_desc) or ""),
+                source_file=str(data.get("source_file") if data.get("source_file") is not None else props.get(self.pk_source_file) or "manual"),
+                meta=data.get("meta") if data.get("meta") is not None else _json_dict(props.get(self.pk_meta)),
+            )
+        return self.update_node_by_id(
+            str(existing.get("id") or ""),
+            name=name,
+            layer=str(data.get("layer") if data.get("layer") is not None else props.get(self.pk_layer) or "Component层"),
+            kind=str(data.get("kind") if data.get("kind") is not None else props.get(self.pk_kind) or "Component"),
+            description=str(data.get("description") if data.get("description") is not None else props.get(self.pk_desc) or ""),
+            source_file=str(data.get("source_file") if data.get("source_file") is not None else props.get(self.pk_source_file) or "manual"),
+            meta=data.get("meta") if data.get("meta") is not None else _json_dict(props.get(self.pk_meta)),
+        )
+
+    def delete_node_by_name(self, name: str) -> bool:
+        self.ensure_schema()
+        existing = self.find_node_by_name(name)
+        if not existing:
+            return False
+        vertex_id = str(existing.get("id") or "")
+        # HugeGraph normally refuses deleting a vertex that still has adjacent
+        # edges. Remove incident KG edges first so the UI delete action works.
+        for edge in self.list_edges(limit=10000):
+            if str(edge.get("outV") or "") == vertex_id or str(edge.get("inV") or "") == vertex_id:
+                self.delete_edge_by_id(str(edge.get("id") or ""))
+        for encoded in self._encoded_id_candidates(vertex_id):
+            try:
+                self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
+                return True
+            except HugeGraphRestError:
+                continue
+        return False
 
     def find_node_by_name(self, name: str) -> dict[str, Any] | None:
         for vertex in self.list_vertices(limit=10000):
@@ -308,7 +422,15 @@ class HugeGraphRestClient:
     def _relation_key(self, source_id: str, target_id: str, relation_type: str) -> str:
         return f"{source_id}|{relation_type or 'CALLS'}|{target_id}"
 
-    def add_edge(self, source_id: str, target_id: str, relation_type: str, description: str) -> dict[str, Any]:
+    def add_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str = "CALLS",
+        description: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_schema()
         relation_key = self._relation_key(source_id, target_id, relation_type)
         payload = {
             "label": self.edge_label,
@@ -320,26 +442,67 @@ class HugeGraphRestClient:
                 self.pk_relation_key: relation_key,
                 self.pk_relation_type: relation_type or "CALLS",
                 self.pk_relation_desc: description or "",
+                self.pk_relation_meta: _json_text(meta or {}),
             },
         }
         try:
             return self._request("POST", "graph/edges", json_body=payload, expected=(200, 201, 202))
         except HugeGraphRestError as exc:
-            # Re-uploading the same file may create the same sorted edge. Treat it
-            # as idempotent for the demo.
             msg = str(exc).lower()
             if "exist" in msg or "duplicate" in msg or "already" in msg:
                 return {"id": "exists", "label": self.edge_label, "properties": payload["properties"]}
             raise
 
+    def add_edge_by_names(
+        self,
+        source_name: str,
+        target_name: str,
+        relation_type: str = "CALLS",
+        description: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_schema()
+        source = self.find_node_by_name(source_name)
+        target = self.find_node_by_name(target_name)
+        if not source:
+            source = self.upsert_node(source_name, "Component层", "Component", "自动创建的关系端点", "manual")
+        if not target:
+            target = self.upsert_node(target_name, "Component层", "Component", "自动创建的关系端点", "manual")
+        return self.add_edge(str(source.get("id") or ""), str(target.get("id") or ""), relation_type, description, meta)
+
+    def delete_edge_by_tuple(self, source_name: str, target_name: str, relation_type: str = "CALLS") -> bool:
+        self.ensure_schema()
+        for edge in self.list_edges(limit=10000):
+            props = edge.get("properties", {}) or {}
+            if str(props.get(self.pk_relation_type) or "CALLS") != relation_type:
+                continue
+            out_v = str(edge.get("outV") or "")
+            in_v = str(edge.get("inV") or "")
+            out_node = self._vertex_name_by_id(out_v)
+            in_node = self._vertex_name_by_id(in_v)
+            if out_node == source_name and in_node == target_name:
+                return self.delete_edge_by_id(str(edge.get("id") or ""))
+        return False
+
+    def delete_edge_by_id(self, edge_id: str) -> bool:
+        if not edge_id:
+            return False
+        encoded = urllib.parse.quote(edge_id, safe="")
+        try:
+            self._request("DELETE", f"graph/edges/{encoded}", expected=(200, 202, 204))
+            return True
+        except HugeGraphRestError:
+            return False
+
+    def _vertex_name_by_id(self, vertex_id: str) -> str:
+        for vertex in self.list_vertices(limit=10000):
+            if str(vertex.get("id") or "") == vertex_id:
+                return str((vertex.get("properties") or {}).get(self.pk_name) or vertex_id)
+        return vertex_id
+
     def list_vertices(self, limit: int = 800) -> list[dict[str, Any]]:
         try:
-            data = self._request(
-                "GET",
-                "graph/vertices",
-                params={"label": self.node_label, "limit": limit},
-                expected=(200,),
-            )
+            data = self._request("GET", "graph/vertices", params={"label": self.node_label, "limit": limit}, expected=(200,))
             if isinstance(data, dict):
                 return data.get("vertices", []) or []
             if isinstance(data, list):
@@ -352,12 +515,7 @@ class HugeGraphRestClient:
 
     def list_edges(self, limit: int = 1600) -> list[dict[str, Any]]:
         try:
-            data = self._request(
-                "GET",
-                "graph/edges",
-                params={"label": self.edge_label, "limit": limit},
-                expected=(200,),
-            )
+            data = self._request("GET", "graph/edges", params={"label": self.edge_label, "limit": limit}, expected=(200,))
             if isinstance(data, dict):
                 return data.get("edges", []) or []
             if isinstance(data, list):
@@ -372,7 +530,6 @@ class HugeGraphRestClient:
         self.ensure_schema()
         vertices = self.list_vertices(limit=limit)
         edges = self.list_edges(limit=limit * 2)
-
         id_to_name: dict[str, str] = {}
         nodes: list[GraphNode] = []
         for v in vertices:
@@ -387,6 +544,8 @@ class HugeGraphRestClient:
                     layer=str(props.get(self.pk_layer) or "Component层"),
                     kind=str(props.get(self.pk_kind) or "Component"),
                     description=str(props.get(self.pk_desc) or ""),
+                    source_file=str(props.get(self.pk_source_file) or ""),
+                    meta=_json_dict(props.get(self.pk_meta)),
                 )
             )
 
@@ -410,9 +569,9 @@ class HugeGraphRestClient:
                     target=target,
                     type=rel_type,
                     description=str(props.get(self.pk_relation_desc) or ""),
+                    meta=_json_dict(props.get(self.pk_relation_meta)),
                 )
             )
-
         return GraphResponse(nodes=nodes, edges=graph_edges)
 
     def clear_logsys_graph(self) -> dict[str, int]:
@@ -422,25 +581,15 @@ class HugeGraphRestClient:
             edge_id = str(edge.get("id") or "")
             if not edge_id:
                 continue
-            encoded = urllib.parse.quote(edge_id, safe="")
-            try:
-                self._request("DELETE", f"graph/edges/{encoded}", expected=(200, 202, 204))
+            if self.delete_edge_by_id(edge_id):
                 edge_count += 1
-            except HugeGraphRestError:
-                pass
 
         vertex_count = 0
         for vertex in self.list_vertices(limit=10000):
             vertex_id = str(vertex.get("id") or "")
             if not vertex_id:
                 continue
-            # HugeGraph vertex id for primary-key labels is a JSON-like string in
-            # many versions; try both raw and JSON-encoded URL variants.
-            encoded_candidates = [
-                urllib.parse.quote(vertex_id, safe=""),
-                urllib.parse.quote(json.dumps(vertex_id, ensure_ascii=False), safe=""),
-            ]
-            for encoded in encoded_candidates:
+            for encoded in self._encoded_id_candidates(vertex_id):
                 try:
                     self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
                     vertex_count += 1

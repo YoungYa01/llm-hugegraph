@@ -134,6 +134,7 @@ class RootCauseHypothesis:
     evidence: list[str]
     reasons: list[str]
     missing_evidence: list[str]
+    validation_suggestions: list[dict[str, Any]] = field(default_factory=list)
     architecture_node: bool = True
 
     def model_dump(self) -> dict[str, Any]:
@@ -619,6 +620,13 @@ class RootCauseEngine:
         evidence = [signal.evidence] if signal.evidence else []
         if item.get("direct_endpoint"):
             evidence.append(f"直接目标标识：{item['direct_endpoint']}")
+        validation_suggestions = self._validation_suggestions(
+            node=node,
+            signal=signal,
+            chain=chain,
+            missing_evidence=missing,
+            direct_endpoint=str(item.get("direct_endpoint") or ""),
+        )
         return RootCauseHypothesis(
             rank=rank,
             candidate=node.name,
@@ -632,8 +640,157 @@ class RootCauseEngine:
             evidence=list(dict.fromkeys(filter(None, evidence))),
             reasons=list(dict.fromkeys(item["reasons"])),
             missing_evidence=list(dict.fromkeys(missing)),
+            validation_suggestions=validation_suggestions,
             architecture_node=bool(item.get("architecture_node", True)),
         )
+
+    def _validation_suggestions(
+        self,
+        *,
+        node: ArchitectureNode,
+        signal: FaultSignal,
+        chain: list[str],
+        missing_evidence: list[str],
+        direct_endpoint: str,
+    ) -> list[dict[str, Any]]:
+        """Return manual validation runbook steps for the current hypothesis.
+
+        These are deliberately suggestions, not executable probes.  The system
+        has not been granted credentials for Redis, databases, Kubernetes or
+        metrics backends, so every step is labelled as manual.
+        """
+        suggestions: list[dict[str, Any]] = []
+
+        def add(
+            check_id: str,
+            title: str,
+            priority: str,
+            evidence_type: str,
+            reason: str,
+            manual_command_hint: str = "",
+        ) -> None:
+            suggestions.append(
+                {
+                    "check_id": check_id,
+                    "title": title,
+                    "priority": priority,
+                    "target": node.name,
+                    "target_kind": node.kind,
+                    "fault_mode": signal.fault_mode,
+                    "evidence_type": evidence_type,
+                    "execution_mode": "manual",
+                    "reason": reason,
+                    "manual_command_hint": manual_command_hint,
+                    "chain_context": chain,
+                }
+            )
+
+        if signal.fault_mode == "REDIS_TIMEOUT":
+            add(
+                "redis_latency",
+                "确认 Redis 是否存在高延迟或慢命令",
+                "high",
+                "redis_health",
+                "当前日志能证明 Redis 依赖超时，但不能区分 Redis 慢、网络慢或客户端连接池耗尽。",
+                "redis-cli --latency；redis-cli SLOWLOG GET 20；检查 Redis INFO commandstats/latencystats",
+            )
+            add(
+                "client_pool_exhaustion",
+                "检查调用方 Redis 连接池和线程池是否耗尽",
+                "high",
+                "client_runtime",
+                "超时可能发生在调用方排队、连接池不足或线程池阻塞阶段。",
+                "检查应用 Hikari/Lettuce/Jedis pool 指标、线程池队列、GC pause 和超时配置",
+            )
+            add(
+                "network_path_latency",
+                "检查服务到 Redis 的网络延迟和丢包",
+                "medium",
+                "network",
+                "拓扑链路显示故障可能沿依赖路径传播，需要确认链路本身是否异常。",
+                "从调用方节点执行 ping/mtr/tcping 到 Redis endpoint，并核对同时间段网络监控",
+            )
+        elif signal.fault_mode == "REDIS_UNREACHABLE":
+            add(
+                "redis_endpoint_reachability",
+                "确认目标 Redis endpoint 是否可连接",
+                "high",
+                "endpoint_reachability",
+                "日志包含连接不可达/拒绝信号，应优先验证目标实例或集群入口是否仍在监听。",
+                f"redis-cli -h <host> -p <port> PING；nc -vz <host> <port>{f'；日志命中 {direct_endpoint}' if direct_endpoint else ''}",
+            )
+            add(
+                "redis_cluster_state",
+                "检查 Redis Sentinel/Cluster 和实例进程状态",
+                "high",
+                "redis_health",
+                "连接被拒绝可能来自实例宕机、主从切换、槽位迁移或服务端口未监听。",
+                "redis-cli CLUSTER INFO；redis-cli SENTINEL masters；systemctl/docker/kubectl 查看实例状态",
+            )
+        elif signal.fault_mode in {"DATABASE_FAILURE", "DATABASE_UNREACHABLE"}:
+            add(
+                "database_connectivity",
+                "确认数据库 endpoint、连接数和慢查询状态",
+                "high",
+                "database_health",
+                "数据库类异常需要区分不可达、连接池耗尽、锁等待和慢查询。",
+                "检查 DB 连接数、slow query、lock wait、主从延迟和应用连接池指标",
+            )
+        elif signal.fault_mode == "MESSAGE_BROKER_FAILURE":
+            add(
+                "broker_health",
+                "确认消息中间件 broker、分区和消费积压状态",
+                "high",
+                "broker_health",
+                "消息中间件异常需要核查 broker 可用性、队列积压和客户端连接状态。",
+                "检查 Kafka/RabbitMQ/RocketMQ broker 状态、consumer lag、连接数和错误日志",
+            )
+        elif signal.fault_mode == "DEPENDENCY_FAILURE":
+            add(
+                "dependency_reachability",
+                "确认下游依赖的健康状态和网络连通性",
+                "high",
+                "dependency_health",
+                "日志只暴露通用超时/连接异常，需要沿图谱链路逐跳确认依赖是否可用。",
+                "按 RCA 链路从调用方到候选依赖逐跳执行健康检查、端口连通性和错误日志核对",
+            )
+        else:
+            add(
+                "application_error_context",
+                "补充应用异常上下文和近期变更信息",
+                "medium",
+                "application_context",
+                "当前异常尚未识别为明确的基础设施依赖故障，需要先确认代码、配置或发布变更。",
+                "核对同时间段发布记录、配置变更、应用 ERROR 日志、线程栈和业务错误码",
+            )
+
+        if not direct_endpoint and (
+            node.kind in {"Cluster", "Cache", "Database", "Middleware", "Queue"}
+            or any("host/IP/port" in item for item in missing_evidence)
+        ):
+            add(
+                "endpoint_identity",
+                "补充候选组件的具体 host/IP/port 或实例健康证据",
+                "high",
+                "endpoint_identity",
+                "当前候选还停留在组件/集群级，缺少能确认具体实例的直接标识。",
+                "在架构图 meta 中补充 host/ip/port/endpoints，并核对日志是否出现目标 endpoint",
+            )
+
+        if chain and len(chain) > 1:
+            add(
+                "propagation_chain_check",
+                "沿 RCA 链路核对上游是否为传播影响",
+                "medium",
+                "topology_propagation",
+                "需要确认链路上游错误是由候选根因传播导致，而不是独立故障。",
+                "按链路顺序核对 trace、时间线、调用错误码和上游服务健康状态",
+            )
+
+        deduped: dict[str, dict[str, Any]] = {}
+        for suggestion in suggestions:
+            deduped.setdefault(str(suggestion["check_id"]), suggestion)
+        return list(deduped.values())
 
     def _causal_path(self, path: tuple[list[str], list[str]] | None) -> tuple[list[str], list[dict[str, str]]]:
         if not path:

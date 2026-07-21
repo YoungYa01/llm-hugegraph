@@ -75,6 +75,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           <section class="card"><div class="card-header"><div><h2>为什么指向这个候选</h2><p>评分由日志故障特征、实体/端点命中与图距离共同构成。</p></div></div><div class="card-body">
             <h3>评分依据</h3>${listHtml(top.reasons, "暂时没有可展示的评分依据。")}
             <h3 style="margin-top:20px">直接证据</h3>${listHtml(top.evidence, detail.root_evidence || "没有独立的结构化证据。")}
+            <h3 style="margin-top:20px">建议验证项</h3>${validationSuggestionsHtml(top.validation_suggestions || [])}
             ${top.missing_evidence?.length ? `<h3 style="margin-top:20px">仍需补充的证据</h3><div class="notice notice-warning">${top.missing_evidence.map((item) => `<p style="margin:0 0 7px">• ${escapeHtml(item)}</p>`).join("")}</div>` : ""}
           </div></section>
           <section class="card"><div class="card-header"><div><h2>日志错误时间线</h2><p>时间相邻只表示先后顺序；长时间线可按需展开。</p></div></div><div class="card-body">${timelineHtml(detail.timeline || [])}</div></section>
@@ -174,6 +175,17 @@ function stepsHtml(steps) {
 function listHtml(items, fallback) {
   const values = items?.length ? items : [fallback];
   return `<ul class="evidence-list">${values.map((item) => `<li class="evidence-item">${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function validationSuggestionsHtml(items) {
+  if (!items.length) return `<p style="color:var(--ink-500)">当前候选暂未生成验证建议。</p>`;
+  return `<div class="timeline">${items.map((item) => `
+    <div class="timeline-item">
+      <time>${escapeHtml((item.priority || "medium").toUpperCase())} · ${escapeHtml(item.evidence_type || "evidence")} · ${escapeHtml(item.execution_mode || "manual")}</time>
+      <p><strong>${escapeHtml(item.title || item.check_id || "验证项")}</strong></p>
+      <p>${escapeHtml(item.reason || "")}</p>
+      ${item.manual_command_hint ? `<small style="color:var(--ink-500)">${escapeHtml(item.manual_command_hint)}</small>` : ""}
+    </div>`).join("")}</div>`;
 }
 
 function timelineHtml(items) {

@@ -19,8 +19,9 @@ from .models import ExtractedCall, ExtractedGraph, ExtractedNode
 
 
 ALLOWED_KINDS = {
-    "System", "Layer", "Service", "Database", "Middleware", "Queue", "API", "Function", "Component",
-    "Incident", "Trace", "LogEvent", "Exception", "Window", "Metric", "Host", "Pod",
+    "System", "Layer", "Service", "Database", "Cache", "Middleware", "Queue", "API", "Function", "Component",
+    "Cluster", "Instance", "Incident", "Trace", "LogEvent", "Exception", "Window", "Metric", "Host", "Pod",
+    "RCAHypothesis", "UnresolvedDependency",
 }
 ALLOWED_RELATIONS = {
     "CALLS",
@@ -33,21 +34,36 @@ ALLOWED_RELATIONS = {
     "WRITES",
     "PUBLISHES",
     "SUBSCRIBES",
+    "HAS_MEMBER",
+    "RUNS_ON",
+    "CONNECTS_TO",
     "HAS_TRACE", "HAS_EVENT", "OBSERVED_IN", "ROOT_CAUSE", "ROOT_SERVICE", "EMITS",
     "CAUSES", "PROPAGATES_TO", "ERROR_PROPAGATES_TO", "TRIGGERED_BY", "AFFECTS",
+    "OBSERVED_AT", "HAS_EXCEPTION", "HAS_HYPOTHESIS", "CANDIDATE_CAUSE", "SUSPECTED_ROOT_CAUSE",
+    "SUPPORTED_BY", "TEMPORALLY_PRECEDES", "CO_OCCURS_IN_TRACE",
 }
+
+
+def _list_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)] if str(value).strip() else []
 
 
 SYSTEM_PROMPT = """
 你是系统架构知识图谱抽取器。禁止输出思考过程，只输出一个 JSON 对象。
 
 JSON 格式固定为：
-{"services":[{"name":"节点名","layer":"层级","kind":"Service|Database|Middleware|Queue|API|Function|Layer|System|Component","description":"描述"}],"calls":[{"source":"起点节点名","target":"终点节点名","type":"CALLS|USES_DB|CONTAINS|BELONGS_TO_LAYER|PROVIDES|DEPENDS_ON|READS|WRITES|PUBLISHES|SUBSCRIBES","description":"描述"}]}
+{"services":[{"name":"节点名","layer":"层级","kind":"Service|Database|Cache|Middleware|Queue|API|Function|Layer|System|Component|Cluster|Instance|Host|Pod","description":"描述","meta":{"aliases":[],"host":"","port":""}}],"calls":[{"source":"起点节点名","target":"终点节点名","type":"CALLS|USES_DB|CONTAINS|BELONGS_TO_LAYER|PROVIDES|DEPENDS_ON|READS|WRITES|PUBLISHES|SUBSCRIBES|HAS_MEMBER|RUNS_ON|CONNECTS_TO","description":"描述","meta":{}}]}
 
 规则：
 1. 文档里的系统、层、服务、数据库、中间件、队列、接口、功能都要作为 services 节点。
 2. calls 中的 source 和 target 必须能在 services 里找到。
-3. 不要 Markdown，不要代码块，不要解释，不要 <think>。
+3. 集群和实例必须分开建模，例如“Redis集群 -HAS_MEMBER-> redis-1”；服务依赖基础设施用 DEPENDS_ON。
+4. 文档给出别名、主机名、IP、端口时放入 meta；未给出的信息禁止猜测。
+5. 不要 Markdown，不要代码块，不要解释，不要 <think>。
 """.strip()
 
 
@@ -388,6 +404,7 @@ class LLMAnalyzer:
                 layer=str(item.get("layer") or item.get("layer_type") or "Component层").strip() or "Component层",
                 kind=self._safe_kind(str(item.get("kind") or item.get("type") or "Component")),
                 description=str(item.get("description") or item.get("desc") or "").strip(),
+                meta=item.get("meta") if isinstance(item.get("meta"), dict) else {},
             )
 
         calls: list[ExtractedCall] = []
@@ -408,6 +425,7 @@ class LLMAnalyzer:
                     target=target,
                     type=self._safe_relation(str(item.get("type") or item.get("relation_type") or "CALLS")),
                     description=str(item.get("description") or item.get("desc") or "").strip(),
+                    meta=item.get("meta") if isinstance(item.get("meta"), dict) else {},
                 )
             )
 
@@ -440,11 +458,17 @@ class LLMAnalyzer:
 
 
 class RuleBasedArchitectureExtractor:
-    SERVICE_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z0-9_\-]+服务")
+    SERVICE_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z0-9_\-]+服务(?!名)")
     DB_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z0-9_\-]+(?:数据库|DB|db)")
     LAYER_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z0-9_\-]+层")
     API_RE = re.compile(r"(?:API\s*Gateway|API网关|网关|[A-Za-z0-9_\-/]+API)", re.IGNORECASE)
-    QUEUE_RE = re.compile(r"Kafka|RabbitMQ|RocketMQ|Redis|MQ|消息队列", re.IGNORECASE)
+    QUEUE_RE = re.compile(r"Kafka|RabbitMQ|RocketMQ|MQ|消息队列", re.IGNORECASE)
+    CACHE_RE = re.compile(
+        r"(?:Redis|Memcached)[\u4e00-\u9fa5A-Za-z0-9_-]{0,12}?(?:集群|Cluster|缓存)|"
+        r"\b(?:Redis|Memcached)\b(?![-_](?:node[-_]?)?\d)",
+        re.IGNORECASE,
+    )
+    INSTANCE_RE = re.compile(r"(?:redis|Redis)(?:[-_](?:node[-_]?)?|节点[-_]?)\d+", re.IGNORECASE)
     MIDDLEWARE_RE = re.compile(r"Nacos|Consul|Etcd|ElasticSearch|Elasticsearch|ES|Zookeeper|ZooKeeper", re.IGNORECASE)
 
     def extract(self, text: str) -> ExtractedGraph:
@@ -457,9 +481,11 @@ class RuleBasedArchitectureExtractor:
         self._extract_common_nodes()
         self._extract_contains_relations()
         self._extract_service_db_relations()
+        self._extract_dependency_relations()
         self._extract_call_relations()
         self._extract_queue_relations()
         self._extract_function_relations()
+        self._extract_metadata()
 
         if not self.nodes:
             title = self._guess_document_title(text)
@@ -471,7 +497,14 @@ class RuleBasedArchitectureExtractor:
         m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9_\-]{2,40}系统)", text)
         return m.group(1) if m else "系统"
 
-    def _add_node(self, name: str, layer: str, kind: str, description: str = "") -> None:
+    def _add_node(
+        self,
+        name: str,
+        layer: str,
+        kind: str,
+        description: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         name = self._clean_name(name)
         if not name:
             return
@@ -484,9 +517,16 @@ class RuleBasedArchitectureExtractor:
                 layer=old.layer if old.layer != "Component层" else layer,
                 kind=old.kind if old.kind != "Component" else kind,
                 description=old.description or description,
+                meta={**(meta or {}), **old.meta},
             )
         else:
-            self.nodes[name] = ExtractedNode(name=name, layer=layer, kind=kind, description=description or "")
+            self.nodes[name] = ExtractedNode(
+                name=name,
+                layer=layer,
+                kind=kind,
+                description=description or "",
+                meta=meta or {},
+            )
 
     def _add_edge(self, source: str, target: str, rel_type: str, description: str = "") -> None:
         source = self._clean_name(source)
@@ -533,6 +573,14 @@ class RuleBasedArchitectureExtractor:
             name = self._normalize_entity(raw, "Queue")
             if name:
                 self._add_node(name, "中间件层", "Queue")
+        for raw in sorted(set(self.CACHE_RE.findall(self.text)), key=len):
+            name = self._normalize_entity(raw, "Cache")
+            if name:
+                self._add_node(name, "数据层", self._infer_kind(name))
+        for raw in sorted(set(self.INSTANCE_RE.findall(self.text)), key=len):
+            name = self._normalize_entity(raw, "Instance")
+            if name:
+                self._add_node(name, "基础设施层", "Instance")
         for raw in sorted(set(self.MIDDLEWARE_RE.findall(self.text)), key=len):
             name = self._normalize_entity(raw, "Middleware")
             if name:
@@ -546,7 +594,7 @@ class RuleBasedArchitectureExtractor:
 
     def _extract_contains_relations(self) -> None:
         for sentence in self.sentences:
-            m = re.search(r"(.{1,30}?(?:系统|层|服务))\s*(?:包含|包括|由)\s*(.+?)(?:组成|构成)?$", sentence)
+            m = re.search(r"(.{1,30}?(?:系统|层|服务|集群|缓存|数据库|中间件))\s*(?:包含|包括|由)\s*(.+?)(?:组成|构成)?$", sentence)
             if not m:
                 continue
             parent = self._clean_name(m.group(1))
@@ -557,7 +605,8 @@ class RuleBasedArchitectureExtractor:
                 if not item or item in {"和", "以及"}:
                     continue
                 self._add_node(item, self._default_layer(self._infer_kind(item)), self._infer_kind(item))
-                self._add_edge(parent, item, "CONTAINS", f"{parent} 包含 {item}")
+                relation = "HAS_MEMBER" if self._infer_kind(parent) == "Cluster" and self._infer_kind(item) in {"Instance", "Host", "Pod"} else "CONTAINS"
+                self._add_edge(parent, item, relation, f"{parent} 包含 {item}")
 
     def _extract_service_db_relations(self) -> None:
         for sentence in self.sentences:
@@ -577,6 +626,32 @@ class RuleBasedArchitectureExtractor:
             for source in sources[:1]:
                 for db in dbs:
                     self._add_edge(source, db, relation, sentence)
+
+    def _extract_dependency_relations(self) -> None:
+        verbs = r"依赖|连接|访问|使用|查询|读写|读取|写入|缓存到|存储到"
+        for sentence in self.sentences:
+            if not re.search(verbs, sentence):
+                continue
+            sources = [self._normalize_entity(x, "Service") for x in self.SERVICE_RE.findall(sentence)]
+            sources = [item for item in sources if item]
+            if not sources:
+                continue
+            targets: list[str] = []
+            for regex, kind in [
+                (self.CACHE_RE, "Cache"),
+                (self.QUEUE_RE, "Queue"),
+                (self.MIDDLEWARE_RE, "Middleware"),
+            ]:
+                targets.extend(self._normalize_entity(item, kind) for item in regex.findall(sentence))
+            targets = [item for item in targets if item and item not in sources]
+            relation = "DEPENDS_ON"
+            if "读取" in sentence or "查询" in sentence:
+                relation = "READS"
+            elif "写入" in sentence or "存储" in sentence:
+                relation = "WRITES"
+            for target in dict.fromkeys(targets):
+                self._add_node(target, self._default_layer(self._infer_kind(target)), self._infer_kind(target))
+                self._add_edge(sources[0], target, relation, sentence)
 
     def _extract_call_relations(self) -> None:
         verbs = r"调用|请求|访问|依赖|对接|连接|校验"
@@ -628,6 +703,59 @@ class RuleBasedArchitectureExtractor:
                 self._add_node(fn, "功能层", "Function")
                 self._add_edge(service, fn, "PROVIDES", sentence)
 
+    def _extract_metadata(self) -> None:
+        # Deterministic fallback for the identifiers most useful to log/KG
+        # entity resolution.  It only copies values explicitly present in the
+        # document and never invents addresses or aliases.
+        alias_pattern = re.compile(
+            r"(?P<name>[\u4e00-\u9fa5A-Za-z0-9_-]+服务)[^。；;\n]{0,60}?"
+            r"(?:日志服务名|serviceName|别名|alias)(?:（serviceName）)?\s*(?:为|是|[=:：])?\s*`?"
+            r"(?P<alias>[A-Za-z][A-Za-z0-9_.-]+)",
+            re.IGNORECASE,
+        )
+        for match in alias_pattern.finditer(self.text):
+            name = self._normalize_entity(match.group("name"), "Service")
+            if name in self.nodes:
+                self._merge_meta(name, {"aliases": [match.group("alias")]})
+
+        for name in list(self.nodes):
+            if self.nodes[name].kind not in {"Instance", "Host", "Pod", "Cluster", "Cache", "Database"}:
+                continue
+            meta: dict[str, Any] = {}
+            for segment_match in re.finditer(
+                re.escape(name) + r"(?![A-Za-z0-9_-])(?P<meta>[^。；;\n]{0,160})",
+                self.text,
+                re.IGNORECASE,
+            ):
+                segment = segment_match.group("meta")
+                for key, pattern in {
+                    "host": r"(?i)\bhost(?:name)?\s*[=:：]\s*([A-Za-z0-9_.-]+)",
+                    "ip": r"(?i)\bip\s*[=:：]\s*((?:\d{1,3}\.){3}\d{1,3})",
+                    "port": r"(?i)\bport\s*[=:：]\s*(\d{2,5})",
+                }.items():
+                    found = re.search(pattern, segment)
+                    if found:
+                        meta[key] = int(found.group(1)) if key == "port" else found.group(1)
+            if meta:
+                self._merge_meta(name, meta)
+
+    def _merge_meta(self, name: str, meta: dict[str, Any]) -> None:
+        old = self.nodes[name]
+        merged = dict(old.meta)
+        for key, value in meta.items():
+            if key == "aliases":
+                merged[key] = list(dict.fromkeys([*_list_values(merged.get(key)), *_list_values(value)]))
+            else:
+                merged[key] = value
+        self.nodes[name] = ExtractedNode(
+            name=old.name,
+            layer=old.layer,
+            kind=old.kind,
+            description=old.description,
+            source_file=old.source_file,
+            meta=merged,
+        )
+
     def _split_items(self, text: str) -> list[str]:
         text = re.sub(r"等(?:信息|组件|服务|功能)?", "", text)
         text = text.replace("以及", "、").replace("和", "、").replace("并", "、")
@@ -666,13 +794,16 @@ class RuleBasedArchitectureExtractor:
 
     def _clean_name(self, value: str) -> str:
         value = str(value or "").strip()
+        value = re.sub(r"^(?:[-*+>#]+\s*)+", "", value)
         value = re.sub(r"^[的和及与并、,，\s]+", "", value)
         value = re.sub(r"[的和及与并、,，\s]+$", "", value)
         value = re.sub(r"^(包含|包括|由|负责|提供)", "", value)
         value = re.sub(r"(?:组成|构成)$", "", value)
+        value = re.sub(r"\s*[一二三四五六七八九十\d]+个实例$", "", value)
         return value.strip(" ：:。；;\t\r\n")[:80]
 
     def _infer_kind(self, name: str) -> str:
+        lowered = name.lower()
         if name.endswith("系统"):
             return "System"
         if name.endswith("层"):
@@ -681,6 +812,16 @@ class RuleBasedArchitectureExtractor:
             return "Service"
         if name.endswith("数据库") or name.lower().endswith("db"):
             return "Database"
+        if "redis" in lowered and ("集群" in name or "cluster" in lowered):
+            return "Cluster"
+        if self.INSTANCE_RE.fullmatch(name):
+            return "Instance"
+        if "redis" in lowered or "memcached" in lowered:
+            return "Cache"
+        if name.endswith("集群") or lowered.endswith("cluster"):
+            return "Cluster"
+        if name.endswith("节点") or name.endswith("实例"):
+            return "Instance"
         if re.search(self.QUEUE_RE, name):
             return "Queue"
         if re.search(self.MIDDLEWARE_RE, name):
@@ -697,6 +838,11 @@ class RuleBasedArchitectureExtractor:
             "Layer": "系统层",
             "Service": "业务服务层",
             "Database": "数据层",
+            "Cache": "数据层",
+            "Cluster": "基础设施层",
+            "Instance": "基础设施层",
+            "Host": "基础设施层",
+            "Pod": "基础设施层",
             "Queue": "中间件层",
             "Middleware": "中间件层",
             "API": "网关层",

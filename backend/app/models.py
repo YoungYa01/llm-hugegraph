@@ -82,3 +82,14 @@ class EdgeDeleteRequest(BaseModel):
     source: str
     target: str
     type: str = "CALLS"
+
+
+class EdgeUpdateRequest(BaseModel):
+    original_source: str
+    original_target: str
+    original_type: str = "CALLS"
+    source: str
+    target: str
+    type: str = "CALLS"
+    description: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)

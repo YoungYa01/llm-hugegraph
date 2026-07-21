@@ -1,0 +1,11 @@
+{
+  "name": "LogScope RCA",
+  "version": "2026.07.21-r2",
+  "frontend": "frontend-system",
+  "features": [
+    "architecture-node-edge-crud",
+    "log-batch-delete",
+    "incident-fusion-graph",
+    "collapsible-long-chain"
+  ]
+}

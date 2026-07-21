@@ -5,11 +5,10 @@ import importlib
 import json
 import os
 import re
-import shutil
 import sys
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +16,7 @@ from fastapi import UploadFile
 
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
+from .rca_engine import RootCauseAnalysis, RootCauseEngine
 
 
 @dataclass
@@ -25,6 +25,7 @@ class IncidentImportResult:
     nodes_written: int
     edges_written: int
     logs: list[str]
+    rca: list[dict[str, Any]] = field(default_factory=list)
 
     def model_dump(self) -> dict[str, Any]:
         return {
@@ -32,6 +33,7 @@ class IncidentImportResult:
             "nodes_written": self.nodes_written,
             "edges_written": self.edges_written,
             "logs": self.logs,
+            "rca": self.rca,
         }
 
 
@@ -50,15 +52,22 @@ class IncidentGraphIntegrator:
         self.logs: list[str] = []
         self.nodes_written = 0
         self.edges_written = 0
+        self.rca_results: list[dict[str, Any]] = []
+        self._known_nodes: dict[str, dict[str, Any]] = {}
 
-    def import_path(self, path: str | Path, source_name: str = "") -> IncidentImportResult:
+    def import_path(
+        self,
+        path: str | Path,
+        source_name: str = "",
+        incident_prefix: str = "",
+    ) -> IncidentImportResult:
         source = Path(path)
         cleanup: tempfile.TemporaryDirectory[str] | None = None
         try:
             if source.is_file() and source.suffix.lower() == ".zip":
                 cleanup = tempfile.TemporaryDirectory(prefix="logsys-incident-")
                 with zipfile.ZipFile(source) as zf:
-                    zf.extractall(cleanup.name)
+                    self._safe_extract_zip(zf, Path(cleanup.name))
                 root = Path(cleanup.name)
             elif source.is_dir():
                 root = source
@@ -96,11 +105,41 @@ class IncidentGraphIntegrator:
             if not details:
                 raise ValueError("没有找到 incident_details.json / incidents.csv / events.csv，无法导入异常链路。")
 
+            # The algorithm restarts identifiers (I00001, I00002...) for every
+            # run. Namespace them before writing to one project's shared graph.
+            if incident_prefix:
+                namespaced: list[dict[str, Any]] = []
+                for detail in details:
+                    item = dict(detail)
+                    original = str(item.get("incident_id") or "I00000")
+                    item["source_incident_id"] = original
+                    item["incident_id"] = f"{incident_prefix}:{original}"
+                    namespaced.append(item)
+                details = namespaced
+
             self._import_details(details, source_name or source.name)
-            return IncidentImportResult(len(details), self.nodes_written, self.edges_written, self.logs)
+            return IncidentImportResult(
+                len(details),
+                self.nodes_written,
+                self.edges_written,
+                self.logs,
+                self.rca_results,
+            )
         finally:
             if cleanup is not None:
                 cleanup.cleanup()
+
+    def _safe_extract_zip(self, archive: zipfile.ZipFile, destination: Path) -> None:
+        root = destination.resolve()
+        infos = archive.infolist()
+        max_bytes = max(1, self.settings.max_upload_mb) * 5 * 1024 * 1024
+        if len(infos) > 10_000 or sum(item.file_size for item in infos) > max_bytes:
+            raise ValueError("ZIP 解压后的文件数量或总体积超过安全限制。")
+        for item in infos:
+            target = (root / item.filename).resolve()
+            if not target.is_relative_to(root):
+                raise ValueError("ZIP 包含不安全的目录路径。")
+            archive.extract(item, root)
 
     def _find_first(self, root: Path, filename: str) -> Path | None:
         if root.is_file() and root.name == filename:
@@ -182,14 +221,48 @@ class IncidentGraphIntegrator:
 
     def _import_details(self, details: list[dict[str, Any]], source_name: str) -> None:
         self.db.ensure_schema()
+        architecture = self.db.read_graph(limit=5000)
+        self._known_nodes = {
+            node.name: {
+                "kind": node.kind,
+                "layer": node.layer,
+                "description": node.description,
+                "meta": node.meta,
+            }
+            for node in architecture.nodes
+        }
+        rca_engine = RootCauseEngine(architecture)
         for detail in details:
-            self._import_one(detail, source_name)
+            rca = rca_engine.analyze(detail, top_k=max(1, min(self.settings.rca_top_k, 20)))
+            self.rca_results.append(rca.model_dump())
+            self._import_one(detail, source_name, rca)
 
-    def _write_node(self, name: str, layer: str, kind: str, description: str = "", source_file: str = "", meta: dict[str, Any] | None = None) -> None:
+    def _write_node(
+        self,
+        name: str,
+        layer: str,
+        kind: str,
+        description: str = "",
+        source_file: str = "",
+        meta: dict[str, Any] | None = None,
+        *,
+        preserve_existing: bool = False,
+    ) -> None:
         if not name:
+            return
+        # Architecture nodes are curated by the LLM + human workflow.  Incident
+        # import may link to them, but must never replace their kind, description
+        # or aliases with the generic "异常链路关联到的服务" payload.
+        if preserve_existing and name in self._known_nodes:
             return
         self.db.upsert_node(name=name, layer=layer, kind=kind, description=description, source_file=source_file, meta=meta or {})
         self.nodes_written += 1
+        self._known_nodes[name] = {
+            "kind": kind,
+            "layer": layer,
+            "description": description,
+            "meta": meta or {},
+        }
 
     def _write_edge(self, source: str, target: str, rel_type: str, description: str = "", meta: dict[str, Any] | None = None) -> None:
         if not source or not target or source == target:
@@ -197,7 +270,7 @@ class IncidentGraphIntegrator:
         self.db.add_edge_by_names(source, target, rel_type, description, meta or {})
         self.edges_written += 1
 
-    def _import_one(self, detail: dict[str, Any], source_name: str) -> None:
+    def _import_one(self, detail: dict[str, Any], source_name: str, rca: RootCauseAnalysis) -> None:
         incident_id = str(detail.get("incident_id") or "I00000")
         incident_node = f"Incident:{incident_id}"
         root_service_raw = str(detail.get("root_service_candidate") or "")
@@ -221,11 +294,26 @@ class IncidentGraphIntegrator:
             },
         )
         if root_service:
-            self._write_node(root_service, "业务服务层", "Service", "异常链路关联到的服务", source_name, {"raw_service": root_service_raw})
-            self._write_edge(incident_node, root_service, "ROOT_SERVICE", "故障归因到该服务", {"raw_service": root_service_raw})
+            self._write_node(
+                root_service,
+                "业务服务层",
+                "Service",
+                "异常链路关联到的服务",
+                source_name,
+                {"raw_service": root_service_raw, "dynamic_observation": True},
+                preserve_existing=True,
+            )
+            self._write_edge(
+                incident_node,
+                root_service,
+                "ROOT_SERVICE",
+                "日志侧根因服务候选（不等于最终基础设施根因）",
+                {"raw_service": root_service_raw},
+            )
+            self._write_edge(incident_node, root_service, "OBSERVED_AT", "最底层异常首先定位到该服务", {"raw_service": root_service_raw})
         if exception_name:
             self._write_node(exception_name, "异常分析层", "Exception", root_cause[:500], source_name, {"root_cause": root_cause})
-            self._write_edge(incident_node, exception_name, "ROOT_CAUSE", "故障根因异常", {"root_cause": root_cause})
+            self._write_edge(incident_node, exception_name, "HAS_EXCEPTION", "日志中提取到的底层异常特征", {"root_cause": root_cause})
         if primary_trace:
             trace_node = f"Trace:{primary_trace}"
             self._write_node(trace_node, "异常分析层", "Trace", f"主 traceId：{primary_trace}", source_name, {})
@@ -272,13 +360,33 @@ class IncidentGraphIntegrator:
             if trace_node:
                 self._write_edge(trace_node, event_node, "HAS_EVENT", "trace 下的日志事件", {"order": idx})
             if service_node:
-                self._write_node(service_node, "业务服务层", "Service", "异常链路关联到的服务", source_name, {"raw_service": service_raw})
+                self._write_node(
+                    service_node,
+                    "业务服务层",
+                    "Service",
+                    "异常链路关联到的服务",
+                    source_name,
+                    {"raw_service": service_raw, "dynamic_observation": True},
+                    preserve_existing=True,
+                )
                 self._write_edge(service_node, event_node, "EMITS", "服务产生该异常日志", {"order": idx})
                 if prev_service_node and prev_service_node != service_node:
-                    self._write_edge(prev_service_node, service_node, "ERROR_PROPAGATES_TO", "异常沿时间线传播到下一个服务", {"incident_id": incident_id})
+                    self._write_edge(
+                        prev_service_node,
+                        service_node,
+                        "CO_OCCURS_IN_TRACE",
+                        "同一异常时间线中相邻出现；不直接代表因果方向",
+                        {"incident_id": incident_id},
+                    )
                 prev_service_node = service_node
             if prev_event_node:
-                self._write_edge(prev_event_node, event_node, "PROPAGATES_TO", "异常链路中的后续日志", {"incident_id": incident_id})
+                self._write_edge(
+                    prev_event_node,
+                    event_node,
+                    "TEMPORALLY_PRECEDES",
+                    "异常时间线中的后续日志；因果链由 RCA 假设单独给出",
+                    {"incident_id": incident_id},
+                )
             prev_event_node = event_node
 
         # Candidate nodes make the evidence auditable even when timeline was trimmed.
@@ -291,9 +399,95 @@ class IncidentGraphIntegrator:
             self._write_node(cand_node, "异常分析层", "LogEvent", cand_text[:500], source_name, candidate)
             self._write_edge(incident_node, cand_node, "TRIGGERED_BY", "根因候选证据", {"rank": idx})
             if cand_service:
+                self._write_node(
+                    cand_service,
+                    "业务服务层",
+                    "Service",
+                    "异常链路关联到的服务",
+                    source_name,
+                    {
+                        "raw_service": candidate.get("service"),
+                        "dynamic_observation": True,
+                    },
+                    preserve_existing=True,
+                )
                 self._write_edge(cand_service, cand_node, "EMITS", "候选根因服务产生该日志", {"rank": idx})
 
-        self.logs.append(f"导入 {incident_id}: root_service={root_service_raw or '-'}, trace={primary_trace or '-'}, timeline_events={len(timeline)}")
+        self._write_rca(incident_node, incident_id, rca, source_name)
+
+        top = rca.hypotheses[0] if rca.hypotheses else None
+        top_text = f", rca={top.candidate}/{top.fault_mode}/{top.confidence:.2f}" if top else ""
+        self.logs.append(
+            f"导入 {incident_id}: root_service={root_service_raw or '-'}, "
+            f"trace={primary_trace or '-'}, timeline_events={len(timeline)}{top_text}"
+        )
+
+    def _write_rca(
+        self,
+        incident_node: str,
+        incident_id: str,
+        rca: RootCauseAnalysis,
+        source_name: str,
+    ) -> None:
+        for hypothesis in rca.hypotheses:
+            data = hypothesis.model_dump()
+            node_name = f"RCAHypothesis:{incident_id}:{hypothesis.rank:02d}"
+            self._write_node(
+                node_name,
+                "根因推理层",
+                "RCAHypothesis",
+                hypothesis.summary,
+                source_name,
+                data,
+            )
+            self._write_edge(
+                incident_node,
+                node_name,
+                "HAS_HYPOTHESIS",
+                f"Top-{hypothesis.rank} 根因假设",
+                {"rank": hypothesis.rank, "confidence": hypothesis.confidence, "status": hypothesis.status},
+            )
+
+            if hypothesis.architecture_node and hypothesis.candidate in self._known_nodes:
+                self._write_edge(
+                    node_name,
+                    hypothesis.candidate,
+                    "CANDIDATE_CAUSE",
+                    hypothesis.fault_mode,
+                    {"rank": hypothesis.rank, "confidence": hypothesis.confidence},
+                )
+                if hypothesis.rank == 1:
+                    self._write_edge(
+                        incident_node,
+                        hypothesis.candidate,
+                        "SUSPECTED_ROOT_CAUSE",
+                        "RCA 首选根因实体",
+                        {
+                            "confidence": hypothesis.confidence,
+                            "fault_mode": hypothesis.fault_mode,
+                            "status": hypothesis.status,
+                        },
+                    )
+
+            for affected in hypothesis.chain[1:]:
+                if affected in self._known_nodes:
+                    self._write_edge(
+                        node_name,
+                        affected,
+                        "AFFECTS",
+                        "该根因假设链路上的受影响组件",
+                        {"rank": hypothesis.rank},
+                    )
+
+            evidence_node = f"RootCandidate:{incident_id}:01"
+            if evidence_node in self._known_nodes:
+                self._write_edge(
+                    node_name,
+                    evidence_node,
+                    "SUPPORTED_BY",
+                    "最高分日志根因证据",
+                    {"rank": hypothesis.rank},
+                )
 
     def _exception_node_name(self, root_cause: str) -> str:
         text = root_cause.strip() or "UnknownException"
@@ -306,13 +500,16 @@ class IncidentGraphIntegrator:
         service_name = service_name.strip()
         if not service_name:
             return ""
-        vertices = self.db.list_vertices(limit=10000)
         normalized = self._norm_service(service_name)
         best = ""
-        for v in vertices:
-            props = v.get("properties", {}) or {}
-            name = str(props.get(self.db.pk_name) or "")
-            kind = str(props.get(self.db.pk_kind) or "")
+        for name, info in self._known_nodes.items():
+            kind = str(info.get("kind") or "")
+            meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+            if meta.get("dynamic_observation") or (
+                "raw_service" in meta
+                and str(info.get("description") or "") == "异常链路关联到的服务"
+            ):
+                continue
             if not name:
                 continue
             if name == service_name:
@@ -351,15 +548,24 @@ class LogFaultRunner:
             output_dir = output_root / f"run-{os.getpid()}-{input_path.stem}"
             summary = self._run_pipeline(input_path, output_dir, train_path)
             result = IncidentGraphIntegrator().import_path(output_dir, source_name=str(input_path.name))
-            return {"summary": summary, "incident_import": result.model_dump(), "output_dir": str(output_dir)}
+            incident_import = result.model_dump()
+            self._write_rca_artifacts(output_dir, incident_import.get("rca") or [])
+            return {"summary": summary, "incident_import": incident_import, "output_dir": str(output_dir)}
         finally:
             temp.cleanup()
 
     def _run_pipeline(self, input_path: Path, output_dir: Path, train_path: Path | None) -> dict[str, Any]:
+        project: Path | None = None
         if self.settings.logfault_project_path:
             project = Path(self.settings.logfault_project_path).expanduser().resolve()
-            if str(project) not in sys.path:
-                sys.path.insert(0, str(project))
+        else:
+            # In the downloadable bundle both repositories are siblings. This
+            # convention makes the system run without machine-specific paths.
+            bundled = Path(__file__).resolve().parents[3] / "LogFaultAlgorithm"
+            if (bundled / "logfault").is_dir():
+                project = bundled
+        if project is not None and str(project) not in sys.path:
+            sys.path.insert(0, str(project))
         try:
             module = importlib.import_module("logfault.pipeline")
         except Exception as exc:  # noqa: BLE001
@@ -375,3 +581,39 @@ class LogFaultRunner:
             config_path=config_path,
             train_input=train_path,
         )
+
+    def _write_rca_artifacts(self, output_dir: Path, analyses: list[dict[str, Any]]) -> None:
+        (output_dir / "rca_results.json").write_text(
+            json.dumps(analyses, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        lines = ["# 架构知识图谱 RCA 报告", ""]
+        if not analyses:
+            lines.extend(["没有形成可用的图谱根因假设。", ""])
+        for analysis in analyses:
+            lines.extend(
+                [
+                    f"## {analysis.get('incident_id') or 'Incident'}",
+                    "",
+                    str(analysis.get("decision") or "未形成结论"),
+                    "",
+                ]
+            )
+            for hypothesis in analysis.get("hypotheses") or []:
+                lines.extend(
+                    [
+                        f"### Top-{hypothesis.get('rank')} {hypothesis.get('candidate')}",
+                        "",
+                        f"- 故障模式：`{hypothesis.get('fault_mode')}`",
+                        f"- 启发式评分：`{hypothesis.get('confidence')}`（{hypothesis.get('status')}）",
+                        f"- 因果链：{' -> '.join(hypothesis.get('chain') or [])}",
+                        f"- 结论：{hypothesis.get('summary') or ''}",
+                        "",
+                    ]
+                )
+                missing = hypothesis.get("missing_evidence") or []
+                if missing:
+                    lines.append("缺失证据：")
+                    lines.extend(f"- {item}" for item in missing)
+                    lines.append("")
+        (output_dir / "kg_rca_report.md").write_text("\n".join(lines), encoding="utf-8")

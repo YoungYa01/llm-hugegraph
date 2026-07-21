@@ -1,0 +1,681 @@
+# LogScope RCA 系统架构知识图谱构建规范
+
+> 适用版本：LogScope RCA `2026.07.21-r2`  
+> 适用范围：当前 `llm-hugegraph + LogFaultAlgorithm + HugeGraph` 实现  
+> 目标读者：架构师、开发人员、运维人员、图谱维护人员和 RCA 算法开发人员
+
+## 1. 文档目标
+
+这份规范回答四个问题：
+
+1. 系统架构知识图谱中应该建立哪些静态节点；
+2. 每类节点必须或建议维护哪些字段；
+3. 节点之间应该用什么关系、按什么方向连接；
+4. 什么样的图谱才能让日志实体对齐、依赖路径搜索和根因排序正常工作。
+
+本系统中的架构图谱描述“系统正常情况下怎样组成和依赖”。它不保存某一次故障本身。`Incident`、`LogEvent`、`Exception`、`Trace` 和 `RCAHypothesis` 等动态节点由日志分析过程自动生成，只能在具体故障的融合图中出现。
+
+## 2. 最重要的建图原则
+
+### 2.1 依赖边统一按“使用者指向被使用者”保存
+
+例如：
+
+```text
+API网关 -CALLS-> 订单服务
+订单服务 -DEPENDS_ON-> Redis生产集群
+订单服务 -WRITES-> MySQL订单库
+Redis生产集群 -HAS_MEMBER-> redis-2
+redis-2 -RUNS_ON-> cache-host-02
+```
+
+不能反向录入成：
+
+```text
+Redis生产集群 -DEPENDS_ON-> 订单服务       # 错误
+订单服务 -CALLS-> API网关                  # 如果实际是网关调用订单服务，则错误
+redis-2 -HAS_MEMBER-> Redis生产集群         # 错误
+cache-host-02 -RUNS_ON-> redis-2            # 错误
+```
+
+RCA 会从打印异常的服务沿存储方向搜索它依赖的组件，再把找到的路径反向解释为故障传播链。因此，边方向错误会直接造成“找不到根因”或“传播链方向相反”。
+
+### 2.2 节点名称负责稳定标识，别名负责匹配日志
+
+- `name` 是项目内稳定且唯一的主名称；不要随部署重启变化。
+- `meta.aliases`、`meta.service_name` 等保存日志、配置中心、注册中心或监控系统实际输出的名称。
+- Spring 服务至少应把 `spring.application.name` 写入别名。
+- 一个项目内不要让两个节点共享同一个别名或 endpoint，否则实体对齐可能产生歧义。
+
+推荐示例：
+
+```json
+{
+  "name": "订单服务",
+  "kind": "Service",
+  "layer": "业务服务层",
+  "description": "负责订单创建、查询和状态流转",
+  "meta": {
+    "aliases": ["order-service", "order-svc"],
+    "service_name": "order-service",
+    "environment": "production",
+    "technology": "Spring Boot"
+  }
+}
+```
+
+### 2.3 集群、实例和主机必须分开建模
+
+如果希望从“Redis 查询超时”进一步定位到具体实例或主机，不能只建立一个 Redis 节点。应至少建立：
+
+```text
+Redis生产集群 -HAS_MEMBER-> redis-1
+Redis生产集群 -HAS_MEMBER-> redis-2
+Redis生产集群 -HAS_MEMBER-> redis-3
+redis-2 -RUNS_ON-> cache-host-02
+```
+
+- 集群节点回答“是哪一类基础设施依赖”；
+- 实例节点回答“是集群中的哪一个成员”；
+- 主机或 Pod 节点回答“实例运行在哪里”。
+
+只有日志中出现的 host、IP、port 或 endpoint 能与实例元数据匹配时，当前算法才会显著提升具体实例的排名。仅有“Redis timeout”时，正确结果通常只能停在 Redis 集群，不能直接断言某个实例宕机。
+
+### 2.4 图谱只记录已确认的架构事实
+
+- 大模型可以抽取和整理，但不能发明服务、实例、IP、端口或依赖关系。
+- `host/IP/port/endpoints` 必须来自配置、部署清单、注册中心、CMDB、Kubernetes 或人工核验。
+- 架构事实与故障事实分开管理。
+- 推测结果只能作为 `RCAHypothesis` 动态节点由系统生成，不能提前写入静态架构图。
+
+## 3. 节点通用数据结构
+
+当前节点结构如下：
+
+```json
+{
+  "name": "节点主名称",
+  "kind": "Service",
+  "layer": "业务服务层",
+  "description": "节点职责、技术类型和用途",
+  "source_file": "manual 或架构文档名",
+  "meta": {}
+}
+```
+
+### 3.1 通用字段要求
+
+| 字段 | 要求 | 用途 | 规则 |
+| --- | --- | --- | --- |
+| `name` | 必填 | 项目内节点主键、图上显示名称 | 项目内唯一、稳定、不可复用；建议使用明确业务名或实例名 |
+| `kind` | 必填 | 决定节点角色、候选类型和图谱布局 | 必须使用本规范中的英文枚举，大小写保持一致 |
+| `layer` | 推荐 | 展示系统分层 | 当前 RCA 不按 layer 评分，可使用统一中文层级 |
+| `description` | 推荐 | 说明职责、技术产品和用途 | RCA 会搜索其中的 Redis、MySQL、Kafka 等资源关键词 |
+| `source_file` | 可选 | 数据来源和审计 | 手工创建可填 `manual`；导入时由系统记录文件名 |
+| `meta` | 强烈推荐 | 保存日志实体对齐标识及扩展属性 | 实例级 RCA 的关键数据主要位于这里 |
+| `id` | 不需要手工填写 | HugeGraph 内部标识 | 由后端和 HugeGraph 生成 |
+
+### 3.2 当前 RCA 能直接识别的 meta 标识字段
+
+| meta 字段 | 推荐格式 | 适用节点 | RCA 作用 |
+| --- | --- | --- | --- |
+| `alias` | 字符串 | 所有节点 | 名称精确或归一化匹配 |
+| `aliases` | 字符串数组 | 所有节点 | 推荐的多别名字段 |
+| `service` | 字符串 | Service/API/Component/Pod | 对齐日志服务名 |
+| `service_name` | 字符串 | Service/API/Component/Pod | 对齐 `spring.application.name` |
+| `service_names` | 字符串数组 | Service/API/Component/Pod | 对齐多个运行时名称 |
+| `instance` | 字符串 | Instance/Pod | 对齐实例标识 |
+| `instance_id` | 字符串 | Instance/Pod | 对齐实例或 Pod 名称 |
+| `host` | 字符串 | Instance/Host/Pod | 与日志 host 匹配 |
+| `hostname` | 字符串 | Instance/Host/Pod | 与日志 hostname 匹配 |
+| `ip` | 字符串 | Instance/Host/Pod/Cluster | 与日志 IP 匹配 |
+| `endpoint` | 字符串 | 基础设施或实例 | 与日志 `host:port` 精确匹配 |
+| `endpoints` | 字符串数组 | 基础设施或实例 | 推荐保存所有已确认访问地址 |
+| `port` | 数字或字符串 | 基础设施或实例 | 与 host/IP 自动组合为 endpoint |
+| `ports` | 数组 | 基础设施或实例 | 同一实例的多个监听端口 |
+
+当日志包含端口时，当前实现要求完整 endpoint 匹配。例如日志出现 `redis-2:6379`，节点必须能够形成同样的 `redis-2:6379` 标识；只有 `host=redis-2` 而没有 `port=6379` 不足以完成该次精确匹配。
+
+### 3.3 推荐但当前主要用于管理和解释的 meta 字段
+
+| 字段 | 示例 | 说明 |
+| --- | --- | --- |
+| `technology` | `Redis`、`MySQL`、`Kafka` | 强烈推荐；也能帮助资源关键词匹配 |
+| `environment` | `production` | 防止混淆生产、测试环境 |
+| `namespace` | `order-prod` | Kubernetes 命名空间 |
+| `cluster_name` | `redis-prod` | CMDB 或集群真实名称 |
+| `zone` | `ap-northeast-1a` | 可用区或机房 |
+| `role` | `master`、`replica` | 集群成员角色 |
+| `version` | `7.2.5` | 技术版本 |
+| `protocol` | `redis`、`jdbc`、`http` | 连接协议 |
+| `owner` | `交易平台组` | 责任团队 |
+| `criticality` | `P0` | 业务重要级别 |
+| `health_check` | `/actuator/health` | 推荐的外部验证入口 |
+
+这些字段会被存储和展示，部分文本也会参与资源关键词搜索，但当前 RCA 没有为它们设置独立权重。不要误认为填写 `role=master` 就能自动证明主节点故障。
+
+## 4. 静态架构节点类型规范
+
+### 4.1 逻辑和业务节点
+
+| kind | 表示对象 | 至少应有的信息 | 推荐信息 | 当前 RCA 角色 |
+| --- | --- | --- | --- | --- |
+| `System` | 一个完整业务系统或子系统 | name、description | aliases、owner、environment | 主要用于展示和组织，不是根因候选 |
+| `Layer` | 网关层、业务层、数据层等 | name、layer | description | 只用于组织，不参与依赖搜索 |
+| `API` | 网关、对外 API 或明确接口节点 | name、description | aliases、service_name、protocol、path | 可作为日志服务锚点；可参与 CALLS |
+| `Service` | Spring 微服务或独立应用 | name、职责 | aliases、service_name、technology、owner | 最重要的日志服务锚点 |
+| `Component` | 暂时无法细分的模块或组件 | name、description | aliases、technology | 可作为服务锚点和通用应用候选；应逐步细化 |
+| `Function` | 业务功能或用例 | name、description | owner | 仅用于说明功能归属，不建议承担运行依赖 |
+
+对于 Spring 项目，每一个会独立输出日志的 `spring.application.name` 原则上都应对应一个 `Service`、`API`、`Component` 或 `Pod` 节点，否则日志中的 `root_service_candidate` 无法稳定落到架构图上。
+
+### 4.2 数据和中间件节点
+
+| kind | 表示对象 | 至少应有的信息 | 推荐信息 | 当前故障识别 |
+| --- | --- | --- | --- | --- |
+| `Database` | MySQL、PostgreSQL、Oracle 等逻辑库或数据库服务 | name、description 中明确产品 | aliases、technology、endpoint | MySQL/JDBC/Hikari/SQL 故障候选 |
+| `Cache` | Redis、Memcached 等缓存资源 | name、description 中明确产品 | aliases、technology、endpoint | Redis/Lettuce/Jedis 故障候选 |
+| `Queue` | Kafka、RabbitMQ、RocketMQ 或逻辑 Topic/队列 | name、description 中明确产品 | aliases、technology、brokers/endpoints | 消息中间件故障候选 |
+| `Middleware` | 无法归入 Cache/Queue/Database 的中间件 | name、产品说明 | aliases、technology、endpoints | 通用依赖或特定中间件候选 |
+| `Cluster` | Redis/MySQL/Kafka 等集群整体 | name、description 中明确产品 | aliases、cluster_name、VIP/endpoints、environment | 集群级根因候选；无实例证据时通常优先于成员 |
+
+资源名称、description 或 meta 中应出现当前日志常用的产品关键词：
+
+- Redis：`redis`、`lettuce` 或 `jedis`；
+- 数据库：`mysql`、`database`、`数据库`、`jdbc` 或 `hikari`；
+- 消息系统：`kafka`、`rabbitmq`、`rocketmq` 或 `mq`。
+
+例如只把 Redis 节点命名为“生产缓存 A”，同时 kind 写成 `Cluster`，但 name、description 和 meta 中完全没有 `Redis`，会削弱 Redis 异常与该节点的直接资源匹配。
+
+### 4.3 部署和物理节点
+
+| kind | 表示对象 | 至少应有的信息 | 推荐信息 | 当前 RCA 角色 |
+| --- | --- | --- | --- | --- |
+| `Instance` | Redis/MySQL/Kafka 等集群成员或独立进程 | name、host/IP、port | instance_id、endpoints、role、zone | 实例候选；没有直接 endpoint 证据会减分 |
+| `Host` | 物理机、虚拟机或云主机 | name、hostname 或 IP | aliases、zone、owner、health_check | 主机候选；需要直接标识或健康证据 |
+| `Pod` | Kubernetes Pod 或实例级服务运行单元 | name、instance_id、IP | aliases、service_name、namespace、host、ports | 可作为日志锚点，也属于实例级候选 |
+
+实例节点示例：
+
+```json
+{
+  "name": "redis-2",
+  "kind": "Instance",
+  "layer": "基础设施层",
+  "description": "Redis生产集群的副本实例",
+  "meta": {
+    "aliases": ["redis-node-b"],
+    "instance_id": "redis-2",
+    "host": "redis-2",
+    "ip": "10.0.2.12",
+    "port": 6379,
+    "endpoints": ["redis-2:6379", "10.0.2.12:6379"],
+    "technology": "Redis",
+    "role": "replica",
+    "environment": "production"
+  }
+}
+```
+
+主机节点示例：
+
+```json
+{
+  "name": "cache-host-02",
+  "kind": "Host",
+  "layer": "运行环境层",
+  "description": "Redis 节点宿主机",
+  "meta": {
+    "hostname": "cache-host-02",
+    "ip": "10.0.1.22",
+    "aliases": ["vm-cache-b"],
+    "zone": "dc-a"
+  }
+}
+```
+
+## 5. 禁止手工放入架构图的动态节点
+
+下列节点属于故障分析数据，由系统在导入日志后自动生成：
+
+| kind | 含义 |
+| --- | --- |
+| `Incident` | 某一次故障事件 |
+| `Trace` | 故障关联 Trace |
+| `LogEvent` | 动态日志事件或候选证据 |
+| `Exception` | 从日志抽取的异常特征 |
+| `Window` | 异常检测窗口 |
+| `Metric` | 动态指标证据 |
+| `RCAHypothesis` | 系统生成的根因假设 |
+| `UnresolvedDependency` | 无法对齐到架构的临时候选 |
+
+还应遵守：
+
+- 静态节点的 `meta.dynamic_observation` 不得设为 `true`，否则会被架构投影和 RCA 快照过滤。
+- 不要手工创建 `Incident:*`、`LogEvent:*`、`Trace:*` 等名称。
+- 不要把“Redis 宕机”“数据库超时”当成静态节点。它们属于故障事实或故障模式，不属于系统组成。
+
+## 6. 关系类型、方向和 RCA 作用
+
+关系结构如下：
+
+```json
+{
+  "source": "使用者或容器节点",
+  "target": "被使用者或成员节点",
+  "type": "DEPENDS_ON",
+  "description": "关系说明",
+  "meta": {}
+}
+```
+
+### 6.1 当前 RCA 会遍历的依赖关系
+
+| type | 正确方向 | 适用场景 | 示例 | RCA 作用 |
+| --- | --- | --- | --- | --- |
+| `CALLS` | 调用方 → 被调用方 | HTTP/RPC/Feign 服务调用 | 网关 → 订单服务 | 沿调用链搜索依赖，并反向形成传播链 |
+| `DEPENDS_ON` | 依赖方 → 被依赖方 | 无法细分的通用依赖 | 订单服务 → Redis集群 | 最通用、最重要的依赖边 |
+| `USES_DB` | 服务 → 数据库 | 一般数据库使用 | 报表服务 → 分析数据库 | 数据库候选搜索 |
+| `READS` | 读取方 → 数据源 | 读数据库或缓存 | 订单服务 → Redis集群 | 数据依赖搜索 |
+| `WRITES` | 写入方 → 数据源 | 写数据库或缓存 | 订单服务 → MySQL订单库 | 数据依赖搜索 |
+| `PUBLISHES` | 生产者 → Queue/Topic | 发布消息 | 订单服务 → order-events | 消息系统候选搜索 |
+| `SUBSCRIBES` | 消费者 → Queue/Topic | 消费消息 | 通知服务 → order-events | 消息系统候选搜索 |
+| `CONNECTS_TO` | 客户端 → 目标组件 | TCP、SDK 或连接池连接 | 配置服务 → Consul | 通用连接依赖搜索 |
+| `RUNS_ON` | 实例/Pod → 主机 | 部署位置 | redis-2 → cache-host-02 | 从实例继续搜索宿主机 |
+| `HAS_MEMBER` | 集群 → 成员实例 | 集群成员关系 | Redis集群 → redis-2 | 从集群搜索具体成员 |
+
+所有 `type` 建议使用大写英文。手工录入虽然允许任意字符串，但当前 RCA 只识别上述精确关系名称；自定义成 `INVOKES`、`USE_REDIS` 或 `DEPLOYED_AT` 不会被当前路径搜索自动遍历。
+
+### 6.2 主要用于组织和展示的关系
+
+| type | 推荐方向 | 用途 | 当前 RCA 限制 |
+| --- | --- | --- | --- |
+| `CONTAINS` | 容器 → 被包含对象 | System 包含 Layer、Layer 包含 Service 等 | 只有部分基础设施容器到运行节点的 CONTAINS 会被遍历；不要用它代替依赖边 |
+| `BELONGS_TO_LAYER` | 业务节点 → Layer | 表示所属层 | 不参与当前依赖路径搜索 |
+| `PROVIDES` | Service → API/Function | 表示服务提供接口或功能 | 不参与当前依赖路径搜索 |
+
+建议同时保留组织关系和真实依赖关系。例如：
+
+```text
+交易系统 -CONTAINS-> 业务服务层
+业务服务层 -CONTAINS-> 订单服务
+订单服务 -DEPENDS_ON-> Redis生产集群
+```
+
+`CONTAINS` 用于回答“属于什么系统”，`DEPENDS_ON` 用于回答“故障可能从哪里传播”。两者不能互相替代。
+
+### 6.3 关系 description 和 meta
+
+建议保存：
+
+```json
+{
+  "source": "订单服务",
+  "target": "Redis生产集群",
+  "type": "READS",
+  "description": "读取订单热点缓存和分布式锁",
+  "meta": {
+    "protocol": "redis",
+    "environment": "production",
+    "timeout_ms": 2000,
+    "config_source": "application-prod.yml"
+  }
+}
+```
+
+当前 RCA 的路径搜索主要使用 source、target 和 type。关系 description/meta 会被存储和展示，但尚未直接加入当前评分公式。因此最先要保证的是：端点正确、类型正确、方向正确。
+
+## 7. 一张可用于 RCA 的推荐拓扑
+
+```mermaid
+flowchart TD
+    G["API网关<br/>API"] -->|CALLS| O["订单服务<br/>Service"]
+    O -->|READS| RC["Redis生产集群<br/>Cluster"]
+    O -->|WRITES| DB["MySQL订单库<br/>Database"]
+    O -->|PUBLISHES| MQ["order-events<br/>Queue"]
+    RC -->|HAS_MEMBER| R1["redis-1<br/>Instance"]
+    RC -->|HAS_MEMBER| R2["redis-2<br/>Instance"]
+    R2 -->|RUNS_ON| H2["cache-host-02<br/>Host"]
+    N["通知服务<br/>Service"] -->|SUBSCRIBES| MQ
+```
+
+该图能支持：
+
+- 从订单服务日志中的 Redis 异常定位 Redis 集群；
+- 日志出现 `redis-2:6379` 时定位到 redis-2；
+- 日志或健康证据出现 `cache-host-02` 时继续定位宿主机；
+- 从数据库异常定位 MySQL 订单库；
+- 从 Kafka/RabbitMQ/RocketMQ 异常定位消息节点；
+- 将底层故障反向展示为“基础设施 → 订单服务 → API 网关”的传播链。
+
+## 8. 最小可用图谱和不同定位精度
+
+### 8.1 服务级定位的最小条件
+
+必须有：
+
+1. 打印日志的服务节点，kind 为 `Service`、`API`、`Component` 或 `Pod`；
+2. `meta.aliases/service_name` 能匹配日志里的 service；
+3. 服务之间存在方向正确的 `CALLS` 或其他依赖边。
+
+只能得到：异常最先落在哪个逻辑服务、可能影响哪些上游服务。
+
+### 8.2 组件或集群级定位的最小条件
+
+在服务级条件上增加：
+
+1. Redis、数据库或消息中间件节点；
+2. 节点 kind、名称、description 或 meta 中有正确产品信息；
+3. 服务 → 资源的 `DEPENDS_ON/READS/WRITES/USES_DB/PUBLISHES/SUBSCRIBES` 边。
+
+可以得到：例如“Redis生产集群是首选根因假设”。
+
+### 8.3 实例级定位的最小条件
+
+在集群级条件上增加：
+
+1. `Cluster -HAS_MEMBER-> Instance`；
+2. 每个实例维护唯一 host、IP、port 或 endpoints；
+3. 日志中确实包含与某实例直接匹配的 endpoint，或系统接入实例健康证据。
+
+可以得到：例如“redis-2 不可达是首选根因假设”。
+
+### 8.4 主机级定位的最小条件
+
+在实例级条件上增加：
+
+1. `Instance/Pod -RUNS_ON-> Host`；
+2. Host 维护 hostname、IP 和别名；
+3. 日志、探针、容器事件或监控指标直接指向该主机。
+
+当前仅处理日志时，系统可以把 Host 作为候选，但“主机已崩溃”仍需要健康检查、重启事件、Kubernetes Node 状态或监控指标确认。
+
+## 9. 当前 RCA 如何使用图谱
+
+### 9.1 第一步：日志服务实体对齐
+
+日志算法输出：
+
+```json
+{
+  "root_service_candidate": "order-service",
+  "root_cause_candidate": "RedisCommandTimeoutException: Command timed out"
+}
+```
+
+RCA 在 `Service/API/Component/Pod` 节点中依次用 name、aliases、service_name、instance_id、host 等标识寻找 `order-service`。找不到服务锚点时，依赖搜索无法正常开始。
+
+### 9.2 第二步：故障模式识别
+
+当前代码主要识别：
+
+| 日志特征 | 故障模式 | 主要候选 kind |
+| --- | --- | --- |
+| Redis/Lettuce/Jedis + connection refused/reset | `REDIS_UNREACHABLE` | Cache、Cluster、Instance、Host、Database、Middleware |
+| Redis/Lettuce/Jedis + timeout | `REDIS_TIMEOUT` | Cache、Cluster、Instance、Host、Database、Middleware |
+| MySQL/JDBC/Hikari/SQL | `DATABASE_FAILURE` 或 `DATABASE_UNREACHABLE` | Database、Cluster、Instance、Host |
+| Kafka/RabbitMQ/RocketMQ | `MESSAGE_BROKER_FAILURE` | Queue、Cluster、Instance、Host、Middleware |
+| 通用 timeout/refused/reset | `DEPENDENCY_FAILURE` | 常见依赖资源和 Service |
+| 其他应用异常 | `APPLICATION_ERROR` | Service、API、Component |
+
+### 9.3 第三步：依赖路径搜索
+
+- 从日志服务沿正确方向的依赖边搜索候选；
+- 默认最大搜索深度为 5 条关系；
+- 上游传播补全的拓扑搜索默认最大 4 跳；
+- 如果根因距离日志服务超过 5 跳，当前实现可能无法发现，应减少无意义的中间节点或调整代码中的 `max_depth`；
+- `System` 和 `Layer` 等组织节点不应放在关键依赖路径中。
+
+### 9.4 第四步：候选评分
+
+当前分数是可解释启发式评分，不是统计概率。主要加减项如下：
+
+| 评分因素 | 当前影响 |
+| --- | --- |
+| 故障模式基础分 | Redis 不可达约 0.46；Redis 超时约 0.30；数据库/消息系统约 0.38 |
+| 节点名称/别名/描述直接匹配资源类型 | `+0.16` |
+| 节点 kind 属于故障资源类型 | `+0.08` |
+| 从日志服务沿依赖图可达 | 最高约 `+0.18`，距离越远越低 |
+| 日志 endpoint 与节点标识直接匹配 | `+0.27` |
+| Cluster 节点 | `+0.03` |
+| Instance/Host/Pod 没有直接 endpoint 证据 | `-0.20` |
+
+评分状态：
+
+- `>= 0.75`：`probable`，较强假设；
+- `>= 0.50`：`suspected`，待验证假设；
+- `< 0.50`：`weak`，弱假设。
+
+### 9.5 第五步：反向生成传播链
+
+存储路径：
+
+```text
+API网关 -CALLS-> 订单服务 -READS-> Redis集群 -HAS_MEMBER-> redis-2
+```
+
+故障传播展示：
+
+```text
+redis-2 -> Redis集群 -> 订单服务 -> API网关
+```
+
+每一步会标注 `reverse_of:原架构关系`，表示这是根据静态依赖反向推导出的传播方向，而不是新建一条静态架构边。
+
+## 10. Redis 根因定位示例
+
+### 10.1 完整静态架构
+
+```json
+{
+  "services": [
+    {
+      "name": "API网关服务",
+      "kind": "API",
+      "layer": "网关层",
+      "description": "Spring Cloud Gateway",
+      "meta": {"aliases": ["api-gateway"], "service_name": "api-gateway"}
+    },
+    {
+      "name": "安全服务",
+      "kind": "Service",
+      "layer": "业务服务层",
+      "description": "读取 Redis 安全配置",
+      "meta": {"aliases": ["security-service"], "service_name": "security-service"}
+    },
+    {
+      "name": "Redis生产集群",
+      "kind": "Cluster",
+      "layer": "基础设施层",
+      "description": "生产 Redis 缓存集群",
+      "meta": {"aliases": ["redis-prod"], "technology": "Redis", "environment": "production"}
+    },
+    {
+      "name": "redis-2",
+      "kind": "Instance",
+      "layer": "基础设施层",
+      "description": "Redis 集群成员",
+      "meta": {
+        "host": "redis-2",
+        "ip": "10.0.2.12",
+        "port": 6379,
+        "endpoints": ["redis-2:6379", "10.0.2.12:6379"],
+        "technology": "Redis"
+      }
+    }
+  ],
+  "calls": [
+    {"source": "API网关服务", "target": "安全服务", "type": "CALLS", "description": "网关调用认证接口", "meta": {}},
+    {"source": "安全服务", "target": "Redis生产集群", "type": "READS", "description": "读取安全配置", "meta": {}},
+    {"source": "Redis生产集群", "target": "redis-2", "type": "HAS_MEMBER", "description": "集群成员", "meta": {}}
+  ]
+}
+```
+
+### 10.2 只有超时，没有 endpoint
+
+日志：
+
+```text
+security-service RedisCommandTimeoutException: Command timed out after 20 seconds
+```
+
+预期结果：
+
+- 首选候选通常是 `Redis生产集群`；
+- 系统会提示有成员但无法确认具体成员；
+- 系统会提示超时也可能来自慢查询、网络拥塞、连接池耗尽或资源过载；
+- 不应输出“redis-2 已宕机”的确定结论。
+
+### 10.3 日志包含具体 endpoint
+
+日志：
+
+```text
+security-service RedisConnectionException: Unable to connect to redis-2:6379; connection refused
+```
+
+由于日志的 `redis-2:6379` 与节点标识直接匹配，`redis-2` 会获得 endpoint 加分并升为首选候选。预期传播链：
+
+```text
+redis-2 -> Redis生产集群 -> 安全服务 -> API网关服务
+```
+
+结论仍应表述为“redis-2 不可达是当前首选根因假设”。要确认“redis-2 服务器崩溃”，仍需 Redis PING、Sentinel/Cluster 状态、容器退出或主机监控证据。
+
+## 11. 推荐的架构描述文本模板
+
+上传给 Qwen 的架构说明建议按以下格式编写。每个事实单独一条，避免在一个长段落中混合多个方向不清的关系。
+
+```markdown
+# 项目与环境
+
+- 项目：订单交易平台。
+- 环境：production。
+
+# 服务节点
+
+- API网关服务，类型为 API，日志 serviceName 为 api-gateway，负责接收外部请求。
+- 订单服务，类型为 Service，日志 serviceName 为 order-service，负责订单创建和查询。
+- 通知服务，类型为 Service，日志 serviceName 为 notification-service。
+
+# 数据与中间件节点
+
+- Redis生产集群，类型为 Cluster，技术产品为 Redis。
+- MySQL订单库，类型为 Database，技术产品为 MySQL。
+- order-events，类型为 Queue，技术产品为 Kafka。
+
+# 实例与主机
+
+- Redis生产集群包含 redis-1、redis-2、redis-3 三个实例。
+- redis-2 的 host=redis-2，ip=10.0.2.12，port=6379。
+- redis-2 运行在 cache-host-02 上；cache-host-02 的 ip=10.0.1.22。
+
+# 依赖关系
+
+- API网关服务调用订单服务。
+- 订单服务从 Redis生产集群读取缓存。
+- 订单服务向 MySQL订单库写入订单。
+- 订单服务向 order-events 发布消息。
+- 通知服务订阅 order-events。
+
+# 约束
+
+- 所有调用和依赖关系均按“使用者指向被使用者”记录。
+- 以上实例、地址和关系来自生产部署清单，不允许推测未列出的节点。
+```
+
+导入完成后必须由人工在“架构图谱”页面校正。大模型输出只是草稿，尤其要检查别名、节点类型、边方向、集群成员和 endpoint。
+
+## 12. 架构图谱验收清单
+
+### 12.1 节点检查
+
+- [ ] 项目内每个独立输出 Spring 日志的服务都有静态节点。
+- [ ] 服务 kind 使用 `Service/API/Component/Pod` 之一。
+- [ ] 每个服务都维护真实的 `spring.application.name` 或其他日志服务名。
+- [ ] Redis、数据库、Kafka 等资源的 name/description/meta 中包含真实技术产品名。
+- [ ] 集群与成员实例没有合并成一个节点。
+- [ ] 实例具有 host、IP、port 或 endpoints；数据来自真实部署清单。
+- [ ] name 在项目内唯一；aliases 和 endpoints 没有冲突。
+- [ ] 生产和测试环境没有混在同一组同名、同别名节点中；优先按环境建立不同项目。
+- [ ] 架构节点中没有 Incident、Trace、LogEvent、Exception、RCAHypothesis 等动态类型。
+- [ ] 静态节点没有设置 `meta.dynamic_observation=true`。
+
+### 12.2 关系检查
+
+- [ ] 每条边的 source 和 target 节点都存在。
+- [ ] 没有节点指向自己的自环边。
+- [ ] `CALLS` 是调用方指向被调用方。
+- [ ] `DEPENDS_ON/READS/WRITES/USES_DB` 是服务指向资源。
+- [ ] `PUBLISHES/SUBSCRIBES` 是业务服务指向 Queue 或 Topic。
+- [ ] `HAS_MEMBER` 是 Cluster 指向 Instance/Pod。
+- [ ] `RUNS_ON` 是 Instance/Pod 指向 Host。
+- [ ] 没有用 `CONTAINS` 代替运行依赖。
+- [ ] 关键路径没有使用当前 RCA 不识别的自定义关系名。
+- [ ] 从日志服务到预期根因节点的依赖距离不超过当前默认 5 跳。
+
+### 12.3 日志联调检查
+
+- [ ] 用一条包含真实 serviceName 的日志验证能够解析到架构服务节点。
+- [ ] 用 Redis timeout 样例验证首选候选停在集群而不是无证据的实例。
+- [ ] 用 `redis-2:6379 connection refused` 样例验证 redis-2 能升为实例级候选。
+- [ ] 用 MySQL/JDBC 异常验证数据库节点可达。
+- [ ] 用 Kafka/RabbitMQ/RocketMQ 异常验证消息节点可达。
+- [ ] 检查传播链是否按“根因 → 受影响服务 → 上游入口”展示。
+- [ ] 检查缺失证据是否符合实际，不把启发式评分当作确认结论。
+
+## 13. 常见错误与后果
+
+| 建图错误 | 直接后果 | 修复方法 |
+| --- | --- | --- |
+| 服务没有日志别名 | `root_service_candidate` 无法落图 | 把 `spring.application.name` 写入 aliases/service_name |
+| 依赖边方向反了 | RCA 从服务无法到达资源 | 改为使用者 → 被使用者 |
+| 用 CONTAINS 表示服务依赖 Redis | 关键依赖可能不被遍历 | 改用 DEPENDS_ON、READS 或 WRITES |
+| 自定义关系名如 USE_REDIS | 当前 RCA 忽略该边 | 使用支持的标准关系类型 |
+| 集群和实例混成一个节点 | 无法区分集群级与实例级根因 | Cluster + HAS_MEMBER + Instance |
+| 实例没有 endpoint | 实例在无直接证据时被减分 | 补充真实 host/IP/port/endpoints |
+| 多个节点共享 endpoint | 日志可能命中错误节点 | 保证项目和环境内 endpoint 唯一 |
+| 资源名称完全没有 Redis/MySQL/Kafka 关键词 | 故障模式与资源匹配变弱 | 在 name、description 或 technology 中写明产品 |
+| 在架构图中手工建立 Incident/故障节点 | 静态架构与动态故障混杂 | 删除动态节点，由日志分析自动创建 |
+| 把超时等同于实例宕机 | 形成不受证据支持的结论 | 保留缺失证据并接入健康检查/指标 |
+| 根因距离服务超过 5 跳 | 当前默认搜索无法到达 | 压缩无意义中间层或调整 max_depth |
+
+## 14. 建议的实际建图流程
+
+1. **确定项目和环境边界**：一个图谱对应一个明确项目/环境，避免生产测试实体冲突。
+2. **从日志反推服务清单**：收集所有 Spring `application.name`，先建立日志服务锚点。
+3. **整理逻辑调用关系**：从网关路由、Feign/HTTP/RPC 配置和代码确认 CALLS。
+4. **整理资源依赖**：从数据源、Redis、MQ、配置中心等配置确认依赖边。
+5. **补充集群成员**：从 Redis Cluster/Sentinel、数据库复制集、Kafka broker 清单建立 HAS_MEMBER。
+6. **补充实例标识**：从 CMDB、Kubernetes、注册中心和部署文件填入 endpoint。
+7. **补充运行位置**：用 RUNS_ON 连接实例/Pod 与 Host。
+8. **大模型抽取**：把规范化架构文本交给 Qwen 生成初稿。
+9. **人工校正**：检查类型、方向、别名、endpoint 和重复节点。
+10. **故障样例验收**：至少运行一次集群级和实例级日志样例，确认 Top-K 和传播链符合预期。
+11. **持续维护**：服务、实例、端口或依赖发生变化后及时更新图谱，再进行 RCA。
+
+## 15. 当前能力边界与后续扩展
+
+当前图谱加日志可以形成“有证据的根因假设和传播链”，但不能只靠一条超时日志确认物理故障。若希望系统自动确认“某台 Redis 服务器已经崩溃”，建议后续接入：
+
+- Redis PING、INFO、Cluster Nodes 或 Sentinel 状态；
+- Kubernetes Pod/Node 状态、RestartCount、OOMKilled 和事件；
+- Prometheus 主机存活、CPU、内存、网络和连接池指标；
+- CMDB、服务注册中心和部署变更事件；
+- SkyWalking/OpenTelemetry 调用链和错误 Span。
+
+这些证据应作为具体 Incident 的动态证据写入融合图，而不是污染静态架构图。静态图负责回答“它们如何连接”，动态证据负责回答“这一次哪个节点真的异常”。
+
+## 16. 代码规则来源
+
+本规范按当前实现整理，关键代码位置：
+
+- `backend/app/models.py`：节点和关系的数据结构；
+- `backend/app/analyzer.py`：允许的节点/关系类型和 Qwen 架构抽取约束；
+- `backend/app/rca_engine.py`：实体标识、可遍历关系、最大深度、候选评分和传播链；
+- `backend/app/scoped_graph.py`：静态架构与动态故障节点过滤；
+- `examples/architecture-redis-demo.md`：可直接导入的 Redis 架构示例；
+- `backend/tests/test_rca_engine.py`：集群级和实例级定位的验收行为。
+
+后续如果扩展新的 kind、关系类型或评分字段，应同步修改代码、前端下拉选项、本规范和 RCA 测试，不能只在 HugeGraph 中增加自定义名称后期望算法自动识别。

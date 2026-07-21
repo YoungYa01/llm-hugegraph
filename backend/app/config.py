@@ -43,11 +43,18 @@ def normalize_openai_base_url(url: str) -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    # Application system storage and authentication.
+    app_data_root: str = _env("APP_DATA_ROOT", "./data")
+    app_database_path: str = _env("APP_DATABASE_PATH", "./data/logsys.db")
+    session_expire_hours: int = _int_env("SESSION_EXPIRE_HOURS", 24)
+    allow_registration: bool = _bool_env("ALLOW_REGISTRATION", True)
+    max_upload_mb: int = _int_env("MAX_UPLOAD_MB", 200)
+
     # Local LLM. This remains compatible with the user's test.py style:
     # OpenAI-compatible /v1/chat/completions first, llama.cpp /completion fallback.
     llm_enabled: bool = _bool_env("LLM_ENABLED", True)
     llm_base_url: str = _env("LLM_BASE_URL", "http://127.0.0.1:1234")
-    llm_model: str = _env("LLM_MODEL", "Qwen_Qwen3_14B_Q4_K_M")
+    llm_model: str = _env("LLM_MODEL", "qwen3.5_14B_Q4_K_M")
     llm_api_key: str = _env("LLM_API_KEY", "not-needed")
     llm_timeout_seconds: int = _int_env("LLM_TIMEOUT_SECONDS", 180)
     llm_connect_timeout_seconds: int = _int_env("LLM_CONNECT_TIMEOUT_SECONDS", 10)
@@ -67,15 +74,15 @@ class Settings:
     hugegraph_timeout_seconds: int = _int_env("HUGEGRAPH_TIMEOUT_SECONDS", 30)
 
     # Versioned schema names avoid collisions with earlier broken local attempts.
-    node_label: str = _env("HUGEGRAPH_NODE_LABEL", "LogSysKGNodeV6")
-    edge_label: str = _env("HUGEGRAPH_EDGE_LABEL", "LOGSYS_KG_RELATION_V6")
-
+    node_label: str = _env("HUGEGRAPH_NODE_LABEL", "LogSysKGNodeV7")
+    edge_label: str = _env("HUGEGRAPH_EDGE_LABEL", "LOGSYS_KG_RELATION_V7")
 
     # Optional integration with the v1-goat sliding-window logfault package.
     logfault_project_path: str = _env("LOGFAULT_PROJECT_PATH", "")
     logfault_config_path: str = _env("LOGFAULT_CONFIG_PATH", "")
     logfault_output_root: str = _env("LOGFAULT_OUTPUT_ROOT", "./runs/kg")
     incident_timeline_limit: int = _int_env("INCIDENT_TIMELINE_LIMIT", 120)
+    rca_top_k: int = _int_env("RCA_TOP_K", 5)
 
     @property
     def llm_openai_base_url(self) -> str:

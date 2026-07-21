@@ -12,21 +12,26 @@ from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import EdgeDeleteRequest, EdgeUpsertRequest, GraphResponse, NodeUpdateRequest, NodeUpsertRequest
+from .rca_engine import hypotheses_from_persisted_graph
 from .service import GraphBuilderService
+from .system_api import router as system_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("logsys-kg-demo")
 
-app = FastAPI(title="LogSys Knowledge Graph Demo", version="6.0.0")
+app = FastAPI(title="LogSys Knowledge Graph RCA System", version="8.0.0")
 settings = get_settings()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # Authentication uses an Authorization bearer token, not browser cookies.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(system_router)
 
 
 @app.middleware("http")
@@ -59,6 +64,7 @@ def health() -> dict:
             "config_path": settings.logfault_config_path,
             "output_root": settings.logfault_output_root,
         },
+        "rca": {"top_k": settings.rca_top_k},
         "hugegraph": {
             "host": settings.hugegraph_host,
             "port": settings.hugegraph_port,
@@ -159,6 +165,22 @@ def get_graph(limit: int = 800) -> GraphResponse:
         return client.read_graph(limit=max(1, min(limit, 5000)))
     except Exception as exc:  # noqa: BLE001
         return GraphResponse(nodes=[], edges=[], warnings=[str(exc)])
+
+
+@app.get("/api/incidents/{incident_id}/rca")
+def get_incident_rca(incident_id: str) -> dict:
+    """Return ranked, persisted RCA hypotheses without rerunning log analysis."""
+    try:
+        client = HugeGraphRestClient()
+        graph = client.read_graph(limit=5000)
+        hypotheses = hypotheses_from_persisted_graph(graph, unquote(incident_id))
+        if not hypotheses:
+            raise HTTPException(status_code=404, detail=f"未找到故障 {incident_id} 的 RCA 结果")
+        return {"incident_id": unquote(incident_id), "hypotheses": hypotheses}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/nodes")

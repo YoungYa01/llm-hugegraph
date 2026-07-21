@@ -9,9 +9,11 @@ from .models import ExtractedGraph, ExtractedNode, ExtractedCall
 class GraphBuilderService:
     """Business service: LLM extraction -> HugeGraph REST write -> graph read model."""
 
-    def __init__(self) -> None:
+    def __init__(self, db: HugeGraphRestClient | None = None) -> None:
         self.settings = get_settings()
-        self.db = HugeGraphRestClient()
+        # ProjectScopedGraphClient implements this same small client surface.
+        # Injection keeps extraction independent from project isolation rules.
+        self.db = db or HugeGraphRestClient()
         self.analyzer = LLMAnalyzer()
 
     def initialize_system(self) -> list[str]:
@@ -45,6 +47,7 @@ class GraphBuilderService:
                 kind=node.kind,
                 description=node.description,
                 source_file=source_file,
+                meta=node.meta,
             )
             real_id = str(res.get("id") or "")
             if real_id:
@@ -64,7 +67,7 @@ class GraphBuilderService:
             if not out_id or not in_id:
                 execution_logs.append(f"跳过关系，未找到端点真实 ID: {call.source} -[{call.type}]-> {call.target}")
                 continue
-            res = self.db.add_edge(out_id, in_id, call.type, call.description)
+            res = self.db.add_edge(out_id, in_id, call.type, call.description, call.meta)
             execution_logs.append(f"写入关系: {call.source} -[{call.type}]-> {call.target} -> {res.get('id', '')}")
 
         return merged.model_dump(), execution_logs
@@ -81,6 +84,8 @@ class GraphBuilderService:
                     layer=old.layer if old.layer != "Component层" else n.layer,
                     kind=old.kind if old.kind != "Component" else n.kind,
                     description=old.description or n.description,
+                    source_file=old.source_file or n.source_file,
+                    meta={**n.meta, **old.meta},
                 )
 
         calls: dict[tuple[str, str, str], ExtractedCall] = {(c.source, c.target, c.type): c for c in left.calls}

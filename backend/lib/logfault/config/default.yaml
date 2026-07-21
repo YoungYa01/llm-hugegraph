@@ -1,0 +1,53 @@
+input:
+  include_globs:
+    - "**/*.log"
+  exclude_globs:
+    - "**/*-err.log"
+    - "**/*-debug.log"
+  encoding: "utf-8"
+  encoding_errors: "replace"
+
+parser:
+  backend: "drain3"
+  similarity_threshold: 0.4
+  depth: 4
+  max_children: 100
+  max_clusters: 10000
+  mask_patterns:
+    - "(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\b"
+    - "(?i)\\b(?:[0-9a-f]{8,})\\b"
+    - "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b"
+    - "\\b\\d+ms\\b"
+    - "\\b\\d+(?:\\.\\d+)?\\b"
+
+window:
+  size_minutes: 5
+  step_minutes: 1
+  min_events: 1
+
+features:
+  namespace_by_service: true
+  include_levels: false
+
+pca:
+  max_components: 20
+  target_variance: 0.95
+
+model:
+  type: "isolation_forest"
+  contamination: 0.03
+  n_estimators: 300
+  random_state: 42
+  ocsvm_nu: 0.03
+  ocsvm_gamma: "scale"
+  # 没有独立正常训练集时，窗口少于该值则不信任纯模型异常标签，改用 ERROR/异常栈规则兜底。
+  min_training_windows: 30
+
+explain:
+  top_templates: 10
+  top_trace_ids: 10
+  max_timeline_events: 200
+  merge_gap_minutes: 1
+  # 任何包含 ERROR 的窗口都进入故障候选，避免小样本时模型漏掉真实错误。
+  always_include_error_windows: true
+  include_known_root_signals: true

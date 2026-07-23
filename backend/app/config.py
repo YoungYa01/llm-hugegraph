@@ -84,6 +84,22 @@ class Settings:
     incident_timeline_limit: int = _int_env("INCIDENT_TIMELINE_LIMIT", 120)
     rca_top_k: int = _int_env("RCA_TOP_K", 5)
 
+    # Preferred model for choosing the most likely RCA candidate after the
+    # deterministic hypothesis list has been generated.
+    rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)
+    rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation")
+    rca_decision_model_config_id: str = _env("RCA_DECISION_MODEL_CONFIG_ID", "")
+    rca_decision_conversation_id: str = _env("RCA_DECISION_CONVERSATION_ID", "")
+    rca_decision_assistant_role: str = _env("RCA_DECISION_ASSISTANT_ROLE", "general")
+    rca_decision_assistant_name: str = _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant")
+    rca_decision_assistant_prompt: str = _env("RCA_DECISION_ASSISTANT_PROMPT", "")
+    rca_decision_stream: bool = _bool_env("RCA_DECISION_STREAM", False)
+    rca_decision_code_language: str = _env("RCA_DECISION_CODE_LANGUAGE", "")
+    rca_decision_kb_id: str = _env("RCA_DECISION_KB_ID", "")
+    rca_decision_kb_name: str = _env("RCA_DECISION_KB_NAME", "")
+    rca_decision_timeout_seconds: int = _int_env("RCA_DECISION_TIMEOUT_SECONDS", 90)
+    rca_decision_connect_timeout_seconds: int = _int_env("RCA_DECISION_CONNECT_TIMEOUT_SECONDS", 10)
+
     @property
     def llm_openai_base_url(self) -> str:
         return normalize_openai_base_url(self.llm_base_url)

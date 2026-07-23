@@ -37,15 +37,24 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
   function paint() {
     const analysis = incident.analysis || {};
     const detail = incident.detail || {};
+    const llmDecision = analysis.llm_decision || {};
     const hypotheses = analysis.hypotheses || [];
     const top = hypotheses[0] || {
       candidate: incident.root_candidate,
       confidence: incident.root_confidence,
       fault_mode: incident.fault_mode,
       chain: incident.chain || [],
-      reasons: [], evidence: [], missing_evidence: [],
+      reasons: [],
+      evidence: [],
+      missing_evidence: [],
     };
     const chain = top.chain || incident.chain || [];
+    const llmCandidate = llmDecision.selected_candidate || top.candidate || "尚未形成判断";
+    const llmReason = llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因";
+    const llmSteps = llmDecision.troubleshooting_methods?.length
+      ? llmDecision.troubleshooting_methods
+      : (top.validation_suggestions || []).map((item) => item.title || item.reason || item.check_id).filter(Boolean);
+    const llmConfidence = llmDecision.confidence || top.confidence;
     content.innerHTML = `
       <div class="page-header">
         <div><a class="link" href="#/projects/${project.id}/incidents">← 返回故障列表</a><h1 style="margin-top:12px">${escapeHtml(incident.title)}</h1><p>${escapeHtml(incident.external_incident_id)} · 发现于 ${formatDate(incident.created_at)}</p></div>
@@ -53,11 +62,24 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       </div>
 
       <section class="cause-hero" style="margin-bottom:20px">
-        <div style="display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap">
-          <div><span class="stat-label">当前首选根因假设</span><h2 style="font-size:26px;margin:5px 0 8px">${escapeHtml(top.candidate || "尚未形成候选")}</h2><p style="margin:0;color:var(--ink-600)">${escapeHtml(top.summary || analysis.decision || "需要补充架构依赖和日志证据")}</p></div>
-          <div class="cause-score"><strong>${formatConfidence(top.confidence)}</strong><span>启发式评分</span></div>
+        <div class="llm-decision-grid">
+          <div class="llm-decision-panel">
+            <span class="stat-label">最可能原因</span>
+            <h3>${escapeHtml(llmCandidate)}</h3>
+            <p>${escapeHtml(llmReason)}</p>
+            <div class="llm-decision-meta">
+              <span class="badge">${escapeHtml(llmDecision.source || "fallback")}</span>
+              <span class="badge">候选排行：${escapeHtml(llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : `Top-${top.rank || 1}`)}</span>
+              <span class="badge">${escapeHtml(llmDecision.selected_fault_mode || top.fault_mode || "UNKNOWN")}</span>
+              ${llmConfidence ? `<span class="badge">置信度：${formatConfidence(llmConfidence)}</span>` : ""}
+              <span class="badge">日志定位：${escapeHtml(analysis.resolved_root_service || detail.root_service_candidate || "未知服务")}</span>
+            </div>
+          </div>
+          <div class="llm-decision-panel">
+            <span class="stat-label">排查方法</span>
+            ${llmSteps.length ? `<ol class="llm-step-list">${llmSteps.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>` : `<p>暂未生成排查方法。</p>`}
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px"><span class="badge">${escapeHtml(top.fault_mode || "UNKNOWN")}</span><span class="badge">日志定位：${escapeHtml(analysis.resolved_root_service || detail.root_service_candidate || "未知服务")}</span><span class="badge">候选类型：${escapeHtml(top.candidate_kind || "未知")}</span></div>
       </section>
 
       <section class="card fusion-graph-card" style="margin-bottom:20px">
@@ -84,13 +106,13 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
         <aside class="grid">
           <section class="card"><div class="card-header"><div><h2>处理故障</h2><p>更新状态并形成可审计的解决记录。</p></div></div><div class="card-body"><form class="form-stack" id="status-form">
             <div class="field"><label>状态</label><select class="select" name="status"><option value="open" ${selected("open", incident.status)}>待处理</option><option value="in_progress" ${selected("in_progress", incident.status)}>处理中</option><option value="resolved" ${selected("resolved", incident.status)}>已解决</option><option value="ignored" ${selected("ignored", incident.status)}>已忽略</option></select></div>
-            <div class="field"><label>处理/解决说明</label><textarea class="textarea" name="resolution_note" placeholder="例如：替换 redis-2 节点并完成主从重建；监控恢复。">${escapeHtml(incident.resolution_note || "")}</textarea><span class="field-hint">标记“已解决”时必须填写。</span></div>
+            <div class="field"><label>处理/解决说明</label><textarea class="textarea" name="resolution_note" placeholder="例如：替换 redis-2 节点并完成主从重建；监控恢复。">${escapeHtml(incident.resolution_note || "")}</textarea><span class="field-hint">标记“已解决”时必须填写解决说明。</span></div>
             <button class="button button-primary" id="save-status" type="submit">保存处理结果</button>
           </form></div></section>
           <section class="card"><div class="card-header"><div><h2>日志侧原始定位</h2><p>这是异常栈和 trace 中的观测，不等同最终基础设施根因。</p></div></div><div class="card-body"><dl class="kv-list">
             <div class="kv-row"><dt>根因服务</dt><dd>${escapeHtml(detail.root_service_candidate || "—")}</dd></div>
             <div class="kv-row"><dt>底层异常</dt><dd>${escapeHtml(detail.root_cause_candidate || "—")}</dd></div>
-            <div class="kv-row"><dt>主 traceId</dt><dd><code>${escapeHtml(detail.primary_trace_id || "—")}</code></dd></div>
+            <div class="kv-row"><dt>单一 traceId</dt><dd><code>${escapeHtml(detail.primary_trace_id || "—")}</code></dd></div>
             <div class="kv-row"><dt>故障区间</dt><dd>${formatDate(detail.fault_start)}<br>至 ${formatDate(detail.fault_end)}</dd></div>
           </dl></div></section>
           <section class="card"><div class="card-header"><div><h2>处理历史</h2><p>记录检测和每次状态变更。</p></div></div><div class="card-body">${actionsHtml(incident.actions || [])}</div></section>
@@ -99,7 +121,6 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
     bind();
     renderFusionGraph();
   }
-
   function renderFusionGraph() {
     const canvas = content.querySelector("#fusion-graph-canvas");
     if (!canvas || !fusionGraph.nodes.length) return;

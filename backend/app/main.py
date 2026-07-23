@@ -59,6 +59,13 @@ def health() -> dict:
         "llm_enabled": settings.llm_enabled,
         "llm_use_langchain_first": settings.llm_use_langchain_first,
         "llm_disable_env_proxy": settings.llm_disable_env_proxy,
+        "rca_decision_model": {
+            "enabled": settings.rca_decision_enabled,
+            "url": settings.rca_decision_url,
+            "model_config_id": settings.rca_decision_model_config_id,
+            "assistant_role": settings.rca_decision_assistant_role,
+            "assistant_name": settings.rca_decision_assistant_name,
+        },
         "logfault": {
             "project_path": settings.logfault_project_path,
             "config_path": settings.logfault_config_path,

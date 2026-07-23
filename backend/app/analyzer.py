@@ -6,7 +6,10 @@ import re
 import urllib.parse
 from typing import Any
 
-import requests
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
 
 try:
     from json_repair import repair_json
@@ -16,6 +19,14 @@ except Exception:  # pragma: no cover
 
 from .config import get_settings
 from .models import ExtractedCall, ExtractedGraph, ExtractedNode
+from .rca_decision import RcaDecisionService
+
+
+class _UnavailableSession:
+    trust_env = False
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("requests package is unavailable")
 
 
 ALLOWED_KINDS = {
@@ -82,7 +93,7 @@ class LLMAnalyzer:
         self.last_logs: list[str] = []
         self.last_mode = "unknown"
         self.last_error = ""
-        self.session = requests.Session()
+        self.session = requests.Session() if requests is not None else _UnavailableSession()
         if self.settings.llm_disable_env_proxy:
             # Local LLM/HugeGraph calls must not be routed through corporate/system
             # proxies. The user's 502 happened exactly in this area.
@@ -106,6 +117,15 @@ class LLMAnalyzer:
         errors: list[str] = []
 
         if self.settings.llm_enabled:
+            try:
+                result = self._analyze_with_conversation_http(user_text)
+                self.last_mode = "llm-conversation-http"
+                return result
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                errors.append(f"Conversation HTTP失败: {msg}")
+                self.last_logs.append(errors[-1])
+
             # Direct HTTP first. It is closer to the user's test.py and avoids
             # LangChain/httpx proxy surprises by using Session(trust_env=False).
             try:
@@ -180,6 +200,18 @@ class LLMAnalyzer:
             f"{prefix}请从下面系统文档抽取知识图谱。只返回 JSON 对象，禁止解释，禁止思考过程。\n\n"
             f"系统文档：\n{doc_text}\n\nJSON："
         )
+
+    def _analyze_with_conversation_http(self, user_text: str) -> dict[str, Any]:
+        if not bool(getattr(self.settings, "rca_decision_enabled", True)):
+            raise RuntimeError("Conversation model is disabled")
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"{self._build_user_prompt(user_text)}\n"
+            "严格返回 services/calls JSON，不要 Markdown，不要代码块。"
+        )
+        content, _meta = RcaDecisionService(settings=self.settings, session=self.session)._post_conversation(prompt)
+        parsed = self._parse_json_lenient(content)
+        return self._normalize_graph(parsed).model_dump()
 
     def _chat_payloads(self, user_text: str) -> list[dict[str, Any]]:
         base_payload = {

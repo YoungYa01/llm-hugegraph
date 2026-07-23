@@ -16,6 +16,7 @@ from fastapi import UploadFile
 
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
+from .rca_decision import RcaDecisionService
 from .rca_engine import RootCauseAnalysis, RootCauseEngine
 
 
@@ -54,6 +55,7 @@ class IncidentGraphIntegrator:
         self.edges_written = 0
         self.rca_results: list[dict[str, Any]] = []
         self._known_nodes: dict[str, dict[str, Any]] = {}
+        self.decision_service = RcaDecisionService()
 
     def import_path(
         self,
@@ -234,7 +236,9 @@ class IncidentGraphIntegrator:
         rca_engine = RootCauseEngine(architecture)
         for detail in details:
             rca = rca_engine.analyze(detail, top_k=max(1, min(self.settings.rca_top_k, 20)))
-            self.rca_results.append(rca.model_dump())
+            rca_data = rca.model_dump()
+            rca_data["llm_decision"] = self.decision_service.enrich(detail, rca_data)
+            self.rca_results.append(rca_data)
             self._import_one(detail, source_name, rca)
 
     def _write_node(
@@ -599,6 +603,18 @@ class LogFaultRunner:
                     "",
                 ]
             )
+            decision = analysis.get("llm_decision") or {}
+            if decision:
+                lines.extend(
+                    [
+                        f"- 最可能原因：{decision.get('selected_candidate') or '未选择'}",
+                        f"- 原因摘要：{decision.get('most_likely_reason') or ''}",
+                        f"- 排查方法：",
+                    ]
+                )
+                for item in decision.get("troubleshooting_methods") or []:
+                    lines.append(f"  - {item}")
+                lines.append("")
             for hypothesis in analysis.get("hypotheses") or []:
                 lines.extend(
                     [

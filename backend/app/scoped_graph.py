@@ -96,6 +96,50 @@ class ProjectScopedGraphClient:
             {**(meta or {}), "project_id": self.project_id},
         )
 
+    def upsert_nodes_bulk(self, nodes: list[dict[str, Any]]) -> int:
+        mapped: list[dict[str, Any]] = []
+        for node in nodes:
+            name = str(node.get("name") or "")
+            mapped.append(
+                {
+                    **node,
+                    "name": self._name(name),
+                    "meta": self._meta(name, node.get("meta") if isinstance(node.get("meta"), dict) else {}),
+                }
+            )
+        if hasattr(self.client, "upsert_nodes_bulk"):
+            return int(self.client.upsert_nodes_bulk(mapped) or 0)
+        count = 0
+        for node in mapped:
+            self.client.upsert_node(**node)
+            count += 1
+        return count
+
+    def add_edges_by_names_bulk(self, edges: list[dict[str, Any]]) -> int:
+        mapped: list[dict[str, Any]] = []
+        for edge in edges:
+            mapped.append(
+                {
+                    **edge,
+                    "source": self._name(str(edge.get("source") or "")),
+                    "target": self._name(str(edge.get("target") or "")),
+                    "meta": {**(edge.get("meta") if isinstance(edge.get("meta"), dict) else {}), "project_id": self.project_id},
+                }
+            )
+        if hasattr(self.client, "add_edges_by_names_bulk"):
+            return int(self.client.add_edges_by_names_bulk(mapped) or 0)
+        count = 0
+        for edge in mapped:
+            self.client.add_edge_by_names(
+                edge["source"],
+                edge["target"],
+                str(edge.get("type") or "CALLS"),
+                str(edge.get("description") or ""),
+                edge.get("meta") if isinstance(edge.get("meta"), dict) else {},
+            )
+            count += 1
+        return count
+
     def update_node_by_name(self, original_name: str, data: dict[str, Any]) -> dict[str, Any]:
         payload = dict(data)
         new_name = str(payload.get("name") or original_name)
@@ -155,6 +199,16 @@ class ProjectScopedGraphClient:
 
     def delete_node_by_name(self, name: str) -> bool:
         return self.client.delete_node_by_name(self._name(name))
+
+    def delete_nodes_by_names(self, names: list[str]) -> int:
+        internal_names = [self._name(name) for name in names]
+        if hasattr(self.client, "delete_nodes_by_names"):
+            return int(self.client.delete_nodes_by_names(internal_names) or 0)
+        deleted = 0
+        for name in names:
+            if self.delete_node_by_name(name):
+                deleted += 1
+        return deleted
 
     def delete_edge_by_tuple(self, source_name: str, target_name: str, relation_type: str = "CALLS") -> bool:
         return self.client.delete_edge_by_tuple(
@@ -353,10 +407,7 @@ class ProjectScopedGraphClient:
             for node in graph.nodes
             if node.kind in DYNAMIC_KINDS and token in node.name
         ]
-        deleted = 0
-        for node in targets:
-            if self.delete_node_by_name(node.name):
-                deleted += 1
+        deleted = self.delete_nodes_by_names([node.name for node in targets])
 
         # Trace and Exception nodes may be shared across incidents. Prune only
         # those left without any edge after removing this batch.
@@ -366,11 +417,12 @@ class ProjectScopedGraphClient:
             for edge in remaining.edges
             for endpoint in (edge.source, edge.target)
         }
-        pruned = 0
-        for node in remaining.nodes:
-            if node.kind in {"Trace", "Exception"} and node.name not in connected:
-                if self.delete_node_by_name(node.name):
-                    pruned += 1
+        prune_names = [
+            node.name
+            for node in remaining.nodes
+            if node.kind in {"Trace", "Exception"} and node.name not in connected
+        ]
+        pruned = self.delete_nodes_by_names(prune_names)
         return {"deleted_dynamic_nodes": deleted, "pruned_orphans": pruned}
 
     def clear_architecture_graph(self) -> dict[str, int]:

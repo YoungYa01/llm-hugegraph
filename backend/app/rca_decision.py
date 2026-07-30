@@ -29,9 +29,16 @@ class _UnavailableSession:
 class RcaDecisionService:
     """Ask the preferred RCA decision model to choose the strongest hypothesis."""
 
-    def __init__(self, settings: Any | None = None, session: Any | None = None) -> None:
+    def __init__(
+        self,
+        settings: Any | None = None,
+        session: Any | None = None,
+        reuse_conversation: bool = False,
+    ) -> None:
         self.settings = settings or get_settings()
         self.session = session or (requests.Session() if requests is not None else _UnavailableSession())
+        self.reuse_conversation = reuse_conversation
+        self.conversation_id = ""
         if bool(getattr(self.settings, "llm_disable_env_proxy", True)):
             self.session.trust_env = False
         self.log_compressor = LogContextCompressor(
@@ -74,7 +81,6 @@ class RcaDecisionService:
     def _post_conversation(self, prompt: str) -> tuple[str, dict[str, Any]]:
         payload = {
             "content": prompt,
-            "conversation_id": str(getattr(self.settings, "rca_decision_conversation_id", "") or ""),
             "model_config_id": str(getattr(self.settings, "rca_decision_model_config_id", "") or ""),
             "attachments": [],
             "stream": bool(getattr(self.settings, "rca_decision_stream", False)),
@@ -88,6 +94,8 @@ class RcaDecisionService:
             "kb_id": self._nullable_setting("rca_decision_kb_id"),
             "kb_name": self._nullable_setting("rca_decision_kb_name"),
         }
+        if self.reuse_conversation and self.conversation_id:
+            payload["conversation_id"] = self.conversation_id
         response = self.session.post(
             str(getattr(self.settings, "rca_decision_url", "http://127.0.0.1/api/conversation")),
             json=payload,
@@ -102,6 +110,10 @@ class RcaDecisionService:
         content, meta = self._conversation_content(response)
         if not content.strip():
             raise RuntimeError("decision model returned empty content")
+        if self.reuse_conversation:
+            conversation_id = str(meta.get("conversation_id") or "").strip()
+            if conversation_id:
+                self.conversation_id = conversation_id
         return content, meta
 
     def _nullable_setting(self, name: str) -> str | None:
@@ -158,11 +170,15 @@ class RcaDecisionService:
     def _meta_from_json(self, data: Any) -> dict[str, Any]:
         if not isinstance(data, dict):
             return {}
-        return {
+        meta = {
             key: data[key]
             for key in ("conversation_id", "execute_id", "id", "message_type")
             if data.get(key) is not None
         }
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            meta.update({key: value for key, value in self._meta_from_json(nested).items() if key not in meta})
+        return meta
 
     def _content_to_text(self, value: Any) -> str:
         if value is None:

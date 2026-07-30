@@ -326,6 +326,20 @@ class HugeGraphRestClient:
                     return self.update_node_by_id(str(existing.get("id") or ""), name, layer, kind, description, source_file, meta)
             raise
 
+    def upsert_nodes_bulk(self, nodes: list[dict[str, Any]]) -> int:
+        count = 0
+        for node in nodes:
+            self.upsert_node(
+                name=str(node.get("name") or ""),
+                layer=str(node.get("layer") or "Component层"),
+                kind=str(node.get("kind") or "Component"),
+                description=str(node.get("description") or ""),
+                source_file=str(node.get("source_file") or ""),
+                meta=node.get("meta") if isinstance(node.get("meta"), dict) else {},
+            )
+            count += 1
+        return count
+
     def _encoded_id_candidates(self, vertex_id: str) -> list[str]:
         if not vertex_id:
             return []
@@ -470,6 +484,39 @@ class HugeGraphRestClient:
             target = self.upsert_node(target_name, "Component层", "Component", "自动创建的关系端点", "manual")
         return self.add_edge(str(source.get("id") or ""), str(target.get("id") or ""), relation_type, description, meta)
 
+    def add_edges_by_names_bulk(self, edges: list[dict[str, Any]]) -> int:
+        self.ensure_schema()
+        vertices = self.list_vertices(limit=100000)
+        name_to_id = {
+            str((vertex.get("properties") or {}).get(self.pk_name) or ""): str(vertex.get("id") or "")
+            for vertex in vertices
+        }
+        count = 0
+        for edge in edges:
+            source_name = str(edge.get("source") or "")
+            target_name = str(edge.get("target") or "")
+            if not source_name or not target_name or source_name == target_name:
+                continue
+            source_id = name_to_id.get(source_name)
+            if not source_id:
+                source = self.upsert_node(source_name, "Component层", "Component", "自动创建的关系端点", "manual")
+                source_id = str(source.get("id") or "")
+                name_to_id[source_name] = source_id
+            target_id = name_to_id.get(target_name)
+            if not target_id:
+                target = self.upsert_node(target_name, "Component层", "Component", "自动创建的关系端点", "manual")
+                target_id = str(target.get("id") or "")
+                name_to_id[target_name] = target_id
+            self.add_edge(
+                source_id,
+                target_id,
+                str(edge.get("type") or "CALLS"),
+                str(edge.get("description") or ""),
+                edge.get("meta") if isinstance(edge.get("meta"), dict) else {},
+            )
+            count += 1
+        return count
+
     def delete_edge_by_tuple(self, source_name: str, target_name: str, relation_type: str = "CALLS") -> bool:
         self.ensure_schema()
         for edge in self.list_edges(limit=10000):
@@ -493,6 +540,35 @@ class HugeGraphRestClient:
             return True
         except HugeGraphRestError:
             return False
+
+    def delete_nodes_by_names(self, names: list[str]) -> int:
+        self.ensure_schema()
+        target_names = {str(name or "") for name in names if str(name or "")}
+        if not target_names:
+            return 0
+        vertices = self.list_vertices(limit=100000)
+        targets = [
+            vertex
+            for vertex in vertices
+            if str((vertex.get("properties") or {}).get(self.pk_name) or "") in target_names
+        ]
+        target_ids = {str(vertex.get("id") or "") for vertex in targets if str(vertex.get("id") or "")}
+        if not target_ids:
+            return 0
+        for edge in self.list_edges(limit=200000):
+            if str(edge.get("outV") or "") in target_ids or str(edge.get("inV") or "") in target_ids:
+                self.delete_edge_by_id(str(edge.get("id") or ""))
+        deleted = 0
+        for vertex in targets:
+            vertex_id = str(vertex.get("id") or "")
+            for encoded in self._encoded_id_candidates(vertex_id):
+                try:
+                    self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
+                    deleted += 1
+                    break
+                except HugeGraphRestError:
+                    continue
+        return deleted
 
     def _vertex_name_by_id(self, vertex_id: str) -> str:
         for vertex in self.list_vertices(limit=10000):

@@ -38,6 +38,37 @@ class IncidentImportResult:
         }
 
 
+@dataclass
+class PendingGraphNode:
+    name: str
+    layer: str
+    kind: str
+    description: str
+    source_file: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PendingGraphEdge:
+    source: str
+    target: str
+    type: str
+    description: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+DYNAMIC_GRAPH_KINDS = {
+    "Incident",
+    "Trace",
+    "LogEvent",
+    "Exception",
+    "Window",
+    "Metric",
+    "RCAHypothesis",
+    "UnresolvedDependency",
+}
+
+
 class IncidentGraphIntegrator:
     """Map sliding-window root-cause outputs into the architecture KG.
 
@@ -55,7 +86,10 @@ class IncidentGraphIntegrator:
         self.edges_written = 0
         self.rca_results: list[dict[str, Any]] = []
         self._known_nodes: dict[str, dict[str, Any]] = {}
-        self.decision_service = RcaDecisionService()
+        self.decision_service = RcaDecisionService(reuse_conversation=True)
+        self._buffer_graph_writes = False
+        self._pending_nodes: dict[str, PendingGraphNode] = {}
+        self._pending_edges: dict[tuple[str, str, str], PendingGraphEdge] = {}
 
     def import_path(
         self,
@@ -235,11 +269,73 @@ class IncidentGraphIntegrator:
         }
         rca_engine = RootCauseEngine(architecture)
         for detail in details:
+            self._begin_graph_buffer()
             rca = rca_engine.analyze(detail, top_k=max(1, min(self.settings.rca_top_k, 20)))
             rca_data = rca.model_dump()
             rca_data["llm_decision"] = self.decision_service.enrich(detail, rca_data)
             self.rca_results.append(rca_data)
             self._import_one(detail, source_name, rca)
+            self._flush_graph_buffer()
+
+    def _begin_graph_buffer(self) -> None:
+        self._buffer_graph_writes = True
+        self._pending_nodes = {}
+        self._pending_edges = {}
+
+    def _flush_graph_buffer(self) -> None:
+        nodes, edges = self._pruned_pending_graph()
+        if hasattr(self.db, "upsert_nodes_bulk"):
+            self.nodes_written += int(self.db.upsert_nodes_bulk([node.__dict__ for node in nodes]) or 0)
+        else:
+            for node in nodes:
+                self.db.upsert_node(
+                    name=node.name,
+                    layer=node.layer,
+                    kind=node.kind,
+                    description=node.description,
+                    source_file=node.source_file,
+                    meta=node.meta,
+                )
+                self.nodes_written += 1
+
+        edge_items = [
+            {
+                "source": edge.source,
+                "target": edge.target,
+                "type": edge.type,
+                "description": edge.description,
+                "meta": edge.meta,
+            }
+            for edge in edges
+        ]
+        if hasattr(self.db, "add_edges_by_names_bulk"):
+            self.edges_written += int(self.db.add_edges_by_names_bulk(edge_items) or 0)
+        else:
+            for edge in edges:
+                self.db.add_edge_by_names(edge.source, edge.target, edge.type, edge.description, edge.meta)
+                self.edges_written += 1
+        self._begin_graph_buffer()
+        self._buffer_graph_writes = False
+
+    def _pruned_pending_graph(self) -> tuple[list[PendingGraphNode], list[PendingGraphEdge]]:
+        connected = {
+            endpoint
+            for edge in self._pending_edges.values()
+            for endpoint in (edge.source, edge.target)
+        }
+        essential_kinds = {"Incident"}
+        kept_names = {
+            name
+            for name, node in self._pending_nodes.items()
+            if name in connected or node.kind in essential_kinds
+        }
+        edges = [
+            edge
+            for edge in self._pending_edges.values()
+            if edge.source in kept_names and edge.target in kept_names
+        ]
+        nodes = [node for name, node in self._pending_nodes.items() if name in kept_names]
+        return nodes, edges
 
     def _write_node(
         self,
@@ -259,20 +355,105 @@ class IncidentGraphIntegrator:
         # or aliases with the generic "异常链路关联到的服务" payload.
         if preserve_existing and name in self._known_nodes:
             return
-        self.db.upsert_node(name=name, layer=layer, kind=kind, description=description, source_file=source_file, meta=meta or {})
-        self.nodes_written += 1
+        node_meta = self._graph_meta(name, kind, meta or {})
+        if self._buffer_graph_writes:
+            self._pending_nodes[name] = PendingGraphNode(
+                name=name,
+                layer=layer,
+                kind=kind,
+                description=description,
+                source_file=source_file,
+                meta=node_meta,
+            )
+        else:
+            self.db.upsert_node(name=name, layer=layer, kind=kind, description=description, source_file=source_file, meta=node_meta)
+            self.nodes_written += 1
         self._known_nodes[name] = {
             "kind": kind,
             "layer": layer,
             "description": description,
-            "meta": meta or {},
+            "meta": node_meta,
         }
 
     def _write_edge(self, source: str, target: str, rel_type: str, description: str = "", meta: dict[str, Any] | None = None) -> None:
         if not source or not target or source == target:
             return
-        self.db.add_edge_by_names(source, target, rel_type, description, meta or {})
-        self.edges_written += 1
+        edge_meta = self._graph_meta(source, "", meta or {})
+        if self._buffer_graph_writes:
+            self._pending_edges[(source, target, rel_type)] = PendingGraphEdge(
+                source=source,
+                target=target,
+                type=rel_type,
+                description=description,
+                meta=edge_meta,
+            )
+        else:
+            self.db.add_edge_by_names(source, target, rel_type, description, edge_meta)
+            self.edges_written += 1
+
+    def _graph_meta(self, name: str, kind: str, meta: dict[str, Any]) -> dict[str, Any]:
+        result = dict(meta)
+        if kind in DYNAMIC_GRAPH_KINDS or name.startswith(("Incident:", "LogEvent:", "RootCandidate:", "RCAHypothesis:")):
+            prefix = self._batch_prefix_from_name(name)
+            if prefix:
+                result.setdefault("log_batch_prefix", prefix)
+            result.setdefault("dynamic_observation", True)
+        return result
+
+    def _batch_prefix_from_name(self, name: str) -> str:
+        parts = str(name or "").split(":")
+        if len(parts) >= 3 and parts[1]:
+            return parts[1]
+        return ""
+
+    def _select_relevant_timeline(
+        self,
+        timeline: list[Any],
+        detail: dict[str, Any],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        root_error_timestamp = str(detail.get("root_error_timestamp") or "")
+        root_candidates = detail.get("root_candidates") if isinstance(detail.get("root_candidates"), list) else []
+        candidate_ids = {
+            str(item.get("event_id") or "")
+            for item in root_candidates
+            if isinstance(item, dict) and item.get("event_id")
+        }
+        candidate_texts = [
+            str(item.get("root_cause") or item.get("message") or "").strip().lower()
+            for item in root_candidates
+            if isinstance(item, dict) and str(item.get("root_cause") or item.get("message") or "").strip()
+        ]
+        selected: list[tuple[int, dict[str, Any]]] = []
+        for index, event in enumerate(timeline, start=1):
+            if isinstance(event, dict) and self._is_relevant_timeline_event(
+                event,
+                root_error_timestamp,
+                candidate_ids,
+                candidate_texts,
+            ):
+                selected.append((index, event))
+        return selected
+
+    def _is_relevant_timeline_event(
+        self,
+        event: dict[str, Any],
+        root_error_timestamp: str,
+        candidate_ids: set[str],
+        candidate_texts: list[str],
+    ) -> bool:
+        level = str(event.get("level") or "").upper()
+        if level in {"ERROR", "FATAL", "CRITICAL", "WARN"}:
+            return True
+        if str(event.get("timestamp") or "") and str(event.get("timestamp") or "") == root_error_timestamp:
+            return True
+        if str(event.get("event_id") or "") in candidate_ids:
+            return True
+        if any(str(event.get(key) or "").strip() for key in ("root_cause", "exception_class", "root_exception_class", "exception_chain", "incident_role")):
+            return True
+        text = " ".join(str(event.get(key) or "") for key in ("message", "root_cause")).lower()
+        if any(token in text for token in ("exception", "error", "timeout", "failed", "failure", "refused", "denied", "unavailable", "panic")):
+            return True
+        return any(candidate and candidate in text for candidate in candidate_texts)
 
     def _import_one(self, detail: dict[str, Any], source_name: str, rca: RootCauseAnalysis) -> None:
         incident_id = str(detail.get("incident_id") or "I00000")
@@ -363,11 +544,10 @@ class IncidentGraphIntegrator:
             timeline = timeline[: max(1, int(self.settings.incident_timeline_limit))]
         else:
             timeline = []
+        selected_timeline = self._select_relevant_timeline(timeline, detail)
         prev_event_node = ""
         prev_service_node = ""
-        for idx, event in enumerate(timeline, start=1):
-            if not isinstance(event, dict):
-                continue
+        for idx, event in selected_timeline:
             service_raw = str(event.get("service") or "")
             service_node = self._resolve_arch_service(service_raw)
             timestamp = str(event.get("timestamp") or "")
@@ -482,7 +662,7 @@ class IncidentGraphIntegrator:
         top_text = f", rca={top.candidate}/{top.fault_mode}/{top.confidence:.2f}" if top else ""
         self.logs.append(
             f"导入 {incident_id}: root_service={root_service_raw or '-'}, "
-            f"trace={primary_trace or '-'}, timeline_events={len(timeline)}{top_text}"
+            f"trace={primary_trace or '-'}, timeline_events={len(timeline)}, stored_events={len(selected_timeline)}{top_text}"
         )
 
     def _write_rca(

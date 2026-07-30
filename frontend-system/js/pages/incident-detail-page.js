@@ -83,7 +83,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       </section>
 
       <section class="card fusion-graph-card" style="margin-bottom:20px">
-        <div class="card-header"><div><h2>本次故障融合定位图</h2><p>仅在这里把当前 Incident、RCA 假设和证据节点与相关架构子图融合；不会污染架构管理页面。</p></div><button class="button ${includeEvents ? "button-primary" : "button-secondary"}" id="toggle-event-nodes">${includeEvents ? "隐藏日志事件" : "展开日志事件节点"}</button></div>
+        <div class="card-header"><div><h2>本次故障融合定位图</h2><p>仅在这里把当前 Incident、RCA 假设和证据节点与相关架构子图融合；不会污染架构管理页面。</p></div></div>
         <div class="card-body">
           ${fusionError ? `<div class="notice notice-warning" style="margin-bottom:12px">融合图暂不可用：${escapeHtml(fusionError)}。下方持久化 RCA 结论仍可正常查看。</div>` : ""}
           ${fusionGraph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(fusionGraph.warnings.join("；"))}</div>` : ""}

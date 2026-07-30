@@ -84,6 +84,15 @@ class Settings:
     incident_timeline_limit: int = _int_env("INCIDENT_TIMELINE_LIMIT", 120)
     rca_top_k: int = _int_env("RCA_TOP_K", 5)
 
+    # Deterministic log compression before the final RCA decision LLM call.
+    # max_chars is a hard budget for the compressed log-context JSON only.
+    log_compression_enabled: bool = _bool_env("LOG_COMPRESSION_ENABLED", True)
+    log_compression_max_chars: int = _int_env("LOG_COMPRESSION_MAX_CHARS", 12000)
+    log_compression_max_events: int = _int_env("LOG_COMPRESSION_MAX_EVENTS", 48)
+    log_compression_context_radius: int = _int_env("LOG_COMPRESSION_CONTEXT_RADIUS", 2)
+    log_compression_max_patterns: int = _int_env("LOG_COMPRESSION_MAX_PATTERNS", 12)
+    log_compression_max_message_chars: int = _int_env("LOG_COMPRESSION_MAX_MESSAGE_CHARS", 700)
+
     # Preferred model for choosing the most likely RCA candidate after the
     # deterministic hypothesis list has been generated.
     rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)

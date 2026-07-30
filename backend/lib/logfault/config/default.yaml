@@ -34,20 +34,45 @@ pca:
   target_variance: 0.95
 
 model:
-  type: "isolation_forest"
+  type: isolation_forest
   contamination: 0.03
   n_estimators: 300
   random_state: 42
   ocsvm_nu: 0.03
-  ocsvm_gamma: "scale"
-  # 没有独立正常训练集时，窗口少于该值则不信任纯模型异常标签，改用 ERROR/异常栈规则兜底。
+  ocsvm_gamma: scale
   min_training_windows: 30
 
 explain:
   top_templates: 10
   top_trace_ids: 10
-  max_timeline_events: 200
+  max_timeline_events: 300
+  max_root_candidates: 30
+
+  # 窗口只是“异常检测范围”；Incident 表示故障 episode，不表示请求/trace。
   merge_gap_minutes: 1
-  # 任何包含 ERROR 的窗口都进入故障候选，避免小样本时模型漏掉真实错误。
-  always_include_error_windows: true
+
+  # V3：traceId 只作为“可以合并”的强证据，不再作为“必须拆分”的边界。
+  # 同一服务、同异常类在 8 分钟内连续出现，或同故障族在 5 分钟内连续出现，归为同一 episode。
+  same_signature_gap_minutes: 8
+  same_family_gap_minutes: 5
+  trace_join_gap_minutes: 10
+  cross_service_gap_minutes: 2
+
+  # 0 表示不按固定时长硬切；主要依赖“无错误的静默间隔”切分，避免长故障被每 30 分钟强拆。
+  max_incident_duration_minutes: 0
+  context_before_seconds: 60
+  context_after_seconds: 120
+
+  # 不再把所有业务 ERROR 都强行提升为系统 Incident。Redis/DB/网络/超时/类加载等技术故障仍会规则保护。
+  always_include_error_windows: false
+  protect_technical_error_windows: true
   include_known_root_signals: true
+
+  # 未被模型或技术故障规则选中的 ERROR 只进入审计文件，不自动创建 Incident。
+  always_include_error_events: false
+  seed_all_error_events_within_candidate_region: false
+  seed_nontechnical_errors_on_model_windows: true
+
+  # 跨服务合并默认保守；只有显式打开时才按相同异常类/异常族跨服务合并。
+  merge_same_class_across_services: false
+  merge_same_family_across_services: false

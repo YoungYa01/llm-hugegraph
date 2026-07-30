@@ -295,6 +295,9 @@ class IncidentGraphIntegrator:
                 "fault_start": detail.get("fault_start"),
                 "fault_end": detail.get("fault_end"),
                 "root_error_timestamp": detail.get("root_error_timestamp"),
+                "root_exception_class": detail.get("root_exception_class"),
+                "exception_classes": detail.get("exception_summary") or detail.get("exception_classes") or [],
+                "detection_source": detail.get("detection_source"),
             },
         )
         if root_service:
@@ -318,6 +321,36 @@ class IncidentGraphIntegrator:
         if exception_name:
             self._write_node(exception_name, "异常分析层", "Exception", root_cause[:500], source_name, {"root_cause": root_cause})
             self._write_edge(incident_node, exception_name, "HAS_EXCEPTION", "日志中提取到的底层异常特征", {"root_cause": root_cause})
+
+        # logfault-incident-clustering-v2: preserve every exception class, not only Top-1.
+        exception_summaries = detail.get("exception_summary") or detail.get("exception_classes") or []
+        if isinstance(exception_summaries, list):
+            for summary in exception_summaries:
+                if isinstance(summary, dict):
+                    class_name = str(summary.get("root_exception_class") or summary.get("exception_class") or "").strip()
+                    summary_meta = dict(summary)
+                else:
+                    class_name = str(summary or "").strip()
+                    summary_meta = {"root_exception_class": class_name}
+                if not class_name:
+                    continue
+                summary_node = self._exception_node_name(class_name)
+                self._write_node(
+                    summary_node,
+                    "异常分析层",
+                    "Exception",
+                    str(summary_meta.get("representative_message") or class_name)[:500],
+                    source_name,
+                    summary_meta,
+                    preserve_existing=True,
+                )
+                self._write_edge(
+                    incident_node,
+                    summary_node,
+                    "HAS_EXCEPTION",
+                    "该异常类已由事件映射归属到本故障",
+                    summary_meta,
+                )
         if primary_trace:
             trace_node = f"Trace:{primary_trace}"
             self._write_node(trace_node, "异常分析层", "Trace", f"主 traceId：{primary_trace}", source_name, {})
@@ -358,9 +391,35 @@ class IncidentGraphIntegrator:
                     "source_line": event.get("source_line"),
                     "message": event.get("message"),
                     "root_cause": event.get("root_cause"),
+                    "event_id": event.get("event_id"),
+                    "exception_class": event.get("exception_class"),
+                    "root_exception_class": event.get("root_exception_class"),
+                    "exception_chain": event.get("exception_chain"),
+                    "incident_role": event.get("incident_role"),
                 },
             )
             self._write_edge(incident_node, event_node, "HAS_EVENT", "故障包含该日志事件", {"order": idx})
+            event_exception_class = str(
+                event.get("root_exception_class") or event.get("exception_class") or ""
+            ).strip()
+            if event_exception_class:
+                event_exception_node = self._exception_node_name(event_exception_class)
+                self._write_node(
+                    event_exception_node,
+                    "异常分析层",
+                    "Exception",
+                    event_exception_class,
+                    source_name,
+                    {"root_exception_class": event_exception_class},
+                    preserve_existing=True,
+                )
+                self._write_edge(
+                    event_node,
+                    event_exception_node,
+                    "RAISES",
+                    "该日志事件解析出的根异常类",
+                    {"event_id": event.get("event_id"), "incident_role": event.get("incident_role")},
+                )
             if trace_node:
                 self._write_edge(trace_node, event_node, "HAS_EVENT", "trace 下的日志事件", {"order": idx})
             if service_node:
@@ -497,7 +556,7 @@ class IncidentGraphIntegrator:
         text = root_cause.strip() or "UnknownException"
         match = re.search(r"([A-Za-z_][\w.$]*(?:Exception|Error))", text)
         if match:
-            return f"Exception:{match.group(1).split('.')[-1]}"
+            return f"Exception:{match.group(1)}"
         return "Exception:" + re.sub(r"\s+", " ", text[:48])
 
     def _resolve_arch_service(self, service_name: str) -> str:

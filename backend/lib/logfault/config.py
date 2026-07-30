@@ -38,12 +38,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "random_state": 42,
         "ocsvm_nu": 0.03,
         "ocsvm_gamma": "scale",
+        "min_training_windows": 30,
     },
     "explain": {
         "top_templates": 10,
         "top_trace_ids": 10,
-        "max_timeline_events": 200,
+        "max_timeline_events": 300,
+        "max_root_candidates": 30,
         "merge_gap_minutes": 1,
+        # Incident is a fault episode, not a request/trace. Different traceIds may
+        # belong to the same outage when service/class/family and time are compatible.
+        "same_signature_gap_minutes": 8,
+        "same_family_gap_minutes": 5,
+        "trace_join_gap_minutes": 10,
+        "cross_service_gap_minutes": 2,
+        # 0 disables a hard duration split; silence gaps are the primary boundary.
+        "max_incident_duration_minutes": 0,
+        "context_before_seconds": 60,
+        "context_after_seconds": 120,
+        # Do not promote every business ERROR into a system Incident.
+        "always_include_error_windows": False,
+        "protect_technical_error_windows": True,
+        "always_include_error_events": False,
+        "include_known_root_signals": True,
+        "seed_all_error_events_within_candidate_region": False,
+        "seed_nontechnical_errors_on_model_windows": True,
+        "merge_same_class_across_services": False,
+        "merge_same_family_across_services": False,
     },
 }
 

@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
         return text
 
 from .config import get_settings
+from .log_compression import LogCompressionConfig, LogContextCompressor
 
 
 class _UnavailableSession:
@@ -33,14 +34,26 @@ class RcaDecisionService:
         self.session = session or (requests.Session() if requests is not None else _UnavailableSession())
         if bool(getattr(self.settings, "llm_disable_env_proxy", True)):
             self.session.trust_env = False
+        self.log_compressor = LogContextCompressor(
+            LogCompressionConfig(
+                enabled=bool(getattr(self.settings, "log_compression_enabled", True)),
+                max_chars=int(getattr(self.settings, "log_compression_max_chars", 12_000)),
+                max_events=int(getattr(self.settings, "log_compression_max_events", 48)),
+                context_radius=int(getattr(self.settings, "log_compression_context_radius", 2)),
+                max_patterns=int(getattr(self.settings, "log_compression_max_patterns", 12)),
+                max_message_chars=int(getattr(self.settings, "log_compression_max_message_chars", 700)),
+            )
+        )
 
     def enrich(self, detail: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
         fallback = self._fallback_decision(analysis, source="fallback")
         if not bool(getattr(self.settings, "rca_decision_enabled", True)):
             return {**fallback, "error": "RCA decision model is disabled"}
 
+        compression_summary: dict[str, Any] = {}
         try:
-            raw_content, meta = self._post_conversation(self._build_prompt(detail, analysis))
+            prompt, compression_summary = self._build_prompt_with_meta(detail, analysis)
+            raw_content, meta = self._post_conversation(prompt)
             parsed = self._parse_model_json(raw_content)
             result = self._normalize_model_result(parsed, analysis, fallback)
             return {
@@ -49,11 +62,13 @@ class RcaDecisionService:
                 "model_config_id": str(getattr(self.settings, "rca_decision_model_config_id", "") or ""),
                 "conversation_id": str(meta.get("conversation_id") or ""),
                 "raw_content": raw_content,
+                "log_compression": compression_summary,
             }
         except Exception as exc:  # noqa: BLE001
             return {
                 **fallback,
                 "error": str(exc),
+                "log_compression": compression_summary,
             }
 
     def _post_conversation(self, prompt: str) -> tuple[str, dict[str, Any]]:
@@ -293,26 +308,58 @@ class RcaDecisionService:
         return [str(value).strip()] if str(value).strip() else []
 
     def _build_prompt(self, detail: dict[str, Any], analysis: dict[str, Any]) -> str:
+        prompt, _ = self._build_prompt_with_meta(detail, analysis)
+        return prompt
+
+    def _build_prompt_with_meta(
+        self,
+        detail: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        timeline = detail.get("timeline") if isinstance(detail.get("timeline"), list) else []
+        evidence = {
+            "root_service_candidate": detail.get("root_service_candidate"),
+            "root_cause_candidate": detail.get("root_cause_candidate"),
+            "root_evidence": detail.get("root_evidence"),
+        }
+        if self.log_compressor.config.enabled:
+            log_context = self.log_compressor.compress(timeline, root_evidence=evidence)
+        else:
+            limit = min(20, max(1, self.log_compressor.config.max_events))
+            key_events = [self._compact_value(item) for item in timeline[:limit]]
+            log_context = {
+                "summary": {
+                    "compression_enabled": False,
+                    "original_events": len(timeline),
+                    "selected_events": len(key_events),
+                    "omitted_events": max(0, len(timeline) - len(key_events)),
+                },
+                "key_events": key_events,
+                "repeated_patterns": [],
+            }
+
         prompt_data = {
             "incident": {
                 "incident_id": detail.get("incident_id") or analysis.get("incident_id"),
                 "root_service_candidate": detail.get("root_service_candidate"),
                 "root_cause_candidate": detail.get("root_cause_candidate"),
-                "root_evidence": detail.get("root_evidence"),
+                "root_evidence": self._compact_value(detail.get("root_evidence")),
                 "fault_start": detail.get("fault_start"),
                 "fault_end": detail.get("fault_end"),
-                "timeline": (detail.get("timeline") or [])[:20] if isinstance(detail.get("timeline"), list) else [],
+                "log_context": log_context,
             },
             "deterministic_rca": {
                 "decision": analysis.get("decision"),
                 "resolved_root_service": analysis.get("resolved_root_service"),
-                "hypotheses": (analysis.get("hypotheses") or [])[:8],
-                "limitations": analysis.get("limitations") or [],
+                "hypotheses": self._compact_hypotheses(analysis.get("hypotheses")),
+                "limitations": self._compact_value(analysis.get("limitations") or []),
             },
         }
-        return (
+        prompt = (
             "你是生产故障 RCA 决策助手。请只基于输入的候选根因、证据和限制信息，"
             "选出一个最可能原因，并给出可执行的排查方法。不要编造候选根因或不存在的证据。\n"
+            "incident.log_context 已经过确定性日志压缩：key_events 是按严重度、异常信号、稀有度、"
+            "服务/trace 多样性和故障邻域筛选的关键事件；repeated_patterns 汇总被折叠的重复日志。\n"
             "请严格返回 JSON 对象，不要 Markdown，不要解释，不要代码块。JSON 格式：\n"
             "{"
             "\"selected_candidate\":\"候选名称\","
@@ -325,6 +372,45 @@ class RcaDecisionService:
             "}\n"
             f"输入数据：\n{json.dumps(prompt_data, ensure_ascii=False, indent=2)}"
         )
+        return prompt, dict(log_context.get("summary") or {})
+
+    def _compact_hypotheses(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        allowed = (
+            "rank",
+            "candidate",
+            "architecture_node",
+            "fault_mode",
+            "confidence",
+            "status",
+            "summary",
+            "chain",
+            "evidence",
+            "missing_evidence",
+            "validation_suggestions",
+        )
+        result: list[dict[str, Any]] = []
+        for item in value[:8]:
+            if not isinstance(item, dict):
+                continue
+            result.append({key: self._compact_value(item.get(key)) for key in allowed if key in item})
+        return result
+
+    def _compact_value(self, value: Any, depth: int = 0) -> Any:
+        if depth >= 4:
+            return "<truncated>"
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            return text if len(text) <= 900 else text[:899] + "…"
+        if isinstance(value, list):
+            return [self._compact_value(item, depth + 1) for item in value[:12]]
+        if isinstance(value, dict):
+            items = list(value.items())[:24]
+            return {str(key): self._compact_value(item, depth + 1) for key, item in items}
+        return self._compact_value(str(value), depth + 1)
 
     def _safe_int(self, value: Any) -> int:
         try:

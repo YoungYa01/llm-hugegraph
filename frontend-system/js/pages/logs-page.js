@@ -27,7 +27,6 @@ export async function renderLogsPage(root, project) {
           <div class="card-body">
             <form class="form-stack" id="log-form">
               <div class="field"><label>待检测日志</label><label class="file-drop"><input type="file" name="file" required accept=".log,.txt,.zip,text/plain,application/zip" /><strong id="target-file-label">选择待分析日志或 ZIP</strong><span>Spring Boot 多服务日志建议打包为 ZIP</span></label></div>
-              <div class="field"><label>正常训练日志（可选）</label><label class="file-drop" style="min-height:95px"><input type="file" name="train_file" accept=".log,.txt,.zip,text/plain,application/zip" /><strong id="train-file-label">选择正常历史日志</strong><span>样本充足时会提升 Isolation Forest / OCSVM 的可信度</span></label></div>
               <div class="notice notice-warning">当前 MVP 采用同步分析。浏览器会等待任务完成，请不要重复点击；生产部署建议换成 Celery / Redis 队列。</div>
               <button class="button button-primary" id="run-analysis" type="submit">开始异常检测与 RCA</button>
             </form>

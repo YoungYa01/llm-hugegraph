@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import tempfile
 import zipfile
@@ -19,7 +20,13 @@ LOG_START_RE = re.compile(
     r"(?P<logger>.*?)\s*:\s*(?P<message>.*)$"
 )
 TRACE_PREFIX_RE = re.compile(r"^\[(?P<trace>[0-9a-fA-F]{8,32})\]\s*(?P<message>.*)$")
-EXCEPTION_RE = re.compile(r"^(?:Caused by:\s*)?(?P<class>[\w.$]+(?:Exception|Error))(?::\s*(?P<message>.*))?$")
+EXCEPTION_CLASS_RE = re.compile(r"(?P<class>[A-Za-z_$][\w.$]*(?:Exception|Error))\b")
+EXCEPTION_HEADER_RE = re.compile(
+    r"^(?:(?P<prefix>Caused by|Suppressed)\s*:\s*)?"
+    r"(?P<class>[A-Za-z_$][\w.$]*(?:Exception|Error))"
+    r"(?::\s*(?P<message>.*))?$",
+    re.IGNORECASE,
+)
 PORT_SUFFIX_RE = re.compile(r"-\d+$")
 
 
@@ -37,6 +44,7 @@ class ParsedEvent:
     exception_class: str
     root_exception_class: str
     root_cause: str
+    exception_chain: str
     raw_block: str
     source_file: str
     source_line: int
@@ -47,7 +55,6 @@ def _matches_any(path: str, patterns: list[str]) -> bool:
     for pattern in patterns:
         if fnmatch.fnmatch(normalized, pattern):
             return True
-        # Python fnmatch 对根目录直接文件不会把 **/ 当成零级目录处理。
         if pattern.startswith("**/") and fnmatch.fnmatch(normalized, pattern[3:]):
             return True
     return False
@@ -81,8 +88,6 @@ def discover_log_files(root: Path, include_globs: list[str], exclude_globs: list
     return sorted(files)
 
 
-
-
 def _parse_timestamp(value: str) -> datetime:
     formats = (
         "%y/%m/%d %H:%M:%S.%f",
@@ -96,19 +101,60 @@ def _parse_timestamp(value: str) -> datetime:
             continue
     raise ValueError(f"不支持的日志时间格式: {value}")
 
-def _parse_exception_details(continuation_lines: list[str]) -> tuple[str, str, str]:
-    exceptions: list[tuple[str, str]] = []
+
+def _exception_entry(line: str, *, first_message: bool = False) -> dict[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("at ") or stripped.startswith("... "):
+        return None
+
+    header = EXCEPTION_HEADER_RE.match(stripped)
+    if header:
+        prefix = str(header.group("prefix") or "").lower()
+        kind = "caused_by" if prefix == "caused by" else "suppressed" if prefix == "suppressed" else "direct"
+        return {
+            "class": str(header.group("class") or ""),
+            "message": str(header.group("message") or ""),
+            "kind": kind,
+        }
+
+    # 常见包装文本："nested exception is ..."、"failed: java.x.Exception: ..."。
+    # 只在首行、Caused by/Suppressed 行或明确包含 exception is 的行中搜索，
+    # 避免把普通业务文本里提到的类名误判为异常栈头。
+    lowered = stripped.lower()
+    eligible = first_message or lowered.startswith(("caused by:", "suppressed:")) or "exception is" in lowered
+    if not eligible:
+        return None
+    token = EXCEPTION_CLASS_RE.search(stripped)
+    if not token:
+        return None
+    class_name = str(token.group("class") or "")
+    remainder = stripped[token.end() :].lstrip(": ")
+    kind = "caused_by" if lowered.startswith("caused by:") else "suppressed" if lowered.startswith("suppressed:") else "direct"
+    return {"class": class_name, "message": remainder, "kind": kind}
+
+
+def _parse_exception_details(first_message: str, continuation_lines: list[str]) -> tuple[str, str, str, str]:
+    entries: list[dict[str, str]] = []
+    first_entry = _exception_entry(first_message, first_message=True)
+    if first_entry:
+        entries.append(first_entry)
     for line in continuation_lines:
-        stripped = line.strip()
-        match = EXCEPTION_RE.match(stripped)
-        if match:
-            exceptions.append((match.group("class") or "", match.group("message") or ""))
-    if not exceptions:
-        return "", "", ""
-    first_class = exceptions[0][0]
-    root_class, root_message = exceptions[-1]
+        entry = _exception_entry(line)
+        if entry:
+            entries.append(entry)
+
+    if not entries:
+        return "", "", "", "[]"
+
+    non_suppressed = [entry for entry in entries if entry["kind"] != "suppressed"] or entries
+    first_class = non_suppressed[0]["class"]
+    caused = [entry for entry in non_suppressed if entry["kind"] == "caused_by"]
+    root = caused[-1] if caused else non_suppressed[-1]
+    root_class = root["class"]
+    root_message = root["message"]
     root_cause = f"{root_class}: {root_message}".rstrip(": ")
-    return first_class, root_class, root_cause
+    chain = json.dumps(entries, ensure_ascii=False)
+    return first_class, root_class, root_cause, chain
 
 
 def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace") -> Iterator[ParsedEvent]:
@@ -127,11 +173,13 @@ def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace")
             first_message = trace_match.group("message")
 
         continuation = item["continuation"]
-        exception_class, root_exception_class, root_cause = _parse_exception_details(continuation)
+        exception_class, root_exception_class, root_cause, exception_chain = _parse_exception_details(
+            first_message, continuation
+        )
         semantic_parts = [first_message]
-        if exception_class:
+        if exception_class and exception_class not in first_message:
             semantic_parts.append(exception_class)
-        if root_cause and root_cause != exception_class:
+        if root_cause and root_cause not in first_message and root_cause != exception_class:
             semantic_parts.append(root_cause)
         semantic_message = " | ".join(part for part in semantic_parts if part)
 
@@ -148,6 +196,7 @@ def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace")
             exception_class=exception_class,
             root_exception_class=root_exception_class,
             root_cause=root_cause,
+            exception_chain=exception_chain,
             raw_block="\n".join(item["raw_lines"]),
             source_file=str(path),
             source_line=item["source_line"],
@@ -180,6 +229,15 @@ def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace")
         yield event
 
 
+def _safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
+    root = destination.resolve()
+    for item in archive.infolist():
+        target = (root / item.filename).resolve()
+        if not target.is_relative_to(root):
+            raise ValueError("ZIP 包含不安全的目录路径")
+        archive.extract(item, root)
+
+
 def load_events(input_path: str | Path, input_config: dict) -> pd.DataFrame:
     source = Path(input_path)
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -187,7 +245,7 @@ def load_events(input_path: str | Path, input_config: dict) -> pd.DataFrame:
         if source.is_file() and source.suffix.lower() == ".zip":
             temp_dir = tempfile.TemporaryDirectory(prefix="logfault-")
             with zipfile.ZipFile(source, "r") as archive:
-                archive.extractall(temp_dir.name)
+                _safe_extract_zip(archive, Path(temp_dir.name))
             root = Path(temp_dir.name)
         else:
             root = source
@@ -213,6 +271,7 @@ def load_events(input_path: str | Path, input_config: dict) -> pd.DataFrame:
             ):
                 record = asdict(event)
                 record["source_file"] = logical_source
+                record["event_id"] = f"{logical_source}:{event.source_line}"
                 records.append(record)
 
         if not records:

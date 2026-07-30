@@ -91,4 +91,26 @@ def test_delete_log_batch_cascades_incidents_and_actions(tmp_path) -> None:
     assert database.delete_log_batch(batch["id"])
     assert database.get_log_batch(batch["id"]) is None
     assert database.get_incident(incident["id"]) is None
+
+
+def test_log_batch_progress_is_stored_in_summary_json(tmp_path) -> None:
+    database = SystemDatabase(tmp_path / "progress.db")
+    user = database.create_user("operator", "hash", "Operator")
+    project = database.create_project(user["id"], "Order", "")
+    batch = database.create_log_batch(project["id"], "logs.zip", "/tmp/logs.zip", "", "", "/tmp/out", user["id"])
+
+    database.update_log_batch_progress(
+        batch["id"],
+        status="deleting",
+        percent=42,
+        stage="graph_cleanup",
+        message="正在清理动态图谱节点和关系",
+    )
+
+    item = database.get_log_batch(batch["id"])
+    assert item["status"] == "deleting"
+    summary = __import__("json").loads(item["summary_json"])
+    assert summary["progress_percent"] == 42
+    assert summary["progress_stage"] == "graph_cleanup"
+    assert summary["progress_message"] == "正在清理动态图谱节点和关系"
     assert database.list_incident_actions(incident["id"]) == []

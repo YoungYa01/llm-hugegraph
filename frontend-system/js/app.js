@@ -1,7 +1,7 @@
 import { hasSession, restoreSession, signOut, user } from "./auth.js";
 import { navigate, onRouteChange, route } from "./router.js";
 import { bindShell } from "./shell.js";
-import { loadProject } from "./state.js";
+import { loadProject, onLogTasksChanged, startLogTaskPolling } from "./state.js";
 import { errorState, loading, toast } from "./ui.js";
 import { renderAuthPage } from "./pages/auth-page.js";
 import { renderProjectsPage } from "./pages/projects-page.js";
@@ -54,11 +54,24 @@ window.addEventListener("auth:expired", () => {
   render();
 });
 
+window.addEventListener("log-task:finished", (event) => {
+  const task = event.detail?.task || {};
+  if (task.type === "delete") toast("日志批次删除完成");
+  else if (task.status === "failed") toast("日志分析失败，请回到日志页面查看详情", "error");
+  else toast("日志分析完成，页面状态已更新");
+  render(route());
+});
+
+onLogTasksChanged(() => {
+  if (route().name === "logs") render(route());
+});
+
 onRouteChange(render);
 
 async function boot() {
   root.innerHTML = `<div class="state-panel" style="min-height:100vh"><span class="spinner"></span><p>正在恢复会话…</p></div>`;
   if (hasSession()) await restoreSession();
+  startLogTaskPolling();
   await render();
 }
 

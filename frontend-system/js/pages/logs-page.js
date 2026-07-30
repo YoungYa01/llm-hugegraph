@@ -1,12 +1,12 @@
 import { api } from "../api.js";
 import { projectShell } from "../shell.js";
+import { getLogTasks, rememberLogTask } from "../state.js";
 import { badge, emptyState, errorState, escapeHtml, formatDate, loading, setBusy, toast } from "../ui.js";
 
 export async function renderLogsPage(root, project) {
   root.innerHTML = projectShell(project, "logs", `<div id="page-content">${loading("正在读取日志批次…")}</div>`);
   const content = root.querySelector("#page-content");
   let batches = [];
-  let lastResult = null;
 
   async function load() {
     try {
@@ -19,22 +19,31 @@ export async function renderLogsPage(root, project) {
   }
 
   function paint() {
+    const tasks = getLogTasks(project.id);
     content.innerHTML = `
-      <div class="page-header"><div><h1>日志数据与异常检测</h1><p>上传 Spring 风格日志，由滑动窗口算法生成异常区间、日志根因证据，再与架构图谱联合推理。</p></div></div>
+      <div class="page-header"><div><h1>日志数据与异常检测</h1><p>上传日志包后会在后台持续分析；离开本页也不会中断任务。</p></div></div>
+      ${tasksPanel(tasks)}
       <div class="split-main" style="margin-bottom:20px">
         <section class="card">
-          <div class="card-header"><div><h2>新建分析批次</h2><p>支持单个 .log/.txt、日志目录 ZIP；可选正常历史日志作为模型训练集。</p></div></div>
+          <div class="card-header"><div><h2>新建分析批次</h2><p>支持单个 .log/.txt、日志目录 ZIP；分析进度会自动刷新。</p></div></div>
           <div class="card-body">
             <form class="form-stack" id="log-form">
               <div class="field"><label>待检测日志</label><label class="file-drop"><input type="file" name="file" required accept=".log,.txt,.zip,text/plain,application/zip" /><strong id="target-file-label">选择待分析日志或 ZIP</strong><span>Spring Boot 多服务日志建议打包为 ZIP</span></label></div>
-              <div class="notice notice-warning">当前 MVP 采用同步分析。浏览器会等待任务完成，请不要重复点击；生产部署建议换成 Celery / Redis 队列。</div>
+              <div class="notice">提交后任务进入后台队列。你可以切换到概览、架构或故障页面，完成后页面状态会自动更新。</div>
               <button class="button button-primary" id="run-analysis" type="submit">开始异常检测与 RCA</button>
             </form>
           </div>
         </section>
         <aside class="card">
-          <div class="card-header"><div><h2>最近一次结果</h2><p>算法运行和图谱融合摘要。</p></div></div>
-          <div class="card-body" id="last-result">${resultHtml(lastResult, project.id)}</div>
+          <div class="card-header"><div><h2>进度说明</h2><p>后台任务按阶段更新，完成后生成故障记录和 RCA 报告。</p></div></div>
+          <div class="card-body">
+            <div class="progress-guide">
+              ${guideStep("上传保存", "日志包落盘并创建批次")}
+              ${guideStep("窗口检测", "运行滑动窗口异常检测")}
+              ${guideStep("图谱融合", "写入错误链路和根因子图")}
+              ${guideStep("报告入库", "保存故障记录与产物")}
+            </div>
+          </div>
         </aside>
       </div>
       <section class="card">
@@ -47,19 +56,30 @@ export async function renderLogsPage(root, project) {
   function bind() {
     const form = content.querySelector("#log-form");
     const target = form?.querySelector('input[name="file"]');
-    const train = form?.querySelector('input[name="train_file"]');
-    target?.addEventListener("change", () => { content.querySelector("#target-file-label").textContent = target.files?.[0]?.name || "选择待分析日志或 ZIP"; });
-    train?.addEventListener("change", () => { content.querySelector("#train-file-label").textContent = train.files?.[0]?.name || "选择正常历史日志"; });
+    target?.addEventListener("change", () => {
+      content.querySelector("#target-file-label").textContent = target.files?.[0]?.name || "选择待分析日志或 ZIP";
+    });
     form?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const button = content.querySelector("#run-analysis");
       const data = new FormData(event.currentTarget);
       if (!data.get("train_file")?.size) data.delete("train_file");
-      setBusy(button, true, "解析、检测和图谱推理中…");
+      setBusy(button, true, "正在提交后台任务…");
       try {
-        lastResult = await api.analyzeLogs(project.id, data);
+        const result = await api.analyzeLogs(project.id, data);
+        const batch = result.batch;
+        if (batch?.id) {
+          rememberLogTask({
+            type: "analyze",
+            projectId: project.id,
+            batchId: batch.id,
+            filename: batch.filename,
+            status: batch.status,
+            summary: batch.summary || {},
+          });
+        }
         batches = (await api.logs(project.id)).items || [];
-        toast(`分析完成，形成 ${lastResult.incidents?.length || 0} 个故障事件`);
+        toast("日志分析已在后台开始");
         paint();
       } catch (error) {
         toast(error.message, "error");
@@ -68,16 +88,24 @@ export async function renderLogsPage(root, project) {
     });
     content.querySelectorAll("[data-delete-batch]").forEach((button) => button.addEventListener("click", async () => {
       const batch = batches[Number(button.dataset.deleteBatch)];
-      if (!batch) return;
+      if (!batch || batch.status === "deleting") return;
       const incidentCount = Number(batch.summary?.incidents || 0);
       const message = `删除日志批次“${batch.filename}”？${incidentCount ? `\n它关联的 ${incidentCount} 个故障记录、RCA 动态图节点和分析产物也会永久删除。` : "\n原始文件和分析产物也会永久删除。"}`;
       if (!window.confirm(message)) return;
-      setBusy(button, true, "删除中…");
+      setBusy(button, true, "启动删除…");
       try {
         const result = await api.deleteBatch(project.id, batch.id);
-        batches = batches.filter((item) => item.id !== batch.id);
-        if (lastResult?.batch?.id === batch.id) lastResult = null;
-        toast(result.warnings?.length ? `批次已删除；${result.warnings.join("；")}` : "日志批次及关联故障已删除");
+        const deleting = result.batch || { ...batch, status: "deleting", summary: { progress_percent: 8, progress_message: "删除任务已开始" } };
+        rememberLogTask({
+          type: "delete",
+          projectId: project.id,
+          batchId: batch.id,
+          filename: batch.filename,
+          status: deleting.status,
+          summary: deleting.summary || {},
+        });
+        batches = (await api.logs(project.id)).items || [];
+        toast("日志批次删除已在后台开始");
         paint();
       } catch (error) {
         toast(error.message, "error");
@@ -89,29 +117,42 @@ export async function renderLogsPage(root, project) {
   await load();
 }
 
-function resultHtml(result, projectId) {
-  if (!result) return `<p style="color:var(--ink-500)">运行一个分析批次后，这里会显示事件、窗口、故障数量和跳转入口。</p>`;
-  const summary = result.summary || {};
-  return `<div class="grid grid-2" style="margin-bottom:18px">
-    ${miniStat("日志事件", summary.events)}${miniStat("异常窗口", summary.anomaly_windows)}${miniStat("故障事件", summary.incidents)}${miniStat("PCA 维数", summary.pca_components)}
-  </div>
-  <dl class="kv-list">
-    <div class="kv-row"><dt>检测模式</dt><dd>${escapeHtml(summary.detection_mode || "—")}</dd></div>
-    <div class="kv-row"><dt>模型可靠</dt><dd>${summary.model_reliable ? "是" : "否（使用规则兜底）"}</dd></div>
-    <div class="kv-row"><dt>图谱写入</dt><dd>${result.integration?.nodes_written || 0} 节点 / ${result.integration?.edges_written || 0} 关系</dd></div>
-  </dl>
-  <a class="button button-primary button-block" style="margin-top:16px" href="#/projects/${projectId}/incidents">查看故障与根因</a>`;
+function guideStep(title, detail) {
+  return `<div class="progress-guide-step"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></div>`;
 }
 
-function miniStat(label, value) {
-  return `<div style="padding:13px;border-radius:9px;background:var(--surface-soft)"><span class="stat-label">${escapeHtml(label)}</span><strong style="display:block;font-size:22px">${Number(value || 0)}</strong></div>`;
+function tasksPanel(tasks) {
+  if (!tasks.length) return "";
+  return `<section class="card task-progress-panel"><div class="card-header"><div><h2>后台任务</h2><p>这些任务会在页面切换后继续运行。</p></div></div><div class="card-body">${tasks.map(taskProgress).join("")}</div></section>`;
+}
+
+function taskProgress(task) {
+  const summary = task.summary || task.batch?.summary || {};
+  const percent = progressPercent(task.status, summary);
+  const message = summary.progress_message || (task.type === "delete" ? "正在删除日志批次" : "正在分析日志批次");
+  return `<div class="task-progress-item">
+    <div class="task-progress-head"><div><strong>${escapeHtml(task.filename || task.batchId)}</strong><span>${escapeHtml(message)}</span></div>${badge(task.status || "processing")}</div>
+    ${progressBar(percent)}
+  </div>`;
+}
+
+function progressPercent(status, summary = {}) {
+  if (status === "completed") return 100;
+  if (status === "failed") return 100;
+  const value = Number(summary.progress_percent ?? 0);
+  return Math.max(6, Math.min(99, Number.isFinite(value) ? value : 12));
+}
+
+function progressBar(percent) {
+  return `<div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>`;
 }
 
 function batchesTable(items, projectId) {
   void projectId;
-  if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。 ");
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>检测模式</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
+  if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。");
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>检测模式</th><th>状态</th><th>进度</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
     const summary = item.summary || {};
-    return `<tr><td><strong>${escapeHtml(item.filename)}</strong>${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${summary.incidents ?? "—"}</td><td><span class="table-subtitle">${escapeHtml(summary.detection_mode || "—")}</span></td><td>${badge(item.status)}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td></tr>`;
+    const busy = item.status === "processing" || item.status === "deleting";
+    return `<tr><td><strong>${escapeHtml(item.filename)}</strong>${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${summary.incidents ?? "—"}</td><td><span class="table-subtitle">${escapeHtml(summary.detection_mode || "—")}</span></td><td>${badge(item.status)}</td><td>${busy ? progressBar(progressPercent(item.status, summary)) : `<span class="table-subtitle">${item.status === "completed" ? "100%" : "—"}</span>`}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}" ${busy ? "disabled" : ""}>删除</button></td></tr>`;
   }).join("")}</tbody></table></div>`;
 }

@@ -338,6 +338,35 @@ class SystemDatabase:
             (summary_json, rca_json, utc_now(), batch_id),
         )
 
+    def update_log_batch_progress(
+        self,
+        batch_id: str,
+        *,
+        status: str = "processing",
+        percent: int = 0,
+        stage: str = "",
+        message: str = "",
+    ) -> None:
+        item = self.get_log_batch(batch_id)
+        summary: dict[str, Any] = {}
+        if item:
+            try:
+                data = json.loads(str(item.get("summary_json") or "{}"))
+                summary = data if isinstance(data, dict) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                summary = {}
+        summary.update(
+            {
+                "progress_percent": max(0, min(100, int(percent))),
+                "progress_stage": stage,
+                "progress_message": message,
+            }
+        )
+        self.execute(
+            "UPDATE log_batches SET status = ?, summary_json = ? WHERE id = ?",
+            (status, json.dumps(summary, ensure_ascii=False), batch_id),
+        )
+
     def fail_log_batch(self, batch_id: str, error_message: str) -> None:
         self.execute(
             "UPDATE log_batches SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",

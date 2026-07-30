@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
@@ -528,6 +528,7 @@ def _persist_incidents(
 @router.post("/projects/{project_id}/logs/analyze", status_code=201)
 async def analyze_project_logs(
     project_id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     train_file: UploadFile | None = File(None),
     user: dict[str, Any] = Depends(require_user),
@@ -557,6 +558,19 @@ async def analyze_project_logs(
         str(user["id"]),
         batch_id=batch_id,
     )
+    database.update_log_batch_progress(batch_id, percent=6, stage="queued", message="日志包已保存，等待后台分析")
+    background_tasks.add_task(
+        _run_log_analysis_batch,
+        project_id,
+        batch_id,
+        str(input_path),
+        str(train_path) if train_path else "",
+        str(output_dir),
+        input_path.name,
+        str(user["id"]),
+    )
+    started = database.get_log_batch(batch_id) or batch
+    return {"message": "log_analysis_started", "batch": _batch_result(started)}
     try:
         runner = LogFaultRunner()
         summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
@@ -599,6 +613,57 @@ async def analyze_project_logs(
         raise HTTPException(status_code=500, detail=f"日志分析失败：{exc}") from exc
 
 
+def _run_log_analysis_batch(
+    project_id: str,
+    batch_id: str,
+    input_path_text: str,
+    train_path_text: str,
+    output_dir_text: str,
+    input_name: str,
+    actor_id: str,
+) -> None:
+    database = get_system_db()
+    input_path = Path(input_path_text)
+    train_path = Path(train_path_text) if train_path_text else None
+    output_dir = Path(output_dir_text)
+    try:
+        database.update_log_batch_progress(batch_id, percent=12, stage="pipeline", message="正在运行滑动窗口日志检测")
+        runner = LogFaultRunner()
+        summary = runner._run_pipeline(input_path, output_dir, train_path)
+        database.update_log_batch_progress(batch_id, percent=45, stage="graph", message="正在把异常链路写入项目图谱")
+        imported = IncidentGraphIntegrator(ProjectScopedGraphClient(project_id)).import_path(
+            output_dir,
+            input_name,
+            batch_id[:12],
+        )
+        import_data = imported.model_dump()
+        database.update_log_batch_progress(batch_id, percent=72, stage="artifacts", message="正在生成 RCA 报告和结果文件")
+        runner._write_rca_artifacts(output_dir, import_data.get("rca") or [])
+        database.update_log_batch_progress(batch_id, percent=86, stage="incidents", message="正在保存故障记录")
+        _persist_incidents(
+            database,
+            project_id,
+            batch_id,
+            actor_id,
+            _load_details(output_dir),
+            import_data.get("rca") or [],
+        )
+        summary = {
+            **(summary if isinstance(summary, dict) else {}),
+            "progress_percent": 100,
+            "progress_stage": "completed",
+            "progress_message": "分析完成",
+        }
+        database.complete_log_batch(
+            batch_id,
+            json.dumps(summary, ensure_ascii=False),
+            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Log analysis failed project=%s batch=%s", project_id, batch_id)
+        database.fail_log_batch(batch_id, str(exc))
+
+
 @router.get("/projects/{project_id}/logs/{batch_id}")
 def get_log_batch(
     project_id: str,
@@ -619,6 +684,7 @@ def get_log_batch(
 def delete_log_batch(
     project_id: str,
     batch_id: str,
+    background_tasks: BackgroundTasks,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
@@ -626,6 +692,13 @@ def delete_log_batch(
     batch = database.get_log_batch(batch_id)
     if not batch or batch.get("project_id") != project_id:
         raise HTTPException(status_code=404, detail="日志批次不存在")
+
+    if str(batch.get("status") or "") == "deleting":
+        return {"message": "log_batch_delete_already_started", "batch": _batch_result(batch), "deleted": False}
+    database.update_log_batch_progress(batch_id, status="deleting", percent=8, stage="delete_queued", message="删除任务已开始")
+    background_tasks.add_task(_delete_log_batch_background, project_id, batch_id)
+    queued = database.get_log_batch(batch_id) or batch
+    return {"message": "log_batch_delete_started", "batch": _batch_result(queued), "deleted": False}
 
     warnings: list[str] = []
     graph_cleanup: dict[str, int] = {}
@@ -662,6 +735,49 @@ def delete_log_batch(
         "warnings": warnings,
         "recoverable": False,
     }
+
+
+def _delete_log_batch_background(project_id: str, batch_id: str) -> None:
+    database = get_system_db()
+    batch = database.get_log_batch(batch_id)
+    if not batch or batch.get("project_id") != project_id:
+        return
+
+    warnings: list[str] = []
+    graph_cleanup: dict[str, int] = {}
+    try:
+        database.update_log_batch_progress(batch_id, status="deleting", percent=22, stage="graph_cleanup", message="正在清理动态图谱节点和关系")
+        graph_cleanup = ProjectScopedGraphClient(project_id).delete_incident_batch(
+            batch_id[:12]
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to clean graph for deleted batch=%s", batch_id)
+        warnings.append(f"日志记录将继续删除，但图谱清理失败：{exc}")
+
+    logs_root = (
+        Path(get_settings().app_data_root).expanduser().resolve()
+        / "projects"
+        / project_id
+        / "logs"
+    ).resolve()
+    batch_dir = Path(str(batch.get("input_path") or "")).expanduser().resolve().parent
+    try:
+        database.update_log_batch_progress(batch_id, status="deleting", percent=68, stage="files", message="正在删除日志输入和分析产物")
+        if (
+            batch_dir.name == batch_id
+            and batch_dir.is_relative_to(logs_root)
+            and batch_dir.is_dir()
+        ):
+            shutil.rmtree(batch_dir)
+        elif batch_dir.exists():
+            raise RuntimeError("日志批次目录校验失败，未删除磁盘文件")
+
+        database.update_log_batch_progress(batch_id, status="deleting", percent=92, stage="records", message="正在删除批次和关联故障记录")
+        if not database.delete_log_batch(batch_id):
+            logger.warning("Log batch disappeared during delete batch=%s warnings=%s cleanup=%s", batch_id, warnings, graph_cleanup)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Log batch delete failed project=%s batch=%s", project_id, batch_id)
+        database.fail_log_batch(batch_id, str(exc))
 
 
 @router.get("/projects/{project_id}/logs/{batch_id}/artifacts/{filename}")

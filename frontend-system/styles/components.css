@@ -88,8 +88,13 @@
 .project-card h2 { margin: 18px 0 7px; }
 .project-card p { flex: 1; overflow: hidden; color: var(--ink-600); }
 .project-meta { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; color: var(--ink-500); font-size: 12px; }
+.project-card-manage { gap: 0; }
+.project-card-archived { opacity: 0.76; }
+.project-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
 .new-project-card { place-items: center; justify-content: center; border-style: dashed; box-shadow: none; cursor: pointer; text-align: center; }
 .new-project-card .project-symbol { margin-bottom: 10px; color: var(--brand); background: var(--brand-soft); font-size: 24px; }
+.toggle-inline { display: inline-flex; align-items: center; gap: 7px; min-height: 38px; color: var(--ink-700); font-size: 13px; font-weight: 650; }
+.toggle-inline input { width: 16px; height: 16px; accent-color: var(--brand); }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgb(12 20 39 / 55%); backdrop-filter: blur(3px); }
 .modal { width: min(540px, 100%); max-height: calc(100vh - 40px); overflow: auto; border-radius: var(--radius-lg); background: #fff; box-shadow: var(--shadow-lg); }

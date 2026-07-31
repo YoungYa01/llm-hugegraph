@@ -32,14 +32,17 @@ class _UnavailableSession:
 ALLOWED_KINDS = {
     "System", "Layer", "Service", "Database", "Cache", "Middleware", "Queue", "API", "Function", "Component",
     "Cluster", "Instance", "Incident", "Trace", "LogEvent", "Exception", "Window", "Metric", "Host", "Pod",
-    "RCAHypothesis", "UnresolvedDependency",
+    "RCAHypothesis", "UnresolvedDependency", "UIControl", "UIFunction", "VM", "NetworkSwitch",
 }
 ALLOWED_RELATIONS = {
     "CALLS",
     "USES_DB",
     "CONTAINS",
     "BELONGS_TO_LAYER",
+    "BELONGS_TO",
     "PROVIDES",
+    "PROVIDED_BY",
+    "TRIGGERS",
     "DEPENDS_ON",
     "READS",
     "WRITES",
@@ -47,6 +50,7 @@ ALLOWED_RELATIONS = {
     "SUBSCRIBES",
     "HAS_MEMBER",
     "RUNS_ON",
+    "HOSTED_ON",
     "CONNECTS_TO",
     "HAS_TRACE", "HAS_EVENT", "OBSERVED_IN", "ROOT_CAUSE", "ROOT_SERVICE", "EMITS",
     "CAUSES", "PROPAGATES_TO", "ERROR_PROPAGATES_TO", "TRIGGERED_BY", "AFFECTS",
@@ -64,17 +68,25 @@ def _list_values(value: Any) -> list[str]:
 
 
 SYSTEM_PROMPT = """
-你是系统架构知识图谱抽取器。禁止输出思考过程，只输出一个 JSON 对象。
+你是全栈系统架构知识图谱抽取器。禁止输出思考过程，只输出一个 JSON 对象。
 
 JSON 格式固定为：
-{"services":[{"name":"节点名","layer":"层级","kind":"Service|Database|Cache|Middleware|Queue|API|Function|Layer|System|Component|Cluster|Instance|Host|Pod","description":"描述","meta":{"aliases":[],"host":"","port":""}}],"calls":[{"source":"起点节点名","target":"终点节点名","type":"CALLS|USES_DB|CONTAINS|BELONGS_TO_LAYER|PROVIDES|DEPENDS_ON|READS|WRITES|PUBLISHES|SUBSCRIBES|HAS_MEMBER|RUNS_ON|CONNECTS_TO","description":"描述","meta":{}}]}
+{"services":[{"name":"节点名","layer":"层级","kind":"UIControl|UIFunction|Service|Database|Cache|Middleware|Queue|API|Function|Layer|System|Component|Cluster|Instance|Host|Pod|NetworkSwitch","description":"描述","meta":{"aliases":[],"host":"","port":""}}],"calls":[{"source":"起点节点名","target":"终点节点名","type":"CALLS|USES_DB|CONTAINS|BELONGS_TO_LAYER|BELONGS_TO|PROVIDES|DEPENDS_ON|READS|WRITES|PUBLISHES|SUBSCRIBES|HAS_MEMBER|RUNS_ON|HOSTED_ON|CONNECTS_TO|TRIGGERS|ROUTES_TO","description":"描述","meta":{}}]}
 
-规则：
-1. 文档里的系统、层、服务、数据库、中间件、队列、接口、功能都要作为 services 节点。
-2. calls 中的 source 和 target 必须能在 services 里找到。
-3. 集群和实例必须分开建模，例如“Redis集群 -HAS_MEMBER-> redis-1”；服务依赖基础设施用 DEPENDS_ON。
-4. 文档给出别名、主机名、IP、端口时放入 meta；未给出的信息禁止猜测。
-5. 不要 Markdown，不要代码块，不要解释，不要 <think>。
+必须遵循的全栈实体映射与链路流向规则：
+1. 实体映射：
+   - 前端控件标记为 `kind: UIControl`；页面业务功能标记为 `kind: UIFunction`；
+   - 接口标记为 `kind: API`；微服务标记为 `kind: Service`；数据库中间件标记为 `kind: Database/Cache/Middleware`；
+   - 容器标记为 `kind: Pod`；物理宿主机标记为 `kind: Host`；网络交换机标记为 `kind: NetworkSwitch`。
+2. 经典分层调用链与流向规范（严禁跨层乱连）：
+   - UI与接口层：`UIControl --BELONGS_TO--> UIFunction`；`UIFunction --TRIGGERS--> API`；
+   - 网关与服务路由层：`API/Gateway --ROUTES_TO/CALLS--> Service`（API 接口必须连接到处理它的微服务，API 本身禁止直接连接数据库或物理机）；
+   - 服务与基础设施层：`Service --DEPENDS_ON/USES_DB--> Database/Cache/Middleware`；微服务之间依赖使用 `Service --CALLS--> Service`；
+   - 物理与部署容器层：`Pod --RUNS_ON--> Service`（容器运行服务）；`Pod --HOSTED_ON--> Host`（容器宿主于物理机）；`Host --CONNECTS_TO--> NetworkSwitch`。
+3. 集群与实例分离：集群和具体实例必须分开建模，例如“Redis集群 -HAS_MEMBER-> redis-1”；层次归属使用 `CONTAINS` / `BELONGS_TO_LAYER`。
+4. 精准 Meta 属性提取：文档给出别名、主机名、IP、端口时放入 meta（如 aliases, host, port）；未给出的信息禁止凭空猜测。
+5. 防孤立框图节点：禁止产生没有连线的孤立分类节点（如纯文本 "API Layer", "System" 等框架图分类框不要抽取为孤立节点）。
+6. 不要 Markdown，不要代码块，不要解释，不要 <think>。
 """.strip()
 
 
@@ -523,7 +535,16 @@ class RuleBasedArchitectureExtractor:
             title = self._guess_document_title(text)
             self._add_node(title, "系统层", "System", "从输入文档生成的系统节点")
 
-        return ExtractedGraph(services=list(self.nodes.values()), calls=list(self.edges.values()))
+        # 过滤在连线中完全没有出现、且属于抽象描述词的悬空孤立节点
+        connected_names = {c.source for c in self.edges.values()} | {c.target for c in self.edges.values()}
+        clean_nodes: list[ExtractedNode] = []
+        for n in self.nodes.values():
+            if n.kind in {"System", "Layer"} or n.name in {"系统", "API Layer", "UI Layer", "网关与微服务"}:
+                if n.name not in connected_names:
+                    continue  # 跳过孤立的抽象节点
+            clean_nodes.append(n)
+
+        return ExtractedGraph(services=clean_nodes, calls=list(self.edges.values()))
 
     def _guess_document_title(self, text: str) -> str:
         m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9_\-]{2,40}系统)", text)

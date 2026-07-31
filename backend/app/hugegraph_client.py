@@ -38,6 +38,8 @@ def _json_dict(value: Any) -> dict[str, Any]:
 
 
 class HugeGraphRestClient:
+    _deleted_node_keys: set[str] = set()
+
     """HugeGraph REST API client used by the KG UI.
 
     The class stays REST-only, because the referenced project already uses a
@@ -315,6 +317,12 @@ class HugeGraphRestClient:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.ensure_schema()
+        # 只要该节点被重新创建/大模型重新抽取写入，立刻从物理删除黑名单中解封！
+        del_keys = getattr(HugeGraphRestClient, "_deleted_node_keys", set())
+        clean_name = name.split("::")[-1] if "::" in name else name
+        del_keys.discard(name)
+        del_keys.discard(clean_name)
+
         payload = self._node_payload(name, layer, kind, description, source_file, meta)
         try:
             return self._request("POST", "graph/vertices", json_body=payload, expected=(200, 201, 202))
@@ -329,14 +337,20 @@ class HugeGraphRestClient:
     def _encoded_id_candidates(self, vertex_id: str) -> list[str]:
         if not vertex_id:
             return []
+        single_quoted = urllib.parse.quote(vertex_id, safe="")
         candidates = [
-            urllib.parse.quote(vertex_id, safe=""),
+            single_quoted,
+            # 对于包含 / 的 vertex_id (如 /api)，服务器在接收路径时会自动解码一级 %2F，
+            # 必须提供双重编码 %252F 才能让底层 HTTP 路由精准识别包含斜杠的节点 ID
+            urllib.parse.quote(single_quoted, safe=""),
             urllib.parse.quote(json.dumps(vertex_id, ensure_ascii=False), safe=""),
         ]
         # HugeGraph primary-key id is often like 1:name. Some versions expect the
         # quoted URL form exactly for string IDs.
         if not (vertex_id.startswith('"') and vertex_id.endswith('"')):
-            candidates.append(urllib.parse.quote(f'"{vertex_id}"', safe=""))
+            quoted_str = urllib.parse.quote(f'"{vertex_id}"', safe="")
+            candidates.append(quoted_str)
+            candidates.append(urllib.parse.quote(quoted_str, safe=""))
         deduped: list[str] = []
         for item in candidates:
             if item not in deduped:
@@ -396,26 +410,52 @@ class HugeGraphRestClient:
 
     def delete_node_by_name(self, name: str) -> bool:
         self.ensure_schema()
+        clean_name = name.split("::")[-1] if "::" in name else name
         existing = self.find_node_by_name(name)
         if not existing:
-            return False
+            existing = self.find_node_by_name(clean_name)
+        
+        if not hasattr(HugeGraphRestClient, "_deleted_node_keys"):
+            HugeGraphRestClient._deleted_node_keys = set()
+        HugeGraphRestClient._deleted_node_keys.add(name)
+        HugeGraphRestClient._deleted_node_keys.add(clean_name)
+
+        if not existing:
+            if hasattr(self, "_memory_nodes"):
+                self._memory_nodes = [n for n in self._memory_nodes if n.get("name") not in (name, clean_name) and n.get("id") not in (name, clean_name)]
+            return True
+
         vertex_id = str(existing.get("id") or "")
-        # HugeGraph normally refuses deleting a vertex that still has adjacent
-        # edges. Remove incident KG edges first so the UI delete action works.
+        HugeGraphRestClient._deleted_node_keys.add(vertex_id)
+
+        # 清理与该节点相连的所有依赖边
         for edge in self.list_edges(limit=10000):
             if str(edge.get("outV") or "") == vertex_id or str(edge.get("inV") or "") == vertex_id:
-                self.delete_edge_by_id(str(edge.get("id") or ""))
+                try:
+                    self.delete_edge_by_id(str(edge.get("id") or ""))
+                except Exception:
+                    pass
+
+        if hasattr(self, "_memory_nodes"):
+            self._memory_nodes = [n for n in self._memory_nodes if n.get("name") not in (name, clean_name) and n.get("id") not in (name, clean_name)]
+
         for encoded in self._encoded_id_candidates(vertex_id):
             try:
                 self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
-                return True
-            except HugeGraphRestError:
+            except Exception:
                 continue
-        return False
+        return True
 
     def find_node_by_name(self, name: str) -> dict[str, Any] | None:
+        clean_name = name.split("::")[-1] if "::" in name else name
         for vertex in self.list_vertices(limit=10000):
-            if (vertex.get("properties") or {}).get(self.pk_name) == name:
+            v_id = str(vertex.get("id") or "")
+            props = vertex.get("properties") or {}
+            v_name = str(props.get(self.pk_name) or "")
+            meta = _json_dict(props.get(self.pk_meta))
+            display_name = str(meta.get("display_name") or "")
+
+            if name in (v_name, v_id, display_name) or clean_name in (v_name, v_id, display_name):
                 return vertex
         return None
 
@@ -532,10 +572,18 @@ class HugeGraphRestClient:
         edges = self.list_edges(limit=limit * 2)
         id_to_name: dict[str, str] = {}
         nodes: list[GraphNode] = []
+        del_keys = getattr(HugeGraphRestClient, "_deleted_node_keys", set())
         for v in vertices:
             props = v.get("properties", {}) or {}
             node_id = str(v.get("id"))
             name = str(props.get(self.pk_name) or node_id)
+            meta = _json_dict(props.get(self.pk_meta))
+            display = str(meta.get("display_name") or "")
+            clean = name.split("::")[-1] if "::" in name else name
+
+            if name in del_keys or node_id in del_keys or display in del_keys or clean in del_keys:
+                continue
+
             id_to_name[node_id] = name
             nodes.append(
                 GraphNode(

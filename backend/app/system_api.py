@@ -23,6 +23,7 @@ from .auth import (
     verify_password,
 )
 from .config import get_settings
+from .hugegraph_client import HugeGraphRestClient
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
     EdgeDeleteRequest,
@@ -298,6 +299,8 @@ async def import_architecture(
         str(user["id"]),
     )
     scoped = ProjectScopedGraphClient(project_id)
+    if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
+        HugeGraphRestClient._deleted_node_keys.clear()
     try:
         extracted, logs = await run_in_threadpool(
             GraphBuilderService(scoped).build_ontology_graph,
@@ -352,7 +355,7 @@ def create_graph_node(
     }
 
 
-@router.put("/projects/{project_id}/graph/nodes/{name}")
+@router.put("/projects/{project_id}/graph/nodes/{name:path}")
 def update_graph_node(
     project_id: str,
     name: str,
@@ -374,7 +377,7 @@ def update_graph_node(
     }
 
 
-@router.delete("/projects/{project_id}/graph/nodes/{name}")
+@router.delete("/projects/{project_id}/graph/nodes/{name:path}")
 def delete_graph_node(
     project_id: str,
     name: str,
@@ -444,6 +447,127 @@ def delete_graph_edge(
     client = ProjectScopedGraphClient(project_id)
     deleted = client.delete_edge_by_tuple(payload.source, payload.target, payload.type)
     return {"deleted": deleted, "graph": client.read_architecture_graph(1500).model_dump()}
+
+
+@router.get("/projects/{project_id}/graph/export")
+def export_architecture_graph(
+    project_id: str,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    graph = client.read_architecture_graph(5000)
+    return {
+        "project_id": project_id,
+        "nodes": [
+            {
+                "name": n.name,
+                "layer": n.layer,
+                "kind": n.kind,
+                "description": n.description,
+                "source_file": n.source_file,
+                "meta": n.meta,
+            }
+            for n in graph.nodes
+        ],
+        "edges": [
+            {
+                "source": e.source,
+                "target": e.target,
+                "type": e.type,
+                "description": e.description,
+                "meta": e.meta,
+            }
+            for e in getattr(graph, "edges", [])
+        ],
+    }
+
+
+@router.post("/projects/{project_id}/graph/import")
+def import_architecture_graph_data(
+    project_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
+        HugeGraphRestClient._deleted_node_keys.clear()
+    
+    # 直接保存节点与依赖边，跳过大模型抽出步
+    raw_nodes = payload.get("nodes") or []
+    raw_edges = payload.get("edges") or []
+
+    imported_nodes = 0
+    imported_edges = 0
+
+    for n in raw_nodes:
+        name = str(n.get("name") or "").strip()
+        if name:
+            client.upsert_node(
+                name=name,
+                layer=str(n.get("layer") or "Component层"),
+                kind=str(n.get("kind") or "Component"),
+                description=str(n.get("description") or ""),
+                source_file=str(n.get("source_file") or "manual_import"),
+                meta=n.get("meta") if isinstance(n.get("meta"), dict) else {},
+            )
+            imported_nodes += 1
+
+    for e in raw_edges:
+        src = str(e.get("source") or "").strip()
+        tgt = str(e.get("target") or "").strip()
+        rel = str(e.get("type") or "CALLS").strip()
+        if src and tgt:
+            client.add_edge_by_names(
+                source_name=src,
+                target_name=tgt,
+                relation_type=rel,
+                description=str(e.get("description") or ""),
+                meta=e.get("meta") if isinstance(e.get("meta"), dict) else {},
+            )
+            imported_edges += 1
+
+    return {
+        "message": "architecture_graph_imported",
+        "imported_nodes": imported_nodes,
+        "imported_edges": imported_edges,
+        "graph": client.read_architecture_graph(1500).model_dump(),
+    }
+
+
+@router.post("/projects/{project_id}/graph/nodes/batch-delete")
+def batch_delete_graph_nodes(
+    project_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    names = payload.get("names") or []
+    res = client.batch_delete_nodes(names)
+    return {
+        "message": "batch_nodes_deleted",
+        **res,
+        "graph": client.read_architecture_graph(1500).model_dump(),
+    }
+
+
+@router.post("/projects/{project_id}/graph/edges/batch-delete")
+def batch_delete_graph_edges(
+    project_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    edges = payload.get("edges") or []
+    res = client.batch_delete_edges(edges)
+    return {
+        "message": "batch_edges_deleted",
+        **res,
+        "graph": client.read_architecture_graph(1500).model_dump(),
+    }
 
 
 @router.post("/projects/{project_id}/graph/clear")

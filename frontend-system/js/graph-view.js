@@ -1,11 +1,74 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 const palette = {
-  Service: "#4568dc", API: "#5d7ce3", Component: "#6679aa", System: "#394a78",
-  Database: "#11938f", Cache: "#13a5a0", Queue: "#7a62c8", Middleware: "#6975bd",
-  Cluster: "#16817e", Instance: "#e68a35", Host: "#d1772d", Pod: "#de7d45",
-  Incident: "#ce4052", RCAHypothesis: "#a848a8", LogEvent: "#c85c72", Exception: "#b93645", Trace: "#8b5baa",
+  UIControl: "#e83e8c",
+  UIFunction: "#fd7e14",
+  Service: "#4568dc",
+  API: "#5d7ce3",
+  Component: "#6679aa",
+  System: "#394a78",
+  Database: "#11938f",
+  Cache: "#13a5a0",
+  Queue: "#7a62c8",
+  Middleware: "#6975bd",
+  Cluster: "#16817e",
+  Instance: "#e68a35",
+  Host: "#d1772d",
+  Pod: "#de7d45",
+  VM: "#b87333",
+  NetworkSwitch: "#20c997",
+  Incident: "#ce4052",
+  RCAHypothesis: "#a848a8",
+  LogEvent: "#c85c72",
+  Exception: "#b93645",
+  Trace: "#8b5baa",
 };
+
+const kindIcons = {
+  UIControl: "🖱️",
+  UIFunction: "⚙️",
+  Service: "🔌",
+  API: "🌐",
+  Database: "🗄️",
+  Cache: "⚡",
+  Queue: "📥",
+  Host: "🖥️",
+  Pod: "📦",
+  VM: "💻",
+  NetworkSwitch: "🔀",
+  Incident: "🚨",
+  RCAHypothesis: "🧠",
+  Exception: "💥",
+};
+
+const edgeColors = {
+  BELONGS_TO: "#d946ef",
+  TRIGGERS: "#f97316",
+  CALLS: "#3b82f6",
+  PROVIDED_BY: "#0284c7",
+  DEPENDS_ON: "#10b981",
+  USES_DB: "#059669",
+  RUNS_ON: "#f59e0b",
+  HOSTED_ON: "#d97706",
+  CONNECTS_TO: "#84cc16",
+  AFFECTS: "#f43f5e",
+  SUSPECTED_ROOT_CAUSE: "#a855f7",
+};
+
+const archColumnTitles = [
+  "🖱️ UI交互与页面功能",
+  "⚡ 接口网关与业务服务",
+  "🗄️ 数据存储与中间件",
+  "☁️ 容器实例与宿主机",
+];
+
+const fullColumnTitles = [
+  "🖱️ UI交互与页面功能",
+  "⚡ 接口网关与业务服务",
+  "🗄️ 数据存储与中间件",
+  "☁️ 容器实例与宿主机",
+  "🚨 故障判定与根因假说",
+];
 
 function svgElement(name, attributes = {}) {
   const element = document.createElementNS(SVG_NS, name);
@@ -15,23 +78,61 @@ function svgElement(name, attributes = {}) {
 
 function groupFor(node) {
   if (["Incident", "RCAHypothesis", "LogEvent", "Exception", "Trace", "Window", "Metric"].includes(node.kind)) return 4;
-  if (["Instance", "Host", "Pod"].includes(node.kind)) return 3;
+  if (["Instance", "Host", "Pod", "VM", "NetworkSwitch"].includes(node.kind)) return 3;
   if (["Database", "Cache", "Queue", "Middleware", "Cluster"].includes(node.kind)) return 2;
-  if (["Service", "Component", "Function"].includes(node.kind)) return 1;
+  if (["Service", "Component", "Function", "API"].includes(node.kind)) return 1;
+  if (["UIControl", "UIFunction"].includes(node.kind)) return 0;
   return 0;
 }
 
-function layout(nodes) {
-  const groups = Array.from({ length: 5 }, () => []);
-  nodes.forEach((node) => groups[groupFor(node)].push(node));
-  groups.forEach((items) => items.sort((a, b) => a.name.localeCompare(b.name, "zh-CN")));
-  const positions = new Map();
-  let maxRows = 1;
-  groups.forEach((items, column) => {
-    maxRows = Math.max(maxRows, items.length);
-    items.forEach((node, row) => positions.set(node.name, { x: 70 + column * 230, y: 70 + row * 84 }));
+function layout(nodes, hasDynamic) {
+  const numCols = hasDynamic ? 5 : 4;
+  const groups = Array.from({ length: numCols }, () => []);
+  nodes.forEach((node) => {
+    const idx = Math.min(groupFor(node), numCols - 1);
+    groups[idx].push(node);
   });
-  return { positions, width: 70 + 5 * 230, height: Math.max(650, 100 + maxRows * 84) };
+  groups.forEach((items) => items.sort((a, b) => a.name.localeCompare(b.name, "zh-CN")));
+  
+  const positions = new Map();
+  const laneWidths = [];
+  let maxLaneRows = 1;
+
+  const startX = 35;
+  const startY = 75;
+  const rowHeight = 76;
+  const subColGap = 190;
+
+  let currentLaneX = startX;
+
+  groups.forEach((items, colIdx) => {
+    const numSubCols = items.length > 5 ? 2 : 1;
+    const laneWidth = numSubCols === 2 ? 395 : 225;
+    laneWidths.push(laneWidth);
+
+    items.forEach((node, idx) => {
+      const subCol = idx % numSubCols;
+      const subRow = Math.floor(idx / numSubCols);
+      const posX = currentLaneX + subCol * subColGap;
+      const posY = startY + subRow * rowHeight;
+      positions.set(node.name, { x: posX, y: posY });
+    });
+
+    const rowsInThisLane = Math.ceil(items.length / numSubCols);
+    maxLaneRows = Math.max(maxLaneRows, rowsInThisLane);
+
+    currentLaneX += laneWidth + 25;
+  });
+
+  return {
+    positions,
+    numCols,
+    laneWidths,
+    width: Math.max(1020, currentLaneX + 20),
+    height: Math.max(620, startY + maxLaneRows * rowHeight + 120),
+    startX,
+    startY,
+  };
 }
 
 function short(value, length = 20) {
@@ -42,118 +143,440 @@ function short(value, length = 20) {
 export function renderGraph(
   container,
   graph,
-  { onSelect = () => {}, onSelectEdge = () => {} } = {},
+  { onSelect = () => {}, onSelectEdge = () => {} } = {}
 ) {
   container.replaceChildren();
   const nodes = (graph.nodes || []).slice(0, 500);
   const nodeNames = new Set(nodes.map((node) => node.name));
-  const edges = (graph.edges || []).filter((edge) => nodeNames.has(edge.source) && nodeNames.has(edge.target)).slice(0, 1200);
+  const edges = (graph.edges || []).filter(
+    (edge) => nodeNames.has(edge.source) && nodeNames.has(edge.target)
+  ).slice(0, 1200);
+
   if (!nodes.length) return null;
 
-  const { positions, width, height } = layout(nodes);
-  const svg = svgElement("svg", { role: "img", "aria-label": "项目知识图谱", viewBox: `0 0 ${width} ${height}` });
+  const hasDynamic = nodes.some((n) =>
+    ["Incident", "RCAHypothesis", "LogEvent", "Exception"].includes(n.kind)
+  );
+  const columnTitles = hasDynamic ? fullColumnTitles : archColumnTitles;
+
+  const affectedNodes = new Set();
+  const rootCauseNodes = new Set();
+
+  edges.forEach((edge) => {
+    if (edge.type === "AFFECTS" || edge.type === "FAULT_PROPAGATES_TO") {
+      affectedNodes.add(edge.target);
+      affectedNodes.add(edge.source);
+    }
+    if (edge.type === "SUSPECTED_ROOT_CAUSE" || edge.type === "CANDIDATE_CAUSE") {
+      rootCauseNodes.add(edge.target);
+    }
+  });
+
+  const { positions, width, height, laneWidths, startX, startY } = layout(nodes, hasDynamic);
+  const svg = svgElement("svg", {
+    role: "img",
+    "aria-label": "全栈系统与故障知识图谱",
+    viewBox: `0 0 ${width} ${height}`,
+    preserveAspectRatio: "xMinYMin meet",
+  });
+
   const defs = svgElement("defs");
-  const marker = svgElement("marker", { id: "arrow", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse" });
-  marker.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#aeb8ca" }));
-  defs.append(marker);
+
+  // 动态箭头定义
+  const arrowNormal = svgElement("marker", {
+    id: "arrow-normal",
+    viewBox: "0 0 10 10",
+    refX: "9",
+    refY: "5",
+    markerWidth: "6",
+    markerHeight: "6",
+    orient: "auto-start-reverse",
+  });
+  arrowNormal.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#94a3b8" }));
+
+  const arrowAffects = svgElement("marker", {
+    id: "arrow-affects",
+    viewBox: "0 0 10 10",
+    refX: "9",
+    refY: "5",
+    markerWidth: "7",
+    markerHeight: "7",
+    orient: "auto-start-reverse",
+  });
+  arrowAffects.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#f43f5e" }));
+
+  const arrowRoot = svgElement("marker", {
+    id: "arrow-root",
+    viewBox: "0 0 10 10",
+    refX: "9",
+    refY: "5",
+    markerWidth: "8",
+    markerHeight: "8",
+    orient: "auto-start-reverse",
+  });
+  arrowRoot.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#a855f7" }));
+
+  defs.append(arrowNormal, arrowAffects, arrowRoot);
   svg.append(defs);
+
   const viewport = svgElement("g");
   svg.append(viewport);
-  const edgeLayer = svgElement("g");
-  const nodeLayer = svgElement("g");
+
+  // 1. 绘制 Swimlane 泳道分栏卡片与顶部标题
+  const swimlaneLayer = svgElement("g", { class: "swimlanes" });
+  let currentLaneX = startX;
+
+  columnTitles.forEach((title, colIdx) => {
+    const laneW = laneWidths[colIdx] || 225;
+    const laneX = currentLaneX - 10;
+    
+    const laneBg = svgElement("rect", {
+      x: laneX,
+      y: "18",
+      width: laneW,
+      height: height - 32,
+      rx: "12",
+      fill: colIdx % 2 === 0 ? "#f8fafc" : "#f1f5f9",
+      stroke: "#e2e8f0",
+      "stroke-width": "1",
+      opacity: "0.65",
+    });
+
+    const headerBox = svgElement("rect", {
+      x: laneX,
+      y: "18",
+      width: laneW,
+      height: "38",
+      rx: "8",
+      fill: "#ffffff",
+      stroke: "#cbd5e1",
+      "stroke-width": "1",
+    });
+
+    const headerText = svgElement("text", {
+      x: laneX + laneW / 2,
+      y: "42",
+      "text-anchor": "middle",
+      fill: "#1e293b",
+      "font-size": "13",
+      "font-weight": "700",
+    });
+    headerText.textContent = title;
+
+    swimlaneLayer.append(laneBg, headerBox, headerText);
+    currentLaneX += laneW + 25;
+  });
+  viewport.append(swimlaneLayer);
+
+  const edgeLayer = svgElement("g", { class: "edges" });
+  const nodeLayer = svgElement("g", { class: "nodes" });
   viewport.append(edgeLayer, nodeLayer);
 
   const visibleEdgePaths = () => edgeLayer.querySelectorAll("path[data-edge-visible]");
+  const nodeGroupElements = new Map();
 
   let selectedEdge = null;
+  let selectedNode = null;
+
+  // 2. 绘制依赖连线 (基于语义边类型的调色与箭头)
   edges.forEach((edge) => {
     const source = positions.get(edge.source);
     const target = positions.get(edge.target);
     if (!source || !target) return;
-    const x1 = source.x + 150;
-    const y1 = source.y + 27;
+
+    const x1 = source.x + 185;
+    const y1 = source.y + 28;
     const x2 = target.x;
-    const y2 = target.y + 27;
+    const y2 = target.y + 28;
     const bend = Math.max(40, Math.abs(x2 - x1) * 0.38);
     const pathData = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+
+    const isFaultEdge = edge.type === "AFFECTS" || edge.type === "FAULT_PROPAGATES_TO";
+    const isRootEdge = edge.type === "SUSPECTED_ROOT_CAUSE" || edge.type === "CANDIDATE_CAUSE";
+
+    let strokeColor = edgeColors[edge.type] || "#94a3b8";
+    let strokeWidth = isFaultEdge || isRootEdge ? "2.6" : "1.6";
+    let markerEnd = "url(#arrow-normal)";
+
+    if (isFaultEdge) {
+      strokeColor = "#f43f5e";
+      markerEnd = "url(#arrow-affects)";
+    } else if (isRootEdge) {
+      strokeColor = "#a855f7";
+      markerEnd = "url(#arrow-root)";
+    }
+
     const hitPath = svgElement("path", {
-      d: pathData, fill: "none", stroke: "transparent", "stroke-width": "14",
-      "pointer-events": "stroke", tabindex: "0", role: "button",
+      d: pathData,
+      fill: "none",
+      stroke: "transparent",
+      "stroke-width": "16",
+      "pointer-events": "stroke",
+      tabindex: "0",
+      role: "button",
       "aria-label": `关系：${edge.source} ${edge.type} ${edge.target}`,
     });
+
     const path = svgElement("path", {
       d: pathData,
-      fill: "none", stroke: "#b9c2d2", "stroke-width": "1.25", "marker-end": "url(#arrow)",
-      "pointer-events": "none", "data-edge-visible": "true",
+      fill: "none",
+      stroke: strokeColor,
+      "stroke-width": strokeWidth,
+      "marker-end": markerEnd,
+      "pointer-events": "none",
+      "data-edge-visible": "true",
     });
+
     [hitPath, path].forEach((candidate) => {
       candidate.dataset.source = edge.source;
       candidate.dataset.target = edge.target;
       candidate.dataset.type = edge.type;
     });
+
     hitPath.style.cursor = "pointer";
+
     const chooseEdge = (event) => {
       event.stopPropagation();
-      if (selected) selected.setAttribute("stroke", "#d4dcea");
-      selected = null;
+      if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
+      selectedNode = null;
+
       visibleEdgePaths().forEach((candidate) => {
-        candidate.setAttribute("stroke", "#d3d9e4");
+        candidate.setAttribute("stroke", "#e2e8f0");
         candidate.setAttribute("stroke-width", "1");
-        candidate.setAttribute("opacity", ".42");
+        candidate.setAttribute("opacity", "0.25");
       });
+
       selectedEdge = path;
-      path.setAttribute("stroke", "#3157d5");
-      path.setAttribute("stroke-width", "3");
+      path.setAttribute("stroke", "#2563eb");
+      path.setAttribute("stroke-width", "3.5");
       path.setAttribute("opacity", "1");
       onSelectEdge(edge);
     };
+
     hitPath.addEventListener("click", chooseEdge);
     hitPath.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") chooseEdge(event);
     });
+
     edgeLayer.append(hitPath, path);
-    if (edges.length <= 55) {
-      const label = svgElement("text", { x: String((x1 + x2) / 2), y: String((y1 + y2) / 2 - 6), "text-anchor": "middle", fill: "#8792a6", "font-size": "9" });
+
+    if (edges.length <= 65) {
+      const label = svgElement("text", {
+        x: String((x1 + x2) / 2),
+        y: String((y1 + y2) / 2 - 6),
+        "text-anchor": "middle",
+        fill: isFaultEdge ? "#e11d48" : "#475569",
+        "font-size": "9.5",
+        "font-weight": isFaultEdge ? "700" : "600",
+      });
       label.textContent = short(edge.type, 18);
       label.style.pointerEvents = "none";
       edgeLayer.append(label);
     }
   });
 
-  let selected = null;
+  // 3. 绘制节点 (专属实体 Icon + 起点/终点徽章 + 精致阴影边框)
   nodes.forEach((node) => {
     const pos = positions.get(node.name);
     const group = svgElement("g", {
-      transform: `translate(${pos.x} ${pos.y})`, tabindex: "0", role: "button",
+      transform: `translate(${pos.x} ${pos.y})`,
+      tabindex: "0",
+      role: "button",
       "aria-label": `节点：${node.name}，类型：${node.kind || "Component"}`,
+      "data-node-name": node.name,
     });
     group.style.cursor = "pointer";
+
     const color = palette[node.kind] || "#64748b";
-    const rect = svgElement("rect", { width: "150", height: "54", rx: "10", fill: "#fff", stroke: "#d4dcea", "stroke-width": "1.2" });
-    const accent = svgElement("rect", { width: "5", height: "54", rx: "2.5", fill: color });
-    const title = svgElement("text", { x: "15", y: "23", fill: "#17213a", "font-size": "12", "font-weight": "650" });
-    title.textContent = short(node.name, 19);
-    const kind = svgElement("text", { x: "15", y: "40", fill: "#7a8599", "font-size": "9.5" });
+    const icon = kindIcons[node.kind] || "🧩";
+    const groupCol = groupFor(node);
+
+    const isStartNode = groupCol === 0;
+    const isAffected = affectedNodes.has(node.name);
+    const isRootCause = rootCauseNodes.has(node.name);
+
+    let cardBg = "#ffffff";
+    let strokeColor = color;
+    let strokeWidth = "1.5";
+
+    if (isAffected && (node.kind === "UIControl" || node.kind === "UIFunction")) {
+      cardBg = "#fff1f2";
+      strokeColor = "#f43f5e";
+      strokeWidth = "2.5";
+    } else if (isRootCause) {
+      cardBg = "#faf5ff";
+      strokeColor = "#a855f7";
+      strokeWidth = "3";
+    }
+
+    const rect = svgElement("rect", {
+      width: "185",
+      height: "58",
+      rx: "10",
+      fill: cardBg,
+      stroke: strokeColor,
+      "stroke-width": strokeWidth,
+    });
+    rect.dataset.originalStroke = strokeColor;
+
+    const accent = svgElement("rect", {
+      width: "6",
+      height: "58",
+      rx: "3",
+      fill: color,
+    });
+
+    const iconTxt = svgElement("text", {
+      x: "16",
+      y: "25",
+      "font-size": "13",
+    });
+    iconTxt.textContent = icon;
+
+    const title = svgElement("text", {
+      x: "36",
+      y: "25",
+      fill: isAffected ? "#9f1239" : "#0f172a",
+      "font-size": "12.5",
+      "font-weight": "700",
+    });
+    title.textContent = short(node.name, 17);
+
+    const kind = svgElement("text", {
+      x: "16",
+      y: "43",
+      fill: "#64748b",
+      "font-size": "10",
+    });
     kind.textContent = node.kind || "Component";
+
+    group.append(rect, accent, iconTxt, title, kind);
+
+    // 起点/根因/受影响徽章
+    if (isStartNode) {
+      const badgeG = svgElement("g", { transform: "translate(136, 6)" });
+      const badgeBg = svgElement("rect", {
+        width: "42",
+        height: "18",
+        rx: "9",
+        fill: isAffected ? "#ffe4e6" : "#e0f2fe",
+        stroke: isAffected ? "#f43f5e" : "#0284c7",
+        "stroke-width": "1",
+      });
+      const badgeTxt = svgElement("text", {
+        x: "21",
+        y: "13",
+        "text-anchor": "middle",
+        fill: isAffected ? "#be123c" : "#0369a1",
+        "font-size": "9",
+        "font-weight": "700",
+      });
+      badgeTxt.textContent = isAffected ? "❌ 异常" : "起点";
+      badgeG.append(badgeBg, badgeTxt);
+      group.append(badgeG);
+    } else if (isRootCause) {
+      const badgeG = svgElement("g", { transform: "translate(116, 6)" });
+      const badgeBg = svgElement("rect", {
+        width: "62",
+        height: "18",
+        rx: "9",
+        fill: "#f3e8ff",
+        stroke: "#9333ea",
+        "stroke-width": "1",
+      });
+      const badgeTxt = svgElement("text", {
+        x: "31",
+        y: "13",
+        "text-anchor": "middle",
+        fill: "#7e22ce",
+        "font-size": "9.5",
+        "font-weight": "700",
+      });
+      badgeTxt.textContent = "🎯 根因起点";
+      badgeG.append(badgeBg, badgeTxt);
+      group.append(badgeG);
+    } else if (isAffected) {
+      const badgeG = svgElement("g", { transform: "translate(124, 6)" });
+      const badgeBg = svgElement("rect", {
+        width: "54",
+        height: "18",
+        rx: "9",
+        fill: "#fff1f2",
+        stroke: "#f43f5e",
+        "stroke-width": "1",
+      });
+      const badgeTxt = svgElement("text", {
+        x: "27",
+        y: "13",
+        "text-anchor": "middle",
+        fill: "#be123c",
+        "font-size": "9",
+        "font-weight": "700",
+      });
+      badgeTxt.textContent = "⚠️ 受波及";
+      badgeG.append(badgeBg, badgeTxt);
+      group.append(badgeG);
+    }
+
     const browserTitle = svgElement("title");
     browserTitle.textContent = `${node.name} · ${node.kind}\n${node.description || ""}`;
-    group.append(rect, accent, title, kind, browserTitle);
+    group.append(browserTitle);
+
+    nodeGroupElements.set(node.name, group);
+
     const choose = () => {
-      if (selected) selected.setAttribute("stroke", "#d4dcea");
+      if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
       selectedEdge = null;
-      selected = rect;
-      rect.setAttribute("stroke", color);
-      rect.setAttribute("stroke-width", "2.5");
+      selectedNode = rect;
+      rect.setAttribute("stroke", "#2563eb");
+      rect.setAttribute("stroke-width", "3");
+
       visibleEdgePaths().forEach((path) => {
         const active = path.dataset.source === node.name || path.dataset.target === node.name;
-        path.setAttribute("stroke", active ? color : "#d3d9e4");
-        path.setAttribute("stroke-width", active ? "2.2" : "1");
-        path.setAttribute("opacity", active ? "1" : ".42");
+        path.setAttribute("stroke", active ? (path.dataset.type === "AFFECTS" ? "#f43f5e" : "#2563eb") : "#e2e8f0");
+        path.setAttribute("stroke-width", active ? "3" : "1");
+        path.setAttribute("opacity", active ? "1" : "0.2");
       });
+
       onSelect(node, edges.filter((edge) => edge.source === node.name || edge.target === node.name));
     };
-    group.addEventListener("click", (event) => { event.stopPropagation(); choose(); });
-    group.addEventListener("keydown", (event) => { if (event.key === "Enter") choose(); });
+
+    group.addEventListener("mouseenter", () => {
+      if (selectedNode) return;
+      const neighborNodes = new Set([node.name]);
+      visibleEdgePaths().forEach((path) => {
+        const isNeighbor = path.dataset.source === node.name || path.dataset.target === node.name;
+        if (isNeighbor) {
+          neighborNodes.add(path.dataset.source);
+          neighborNodes.add(path.dataset.target);
+        }
+        path.setAttribute("opacity", isNeighbor ? "1" : "0.15");
+        if (isNeighbor) path.setAttribute("stroke-width", "2.5");
+      });
+      nodeGroupElements.forEach((el, name) => {
+        el.style.opacity = neighborNodes.has(name) ? "1" : "0.25";
+      });
+    });
+
+    group.addEventListener("mouseleave", () => {
+      if (selectedNode) return;
+      visibleEdgePaths().forEach((path) => {
+        path.setAttribute("opacity", "1");
+        path.setAttribute("stroke-width", edgeColors[path.dataset.type] ? "2" : "1.5");
+      });
+      nodeGroupElements.forEach((el) => {
+        el.style.opacity = "1";
+      });
+    });
+
+    group.addEventListener("click", (event) => {
+      event.stopPropagation();
+      choose();
+    });
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") choose();
+    });
+
     nodeLayer.append(group);
   });
 
@@ -162,35 +585,87 @@ export function renderGraph(
   let panY = 0;
   let dragging = false;
   let start = { x: 0, y: 0 };
+
   const transform = () => viewport.setAttribute("transform", `translate(${panX} ${panY}) scale(${scale})`);
-  const zoom = (factor) => { scale = Math.max(0.35, Math.min(2.4, scale * factor)); transform(); };
-  const reset = () => { scale = 1; panX = 0; panY = 0; transform(); };
-  svg.addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1.1 : 0.9); }, { passive: false });
+  const zoom = (factor) => {
+    scale = Math.max(0.35, Math.min(2.4, scale * factor));
+    transform();
+  };
+  const reset = () => {
+    scale = 1;
+    panX = 0;
+    panY = 0;
+    transform();
+  };
+
+  svg.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      zoom(event.deltaY < 0 ? 1.1 : 0.9);
+    },
+    { passive: false }
+  );
+
   svg.addEventListener("pointerdown", (event) => {
-    // 只允许从画布空白处开始拖动。过去在节点上也调用 pointer capture，
-    // 某些浏览器会把随后合成的 click 重定向到 SVG，导致节点点击看起来无效。
-    if (event.target !== svg) return;
+    if (event.target !== svg && event.target.tagName !== "rect" && !event.target.closest(".swimlanes")) return;
     dragging = true;
     start = { x: event.clientX - panX, y: event.clientY - panY };
     svg.setPointerCapture?.(event.pointerId);
   });
-  svg.addEventListener("pointermove", (event) => { if (!dragging) return; panX = event.clientX - start.x; panY = event.clientY - start.y; transform(); });
-  svg.addEventListener("pointerup", () => { dragging = false; });
-  svg.addEventListener("pointercancel", () => { dragging = false; });
+  svg.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    panX = event.clientX - start.x;
+    panY = event.clientY - start.y;
+    transform();
+  });
+  svg.addEventListener("pointerup", () => {
+    dragging = false;
+  });
+  svg.addEventListener("pointercancel", () => {
+    dragging = false;
+  });
+
   svg.addEventListener("click", (event) => {
     if (event.target === svg) {
       selectedEdge = null;
-      if (selected) selected.setAttribute("stroke", "#d4dcea");
-      selected = null;
-      visibleEdgePaths().forEach((path) => { path.setAttribute("stroke", "#b9c2d2"); path.setAttribute("stroke-width", "1.25"); path.setAttribute("opacity", "1"); });
+      if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
+      selectedNode = null;
+      visibleEdgePaths().forEach((path) => {
+        path.setAttribute("stroke", edgeColors[path.dataset.type] || "#cbd5e1");
+        path.setAttribute("stroke-width", "1.5");
+        path.setAttribute("opacity", "1");
+      });
+      nodeGroupElements.forEach((el) => {
+        el.style.opacity = "1";
+      });
     }
   });
+
   container.append(svg);
-  return { zoomIn: () => zoom(1.18), zoomOut: () => zoom(0.84), reset, nodeCount: nodes.length, edgeCount: edges.length };
+  return {
+    zoomIn: () => zoom(1.18),
+    zoomOut: () => zoom(0.84),
+    reset,
+    nodeCount: nodes.length,
+    edgeCount: edges.length,
+  };
 }
 
 export function graphLegend(includeDynamic = true) {
-  const entries = [["Service", "服务"], ["Database", "数据库/缓存"], ["Cluster", "集群"], ["Instance", "实例"]];
-  if (includeDynamic) entries.push(["Incident", "故障"], ["RCAHypothesis", "根因假设"]);
-  return entries.map(([kind, label]) => `<span><i class="legend-dot" style="background:${palette[kind]}"></i>${label}</span>`).join("");
+  const entries = [
+    ["UIControl", "UI控件 (起点)"],
+    ["UIFunction", "页面功能"],
+    ["Service", "服务"],
+    ["Database", "数据库/缓存"],
+    ["Host", "宿主机"],
+    ["Pod", "容器"],
+  ];
+  if (includeDynamic) entries.push(["Incident", "故障"], ["RCAHypothesis", "根因假说"]);
+  return entries
+    .map(
+      ([kind, label]) =>
+        `<span><i class="legend-dot" style="background:${palette[kind]}"></i>${label}</span>`
+    )
+    .join("");
 }

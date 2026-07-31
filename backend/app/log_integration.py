@@ -318,9 +318,16 @@ class IncidentGraphIntegrator:
         self._buffer_graph_writes = False
 
     def _pruned_pending_graph(self) -> tuple[list[PendingGraphNode], list[PendingGraphEdge]]:
+        known_names = set(self._known_nodes)
+        valid_edges = [
+            edge
+            for edge in self._pending_edges.values()
+            if (edge.source in self._pending_nodes or edge.source in known_names)
+            and (edge.target in self._pending_nodes or edge.target in known_names)
+        ]
         connected = {
             endpoint
-            for edge in self._pending_edges.values()
+            for edge in valid_edges
             for endpoint in (edge.source, edge.target)
         }
         essential_kinds = {"Incident"}
@@ -331,8 +338,9 @@ class IncidentGraphIntegrator:
         }
         edges = [
             edge
-            for edge in self._pending_edges.values()
-            if edge.source in kept_names and edge.target in kept_names
+            for edge in valid_edges
+            if (edge.source in kept_names or edge.source in known_names)
+            and (edge.target in kept_names or edge.target in known_names)
         ]
         nodes = [node for name, node in self._pending_nodes.items() if name in kept_names]
         return nodes, edges

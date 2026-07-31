@@ -1,18 +1,43 @@
 import { api } from "../api.js";
 import { projectShell } from "../shell.js";
-import { getLogTasks, rememberLogTask } from "../state.js";
+import { getLogTasks, onLogTasksChanged, rememberLogTask } from "../state.js";
 import { badge, emptyState, errorState, escapeHtml, formatDate, loading, setBusy, toast } from "../ui.js";
 
 export async function renderLogsPage(root, project) {
   root.innerHTML = projectShell(project, "logs", `<div id="page-content">${loading("正在读取日志批次…")}</div>`);
   const content = root.querySelector("#page-content");
   let batches = [];
+  let disposed = false;
+  let refreshVersion = 0;
+
+  const unsubscribeTasks = onLogTasksChanged((tasks) => {
+    if (disposed) return;
+    const projectTasks = tasks.filter((task) => task.projectId === project.id);
+    updateTasksPanel(projectTasks);
+    refreshBatches();
+  });
+
+  function onTaskFinished(event) {
+    const task = event.detail?.task || {};
+    if (task.projectId !== project.id) return;
+    updateTasksPanel(getLogTasks(project.id));
+    refreshBatches();
+  }
+
+  window.addEventListener("log-task:finished", onTaskFinished);
+  root.__pageCleanup = () => {
+    disposed = true;
+    unsubscribeTasks();
+    window.removeEventListener("log-task:finished", onTaskFinished);
+  };
 
   async function load() {
     try {
       batches = (await api.logs(project.id)).items || [];
+      if (disposed) return;
       paint();
     } catch (error) {
+      if (disposed) return;
       content.innerHTML = errorState(error, "retry-logs");
       content.querySelector("#retry-logs")?.addEventListener("click", load);
     }
@@ -22,7 +47,7 @@ export async function renderLogsPage(root, project) {
     const tasks = getLogTasks(project.id);
     content.innerHTML = `
       <div class="page-header"><div><h1>日志数据与异常检测</h1><p>上传日志包后会在后台持续分析；离开本页也不会中断任务。</p></div></div>
-      ${tasksPanel(tasks)}
+      <div id="log-tasks-region">${tasksPanel(tasks)}</div>
       <div class="split-main" style="margin-bottom:20px">
         <section class="card">
           <div class="card-header"><div><h2>新建分析批次</h2><p>支持单个 .log/.txt、日志目录 ZIP；分析进度会自动刷新。</p></div></div>
@@ -48,9 +73,33 @@ export async function renderLogsPage(root, project) {
       </div>
       <section class="card">
         <div class="card-header"><div><h2>日志批次</h2><p>原始输入和分析产物按项目、批次隔离保存。</p></div></div>
-        <div class="card-body flush">${batchesTable(batches, project.id)}</div>
+        <div class="card-body flush" id="log-batches-region">${batchesTable(batches, project.id)}</div>
       </section>`;
     bind();
+  }
+
+  function updateTasksPanel(tasks = getLogTasks(project.id)) {
+    const region = content.querySelector("#log-tasks-region");
+    if (region) region.innerHTML = tasksPanel(tasks);
+  }
+
+  async function refreshBatches() {
+    const version = ++refreshVersion;
+    try {
+      const nextBatches = (await api.logs(project.id)).items || [];
+      if (disposed || version !== refreshVersion) return;
+      batches = nextBatches;
+      updateBatchesTable();
+    } catch {
+      // Keep the last visible table while the next poll retries.
+    }
+  }
+
+  function updateBatchesTable() {
+    const region = content.querySelector("#log-batches-region");
+    if (!region) return;
+    region.innerHTML = batchesTable(batches, project.id);
+    bindDeleteButtons(region);
   }
 
   function bind() {
@@ -79,14 +128,21 @@ export async function renderLogsPage(root, project) {
           });
         }
         batches = (await api.logs(project.id)).items || [];
+        if (disposed) return;
         toast("日志分析已在后台开始");
-        paint();
+        updateTasksPanel();
+        updateBatchesTable();
+        setBusy(button, false);
       } catch (error) {
         toast(error.message, "error");
         setBusy(button, false);
       }
     });
-    content.querySelectorAll("[data-delete-batch]").forEach((button) => button.addEventListener("click", async () => {
+    bindDeleteButtons(content);
+  }
+
+  function bindDeleteButtons(scope) {
+    scope.querySelectorAll("[data-delete-batch]").forEach((button) => button.addEventListener("click", async () => {
       const batch = batches[Number(button.dataset.deleteBatch)];
       if (!batch || batch.status === "deleting") return;
       const incidentCount = Number(batch.summary?.incidents || 0);
@@ -105,8 +161,10 @@ export async function renderLogsPage(root, project) {
           summary: deleting.summary || {},
         });
         batches = (await api.logs(project.id)).items || [];
+        if (disposed) return;
         toast("日志批次删除已在后台开始");
-        paint();
+        updateTasksPanel();
+        updateBatchesTable();
       } catch (error) {
         toast(error.message, "error");
         setBusy(button, false);

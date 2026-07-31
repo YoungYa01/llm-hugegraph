@@ -1,7 +1,7 @@
 import { hasSession, restoreSession, signOut, user } from "./auth.js";
 import { navigate, onRouteChange, route } from "./router.js";
 import { bindShell } from "./shell.js";
-import { loadProject, onLogTasksChanged, startLogTaskPolling } from "./state.js";
+import { loadProject, startLogTaskPolling } from "./state.js";
 import { errorState, loading, toast } from "./ui.js";
 import { renderAuthPage } from "./pages/auth-page.js";
 import { renderProjectsPage } from "./pages/projects-page.js";
@@ -14,6 +14,11 @@ import { renderIncidentDetailPage } from "./pages/incident-detail-page.js";
 const root = document.querySelector("#app");
 let renderVersion = 0;
 
+function cleanupPage() {
+  root.__pageCleanup?.();
+  root.__pageCleanup = null;
+}
+
 async function logout() {
   await signOut();
   navigate("/projects");
@@ -22,6 +27,7 @@ async function logout() {
 
 async function render(nextRoute = route()) {
   const version = ++renderVersion;
+  cleanupPage();
   if (!user()) {
     renderAuthPage(root, { onAuthenticated: () => { navigate("/projects"); render(); } });
     return;
@@ -59,11 +65,7 @@ window.addEventListener("log-task:finished", (event) => {
   if (task.type === "delete") toast("日志批次删除完成");
   else if (task.status === "failed") toast("日志分析失败，请回到日志页面查看详情", "error");
   else toast("日志分析完成，页面状态已更新");
-  render(route());
-});
-
-onLogTasksChanged(() => {
-  if (route().name === "logs") render(route());
+  if (route().name !== "logs") render(route());
 });
 
 onRouteChange(render);

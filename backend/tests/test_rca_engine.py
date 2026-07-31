@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.analyzer import RuleBasedArchitectureExtractor
-from app.log_integration import IncidentGraphIntegrator, LogFaultRunner
+from app.log_integration import (
+    IncidentGraphIntegrator,
+    LogFaultRunner,
+    PendingGraphEdge,
+    PendingGraphNode,
+)
 from app.models import GraphEdge, GraphNode, GraphResponse
 from app.rca_engine import RootCauseEngine, hypotheses_from_persisted_graph
 
@@ -133,6 +138,43 @@ def test_incident_import_does_not_overwrite_curated_architecture_nodes() -> None
     assert "Redis生产集群" not in updated_names
     assert "RCAHypothesis:I00001:01" in updated_names
     assert ("Incident:I00001", "Redis生产集群", "SUSPECTED_ROOT_CAUSE") in db.edges
+
+
+def test_pending_graph_pruning_keeps_edges_to_existing_architecture_nodes() -> None:
+    integrator = IncidentGraphIntegrator(db=FakeGraphDb(architecture_graph()))  # type: ignore[arg-type]
+    integrator._known_nodes = {
+        "Redis生产集群": {"kind": "Cluster", "layer": "基础设施层", "description": "", "meta": {}},
+    }
+    integrator._pending_nodes = {
+        "Incident:I00001": PendingGraphNode("Incident:I00001", "异常分析层", "Incident", "", "test.json"),
+        "RCAHypothesis:I00001:01": PendingGraphNode("RCAHypothesis:I00001:01", "根因推理层", "RCAHypothesis", "", "test.json"),
+        "UnrelatedRuntimeNode": PendingGraphNode("UnrelatedRuntimeNode", "异常分析层", "LogEvent", "", "test.json"),
+    }
+    integrator._pending_edges = {
+        ("Incident:I00001", "RCAHypothesis:I00001:01", "HAS_HYPOTHESIS"): PendingGraphEdge(
+            "Incident:I00001",
+            "RCAHypothesis:I00001:01",
+            "HAS_HYPOTHESIS",
+        ),
+        ("RCAHypothesis:I00001:01", "Redis生产集群", "CANDIDATE_CAUSE"): PendingGraphEdge(
+            "RCAHypothesis:I00001:01",
+            "Redis生产集群",
+            "CANDIDATE_CAUSE",
+        ),
+        ("UnrelatedRuntimeNode", "MissingArchitectureNode", "NOISE"): PendingGraphEdge(
+            "UnrelatedRuntimeNode",
+            "MissingArchitectureNode",
+            "NOISE",
+        ),
+    }
+
+    nodes, edges = integrator._pruned_pending_graph()
+
+    assert {node.name for node in nodes} == {"Incident:I00001", "RCAHypothesis:I00001:01"}
+    assert {(edge.source, edge.target, edge.type) for edge in edges} == {
+        ("Incident:I00001", "RCAHypothesis:I00001:01", "HAS_HYPOTHESIS"),
+        ("RCAHypothesis:I00001:01", "Redis生产集群", "CANDIDATE_CAUSE"),
+    }
 
 
 def test_rule_fallback_extracts_aliases_and_redis_member_topology() -> None:

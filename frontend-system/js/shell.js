@@ -11,9 +11,9 @@ const icons = {
 
 const navItems = [
   ["overview", "总览"],
-  ["architecture", "架构图谱"],
-  ["logs", "日志数据"],
-  ["incidents", "故障与根因"],
+  ["architecture", "系统架构拓扑"],
+  ["logs", "日志解析与检测"],
+  ["incidents", "故障根因定位"],
 ];
 
 export function projectShell(project, current, content) {

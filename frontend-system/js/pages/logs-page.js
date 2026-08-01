@@ -20,7 +20,7 @@ export async function renderLogsPage(root, project) {
 
   function paint() {
     content.innerHTML = `
-      <div class="page-header"><div><h1>日志数据与异常检测</h1><p>上传 Spring 风格日志，由滑动窗口算法生成异常区间、日志根因证据，再与架构图谱联合推理。</p></div></div>
+      <div class="page-header"><div><h1>日志解析与检测</h1><p>上传 Spring 风格日志，由滑动窗口算法生成异常区间、日志根因证据，再与架构图谱联合推理。</p></div></div>
       <div class="split-main" style="margin-bottom:20px">
         <section class="card">
           <div class="card-header"><div><h2>新建分析批次</h2><p>支持单个 .log/.txt、日志目录 ZIP；可选正常历史日志作为模型训练集。</p></div></div>

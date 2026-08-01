@@ -38,7 +38,7 @@ export async function renderArchitecturePage(root, project) {
     selectedEdge = null;
     content.innerHTML = `
       <div class="page-header">
-        <div><h1>系统架构知识图谱</h1><p>这里只展示静态系统架构；故障、日志事件和 RCA 节点仅在具体故障详情中融合展示。</p></div>
+        <div><h1>系统架构拓扑</h1><p>这里只展示静态系统架构；故障、日志事件和 RCA 节点仅在具体故障详情中融合展示。</p></div>
         <div class="page-actions" style="gap:8px;display:flex;flex-wrap:wrap">
           <button class="button button-secondary" id="export-graph-json"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>导出架构数据</button>
           <label class="button button-secondary" style="margin:0;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>导入图谱数据<input type="file" id="import-json-file" accept=".json" style="display:none" /></label>

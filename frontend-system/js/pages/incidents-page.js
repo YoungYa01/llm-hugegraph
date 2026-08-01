@@ -25,7 +25,7 @@ export async function renderIncidentsPage(root, project) {
       return haystack.includes(query.toLowerCase());
     });
     content.innerHTML = `
-      <div class="page-header"><div><h1>故障与根因</h1><p>日志证据、架构路径和处理闭环都保留在同一个故障记录中。</p></div><a class="button button-primary" href="#/projects/${project.id}/logs">＋ 分析新日志</a></div>
+      <div class="page-header"><div><h1>故障根因定位</h1><p>日志证据、架构路径和处理闭环都保留在同一个故障记录中。</p></div><a class="button button-primary" href="#/projects/${project.id}/logs">＋ 分析新日志</a></div>
       <div class="toolbar">
         <div class="filters">
           <input class="input" id="incident-search" value="${escapeHtml(query)}" placeholder="搜索标题、候选或故障模式" style="min-width:260px" />

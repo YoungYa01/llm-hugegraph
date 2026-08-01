@@ -98,16 +98,16 @@ function layout(nodes, hasDynamic) {
   const laneWidths = [];
   let maxLaneRows = 1;
 
-  const startX = 35;
-  const startY = 75;
-  const rowHeight = 76;
-  const subColGap = 190;
+  const startX = 25;
+  const startY = 126;
+  const rowHeight = 74;
+  const subColGap = 192;
 
   let currentLaneX = startX;
 
   groups.forEach((items, colIdx) => {
     const numSubCols = items.length > 5 ? 2 : 1;
-    const laneWidth = numSubCols === 2 ? 395 : 225;
+    const laneWidth = numSubCols === 2 ? 395 : 220;
     laneWidths.push(laneWidth);
 
     items.forEach((node, idx) => {
@@ -118,34 +118,37 @@ function layout(nodes, hasDynamic) {
       positions.set(node.name, { x: posX, y: posY });
     });
 
-    const rowsInThisLane = Math.ceil(items.length / numSubCols);
-    maxLaneRows = Math.max(maxLaneRows, rowsInThisLane);
+    const numRows = Math.ceil(items.length / numSubCols);
+    if (numRows > maxLaneRows) maxLaneRows = numRows;
 
-    currentLaneX += laneWidth + 25;
+    currentLaneX += laneWidth + 32;
   });
+
+  const totalWidth = currentLaneX + 15;
+  const totalHeight = Math.max(620, startY + maxLaneRows * rowHeight + 45);
 
   return {
     positions,
     numCols,
+    width: totalWidth,
+    height: totalHeight,
     laneWidths,
-    width: Math.max(1020, currentLaneX + 20),
-    height: Math.max(620, startY + maxLaneRows * rowHeight + 120),
     startX,
     startY,
   };
 }
 
 function short(value, length = 20) {
-  const text = String(value || "");
-  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+  if (!value) return "";
+  return value.length > length ? `${value.slice(0, length - 1)}…` : value;
 }
 
-export function renderGraph(
-  container,
-  graph,
-  { onSelect = () => {}, onSelectEdge = () => {} } = {}
-) {
-  container.replaceChildren();
+export function renderGraph(container, graph, options = {}) {
+  const onSelect = options.onSelect || options.onSelectNode || (() => {});
+  const onSelectEdge = options.onSelectEdge || (() => {});
+
+  container.innerHTML = "";
+
   const nodes = (graph.nodes || []).slice(0, 500);
   const nodeNames = new Set(nodes.map((node) => node.name));
   const edges = (graph.edges || []).filter(
@@ -182,7 +185,6 @@ export function renderGraph(
 
   const defs = svgElement("defs");
 
-  // 动态箭头定义
   const arrowNormal = svgElement("marker", {
     id: "arrow-normal",
     viewBox: "0 0 10 10",
@@ -227,14 +229,14 @@ export function renderGraph(
   let currentLaneX = startX;
 
   columnTitles.forEach((title, colIdx) => {
-    const laneW = laneWidths[colIdx] || 225;
+    const laneW = laneWidths[colIdx] || 220;
     const laneX = currentLaneX - 10;
     
     const laneBg = svgElement("rect", {
       x: laneX,
-      y: "18",
+      y: "64",
       width: laneW,
-      height: height - 32,
+      height: height - 78,
       rx: "12",
       fill: colIdx % 2 === 0 ? "#f8fafc" : "#f1f5f9",
       stroke: "#e2e8f0",
@@ -244,7 +246,7 @@ export function renderGraph(
 
     const headerBox = svgElement("rect", {
       x: laneX,
-      y: "18",
+      y: "64",
       width: laneW,
       height: "38",
       rx: "8",
@@ -255,7 +257,7 @@ export function renderGraph(
 
     const headerText = svgElement("text", {
       x: laneX + laneW / 2,
-      y: "42",
+      y: "88",
       "text-anchor": "middle",
       fill: "#1e293b",
       "font-size": "13",
@@ -264,7 +266,7 @@ export function renderGraph(
     headerText.textContent = title;
 
     swimlaneLayer.append(laneBg, headerBox, headerText);
-    currentLaneX += laneW + 25;
+    currentLaneX += laneW + 18;
   });
   viewport.append(swimlaneLayer);
 
@@ -290,6 +292,14 @@ export function renderGraph(
     const y2 = target.y + 28;
     const bend = Math.max(40, Math.abs(x2 - x1) * 0.38);
     const pathData = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+
+    const edgeGroup = svgElement("g", {
+      class: "edge-group",
+      "data-source": edge.source,
+      "data-target": edge.target,
+      "data-type": edge.type,
+    });
+    edgeGroup.style.transition = "opacity 0.2s ease";
 
     const isFaultEdge = edge.type === "AFFECTS" || edge.type === "FAULT_PROPAGATES_TO";
     const isRootEdge = edge.type === "SUSPECTED_ROOT_CAUSE" || edge.type === "CANDIDATE_CAUSE";
@@ -340,16 +350,14 @@ export function renderGraph(
       if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
       selectedNode = null;
 
-      visibleEdgePaths().forEach((candidate) => {
-        candidate.setAttribute("stroke", "#e2e8f0");
-        candidate.setAttribute("stroke-width", "1");
-        candidate.setAttribute("opacity", "0.25");
+      Array.from(svg.querySelectorAll("g.edge-group")).forEach((g) => {
+        g.style.opacity = "0.1";
       });
 
       selectedEdge = path;
+      edgeGroup.style.opacity = "1";
       path.setAttribute("stroke", "#2563eb");
       path.setAttribute("stroke-width", "3.5");
-      path.setAttribute("opacity", "1");
       onSelectEdge(edge);
     };
 
@@ -358,7 +366,7 @@ export function renderGraph(
       if (event.key === "Enter" || event.key === " ") chooseEdge(event);
     });
 
-    edgeLayer.append(hitPath, path);
+    edgeGroup.append(hitPath, path);
 
     if (edges.length <= 65) {
       const label = svgElement("text", {
@@ -371,11 +379,13 @@ export function renderGraph(
       });
       label.textContent = short(edge.type, 18);
       label.style.pointerEvents = "none";
-      edgeLayer.append(label);
+      edgeGroup.append(label);
     }
+    
+    edgeLayer.append(edgeGroup);
   });
 
-  // 3. 绘制节点 (专属实体 Icon + 起点/终点徽章 + 精致阴影边框)
+  // 3. 绘制节点 (纯素雅极简 Text Badges + 精致边框)
   nodes.forEach((node) => {
     const pos = positions.get(node.name);
     const group = svgElement("g", {
@@ -386,9 +396,9 @@ export function renderGraph(
       "data-node-name": node.name,
     });
     group.style.cursor = "pointer";
+    group.style.transition = "opacity 0.2s ease";
 
     const color = palette[node.kind] || "#64748b";
-    const icon = kindIcons[node.kind] || "🧩";
     const groupCol = groupFor(node);
 
     const isStartNode = groupCol === 0;
@@ -396,7 +406,7 @@ export function renderGraph(
     const isRootCause = rootCauseNodes.has(node.name);
 
     let cardBg = "#ffffff";
-    let strokeColor = color;
+    let strokeColor = "#cbd5e1";
     let strokeWidth = "1.5";
 
     if (isAffected && (node.kind === "UIControl" || node.kind === "UIFunction")) {
@@ -410,7 +420,7 @@ export function renderGraph(
     }
 
     const rect = svgElement("rect", {
-      width: "185",
+      width: "172",
       height: "58",
       rx: "10",
       fill: cardBg,
@@ -426,15 +436,8 @@ export function renderGraph(
       fill: color,
     });
 
-    const iconTxt = svgElement("text", {
-      x: "16",
-      y: "25",
-      "font-size": "13",
-    });
-    iconTxt.textContent = icon;
-
     const title = svgElement("text", {
-      x: "36",
+      x: "16",
       y: "25",
       fill: isAffected ? "#9f1239" : "#0f172a",
       "font-size": "12.5",
@@ -450,34 +453,42 @@ export function renderGraph(
     });
     kind.textContent = node.kind || "Component";
 
-    group.append(rect, accent, iconTxt, title, kind);
+    group.append(rect, accent, title, kind);
 
-    // 起点/根因/受影响徽章
+    if (isRootCause) {
+      group.classList.add("node-root-glow");
+    } else if (isAffected) {
+      group.classList.add("node-fault-glow");
+    }
+
+    const isInfraNode = ["Host", "Pod", "Database", "Cache", "NetworkSwitch"].includes(node.kind);
+
+    // 纯素雅极简徽章 (精细适配 172px 节点卡片宽)
     if (isStartNode) {
-      const badgeG = svgElement("g", { transform: "translate(136, 6)" });
+      const badgeG = svgElement("g", { transform: "translate(130, 6)" });
       const badgeBg = svgElement("rect", {
-        width: "42",
+        width: "34",
         height: "18",
         rx: "9",
-        fill: isAffected ? "#ffe4e6" : "#e0f2fe",
-        stroke: isAffected ? "#f43f5e" : "#0284c7",
+        fill: isAffected ? "#ffe4e6" : "#f1f5f9",
+        stroke: isAffected ? "#f43f5e" : "#cbd5e1",
         "stroke-width": "1",
       });
       const badgeTxt = svgElement("text", {
-        x: "21",
+        x: "17",
         y: "13",
         "text-anchor": "middle",
-        fill: isAffected ? "#be123c" : "#0369a1",
+        fill: isAffected ? "#be123c" : "#475569",
         "font-size": "9",
         "font-weight": "700",
       });
-      badgeTxt.textContent = isAffected ? "❌ 异常" : "起点";
+      badgeTxt.textContent = isAffected ? "异常" : "起点";
       badgeG.append(badgeBg, badgeTxt);
       group.append(badgeG);
     } else if (isRootCause) {
-      const badgeG = svgElement("g", { transform: "translate(116, 6)" });
+      const badgeG = svgElement("g", { transform: "translate(114, 6)" });
       const badgeBg = svgElement("rect", {
-        width: "62",
+        width: "50",
         height: "18",
         rx: "9",
         fill: "#f3e8ff",
@@ -485,20 +496,20 @@ export function renderGraph(
         "stroke-width": "1",
       });
       const badgeTxt = svgElement("text", {
-        x: "31",
+        x: "25",
         y: "13",
         "text-anchor": "middle",
         fill: "#7e22ce",
-        "font-size": "9.5",
+        "font-size": "9",
         "font-weight": "700",
       });
-      badgeTxt.textContent = "🎯 根因起点";
+      badgeTxt.textContent = "根因起点";
       badgeG.append(badgeBg, badgeTxt);
       group.append(badgeG);
     } else if (isAffected) {
-      const badgeG = svgElement("g", { transform: "translate(124, 6)" });
+      const badgeG = svgElement("g", { transform: "translate(122, 6)" });
       const badgeBg = svgElement("rect", {
-        width: "54",
+        width: "42",
         height: "18",
         rx: "9",
         fill: "#fff1f2",
@@ -506,14 +517,35 @@ export function renderGraph(
         "stroke-width": "1",
       });
       const badgeTxt = svgElement("text", {
-        x: "27",
+        x: "21",
         y: "13",
         "text-anchor": "middle",
         fill: "#be123c",
         "font-size": "9",
         "font-weight": "700",
       });
-      badgeTxt.textContent = "⚠️ 受波及";
+      badgeTxt.textContent = "受波及";
+      badgeG.append(badgeBg, badgeTxt);
+      group.append(badgeG);
+    } else if (isInfraNode) {
+      const badgeG = svgElement("g", { transform: "translate(114, 6)" });
+      const badgeBg = svgElement("rect", {
+        width: "50",
+        height: "18",
+        rx: "9",
+        fill: "#f8fafc",
+        stroke: "#cbd5e1",
+        "stroke-width": "1",
+      });
+      const badgeTxt = svgElement("text", {
+        x: "25",
+        y: "13",
+        "text-anchor": "middle",
+        fill: "#64748b",
+        "font-size": "8.5",
+        "font-weight": "700",
+      });
+      badgeTxt.textContent = "基础设施";
       badgeG.append(badgeBg, badgeTxt);
       group.append(badgeG);
     }
@@ -531,11 +563,32 @@ export function renderGraph(
       rect.setAttribute("stroke", "#2563eb");
       rect.setAttribute("stroke-width", "3");
 
-      visibleEdgePaths().forEach((path) => {
-        const active = path.dataset.source === node.name || path.dataset.target === node.name;
-        path.setAttribute("stroke", active ? (path.dataset.type === "AFFECTS" ? "#f43f5e" : "#2563eb") : "#e2e8f0");
-        path.setAttribute("stroke-width", active ? "3" : "1");
-        path.setAttribute("opacity", active ? "1" : "0.2");
+      const allEdgeGroups = Array.from(svg.querySelectorAll("g.edge-group"));
+      const neighborNodes = new Set([node.name]);
+
+      allEdgeGroups.forEach((g) => {
+        const isNeighbor = g.dataset.source === node.name || g.dataset.target === node.name;
+        if (isNeighbor) {
+          neighborNodes.add(g.dataset.source);
+          neighborNodes.add(g.dataset.target);
+          g.style.opacity = "1";
+          const path = g.querySelector("path[data-edge-visible]");
+          if (path) {
+            path.setAttribute("stroke", path.dataset.type === "AFFECTS" ? "#f43f5e" : "#2563eb");
+            path.setAttribute("stroke-width", "3");
+          }
+        } else {
+          g.style.opacity = "0.06";
+          const path = g.querySelector("path[data-edge-visible]");
+          if (path) {
+            path.setAttribute("stroke", "#cbd5e1");
+            path.setAttribute("stroke-width", "1");
+          }
+        }
+      });
+
+      nodeGroupElements.forEach((el, name) => {
+        el.style.opacity = neighborNodes.has(name) ? "1" : "0.2";
       });
 
       onSelect(node, edges.filter((edge) => edge.source === node.name || edge.target === node.name));
@@ -544,25 +597,32 @@ export function renderGraph(
     group.addEventListener("mouseenter", () => {
       if (selectedNode) return;
       const neighborNodes = new Set([node.name]);
-      visibleEdgePaths().forEach((path) => {
-        const isNeighbor = path.dataset.source === node.name || path.dataset.target === node.name;
+      const allEdgeGroups = Array.from(svg.querySelectorAll("g.edge-group"));
+
+      allEdgeGroups.forEach((g) => {
+        const isNeighbor = g.dataset.source === node.name || g.dataset.target === node.name;
         if (isNeighbor) {
-          neighborNodes.add(path.dataset.source);
-          neighborNodes.add(path.dataset.target);
+          neighborNodes.add(g.dataset.source);
+          neighborNodes.add(g.dataset.target);
         }
-        path.setAttribute("opacity", isNeighbor ? "1" : "0.15");
-        if (isNeighbor) path.setAttribute("stroke-width", "2.5");
+        g.style.opacity = isNeighbor ? "1" : "0.06";
       });
       nodeGroupElements.forEach((el, name) => {
-        el.style.opacity = neighborNodes.has(name) ? "1" : "0.25";
+        el.style.opacity = neighborNodes.has(name) ? "1" : "0.2";
       });
     });
 
     group.addEventListener("mouseleave", () => {
       if (selectedNode) return;
-      visibleEdgePaths().forEach((path) => {
-        path.setAttribute("opacity", "1");
-        path.setAttribute("stroke-width", edgeColors[path.dataset.type] ? "2" : "1.5");
+      Array.from(svg.querySelectorAll("g.edge-group")).forEach((g) => {
+        g.style.opacity = "1";
+        const path = g.querySelector("path[data-edge-visible]");
+        if (path) {
+          const isFaultEdge = g.dataset.type === "AFFECTS" || g.dataset.type === "FAULT_PROPAGATES_TO";
+          const isRootEdge = g.dataset.type === "SUSPECTED_ROOT_CAUSE" || g.dataset.type === "CANDIDATE_CAUSE";
+          path.setAttribute("stroke", isFaultEdge ? "#f43f5e" : isRootEdge ? "#a855f7" : (edgeColors[g.dataset.type] || "#94a3b8"));
+          path.setAttribute("stroke-width", isFaultEdge || isRootEdge ? "2.6" : "1.6");
+        }
       });
       nodeGroupElements.forEach((el) => {
         el.style.opacity = "1";
@@ -607,7 +667,10 @@ export function renderGraph(
     { passive: false }
   );
 
+  let lastDownPos = { x: 0, y: 0 };
+
   svg.addEventListener("pointerdown", (event) => {
+    lastDownPos = { x: event.clientX, y: event.clientY };
     if (event.target !== svg && event.target.tagName !== "rect" && !event.target.closest(".swimlanes")) return;
     dragging = true;
     start = { x: event.clientX - panX, y: event.clientY - panY };
@@ -627,14 +690,23 @@ export function renderGraph(
   });
 
   svg.addEventListener("click", (event) => {
-    if (event.target === svg) {
+    // 如果鼠标按下和抬起的物理移动距离 > 5 像素，说明用户是在平移拖动画布 (Drag)，绝对不取消高亮！
+    const moveDist = Math.hypot(event.clientX - lastDownPos.x, event.clientY - lastDownPos.y);
+    if (moveDist > 5) return;
+
+    if (event.target === svg || event.target.tagName === "rect") {
       selectedEdge = null;
       if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
       selectedNode = null;
-      visibleEdgePaths().forEach((path) => {
-        path.setAttribute("stroke", edgeColors[path.dataset.type] || "#cbd5e1");
-        path.setAttribute("stroke-width", "1.5");
-        path.setAttribute("opacity", "1");
+      Array.from(svg.querySelectorAll("g.edge-group")).forEach((g) => {
+        g.style.opacity = "1";
+        const path = g.querySelector("path[data-edge-visible]");
+        if (path) {
+          const isFaultEdge = g.dataset.type === "AFFECTS" || g.dataset.type === "FAULT_PROPAGATES_TO";
+          const isRootEdge = g.dataset.type === "SUSPECTED_ROOT_CAUSE" || g.dataset.type === "CANDIDATE_CAUSE";
+          path.setAttribute("stroke", isFaultEdge ? "#f43f5e" : isRootEdge ? "#a855f7" : (edgeColors[g.dataset.type] || "#94a3b8"));
+          path.setAttribute("stroke-width", isFaultEdge || isRootEdge ? "2.6" : "1.6");
+        }
       });
       nodeGroupElements.forEach((el) => {
         el.style.opacity = "1";

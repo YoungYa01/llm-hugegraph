@@ -226,3 +226,23 @@
   animation: rowDeleteAnimation 380ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
   pointer-events: none !important;
 }
+
+/* 故障链路动态脉冲流光粒子 */
+@keyframes faultFlowAnimation {
+  0% { stroke-dashoffset: 24; }
+  100% { stroke-dashoffset: 0; }
+}
+
+.edge-fault-flow {
+  stroke-dasharray: 6 3 !important;
+  animation: faultFlowAnimation 0.85s linear infinite !important;
+  filter: drop-shadow(0 0 6px rgba(244, 63, 94, 0.75)) !important;
+}
+
+.node-fault-glow {
+  filter: drop-shadow(0 0 10px rgba(244, 63, 94, 0.65)) !important;
+}
+
+.node-root-glow {
+  filter: drop-shadow(0 0 12px rgba(168, 85, 247, 0.8)) !important;
+}

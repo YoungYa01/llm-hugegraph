@@ -47,7 +47,7 @@ export async function renderArchitecturePage(root, project) {
         </div>
       </div>
 
-      <details class="card architecture-import" style="margin-bottom:20px">
+      <details class="card architecture-import" style="margin-bottom:20px" ${graph.nodes.length === 0 ? "open" : ""}>
         <summary><span><strong>从架构描述文本增量抽取 (LLM 大模型)</strong><small>使用本地 Qwen 大模型增量抽取节点与依赖关系</small></span><span>展开上传 ▾</span></summary>
         <div class="card-body">
           <form id="architecture-form" class="form-row" style="align-items:end">
@@ -440,17 +440,35 @@ export async function renderArchitecturePage(root, project) {
     const options = graph.nodes.map((node) => `<option value="${escapeHtml(node.name)}">${escapeHtml(node.name)} · ${escapeHtml(node.kind)}</option>`).join("");
     const modal = modalElement(edge ? "编辑架构关系" : "新增架构关系", `<form class="form-stack" id="edge-form">
       <div class="field"><label>源节点（调用方/依赖方）</label><select class="select" name="source" required>${options}</select></div>
-      <div class="field"><label>关系类型</label><input class="input" name="type" required value="${escapeHtml(edge?.type || "DEPENDS_ON")}" list="relation-options" /><datalist id="relation-options"><option>CALLS</option><option>DEPENDS_ON</option><option>USES_DB</option><option>READS</option><option>WRITES</option><option>CONNECTS_TO</option><option>RUNS_ON</option><option>HAS_MEMBER</option><option>CONTAINS</option></datalist></div>
+      <div class="field"><label>关系类型</label>
+        <select class="select" name="type" required>
+          <option value="CALLS" ${edge?.type === "CALLS" ? "selected" : ""}>CALLS · 微服务/接口服务间调用</option>
+          <option value="DEPENDS_ON" ${!edge || edge?.type === "DEPENDS_ON" ? "selected" : ""}>DEPENDS_ON · 业务服务依赖组件/基础设施</option>
+          <option value="USES_DB" ${edge?.type === "USES_DB" ? "selected" : ""}>USES_DB · 读写使用数据库或缓存</option>
+          <option value="TRIGGERS" ${edge?.type === "TRIGGERS" ? "selected" : ""}>TRIGGERS · UI页面功能触发API接口</option>
+          <option value="BELONGS_TO" ${edge?.type === "BELONGS_TO" ? "selected" : ""}>BELONGS_TO · 前端控件归属于页面功能</option>
+          <option value="ROUTES_TO" ${edge?.type === "ROUTES_TO" ? "selected" : ""}>ROUTES_TO · API网关路由调度到后端微服务</option>
+          <option value="RUNS_ON" ${edge?.type === "RUNS_ON" ? "selected" : ""}>RUNS_ON · 容器Pod实例承载运行微服务</option>
+          <option value="HOSTED_ON" ${edge?.type === "HOSTED_ON" ? "selected" : ""}>HOSTED_ON · 容器/数据库托管部署在宿主机</option>
+          <option value="CONNECTS_TO" ${edge?.type === "CONNECTS_TO" ? "selected" : ""}>CONNECTS_TO · 物理宿主机连接网络交换机</option>
+          <option value="READS" ${edge?.type === "READS" ? "selected" : ""}>READS · 数据存储只读依赖关系</option>
+          <option value="WRITES" ${edge?.type === "WRITES" ? "selected" : ""}>WRITES · 数据存储写入依赖关系</option>
+          <option value="PUBLISHES" ${edge?.type === "PUBLISHES" ? "selected" : ""}>PUBLISHES · 消息队列发布事件</option>
+          <option value="SUBSCRIBES" ${edge?.type === "SUBSCRIBES" ? "selected" : ""}>SUBSCRIBES · 消息队列订阅消费事件</option>
+          <option value="HAS_MEMBER" ${edge?.type === "HAS_MEMBER" ? "selected" : ""}>HAS_MEMBER · 逻辑集群包含物理具体实例</option>
+          <option value="CONTAINS" ${edge?.type === "CONTAINS" ? "selected" : ""}>CONTAINS · 系统分层/模块逻辑包含</option>
+        </select>
+      </div>
       <div class="field"><label>目标节点（被调用方/被依赖方）</label><select class="select" name="target" required>${options}</select></div>
       <div class="field"><label>说明</label><input class="input" name="description" value="${escapeHtml(edge?.description || "")}" placeholder="关系的业务语义或环境信息" /></div>
       <div class="field"><label>元数据 JSON</label><textarea class="textarea" name="meta">${escapeHtml(JSON.stringify(edge?.meta || {}, null, 2))}</textarea></div>
       <div class="notice">依赖边必须按“调用方 → 被依赖方”录入；根因页面会按相反方向展示故障传播。</div>
       <div style="display:flex;justify-content:flex-end;gap:9px"><button type="button" class="button button-secondary" data-close>取消</button><button class="button button-primary" id="save-edge" type="submit">保存关系</button></div>
     </form>`);
-    const sourceSelect = modal.querySelector('select[name="source"]');
-    const targetSelect = modal.querySelector('select[name="target"]');
-    sourceSelect.value = edge?.source || graph.nodes[0].name;
-    targetSelect.value = edge?.target || graph.nodes[1].name;
+    const defaultSource = edge?.source || (selectedNode ? selectedNode.name : graph.nodes[0].name);
+    const defaultTarget = edge?.target || (graph.nodes.find(n => n.name !== defaultSource)?.name || graph.nodes[1]?.name);
+    sourceSelect.value = defaultSource;
+    targetSelect.value = defaultTarget;
     modal.querySelector("#edge-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const values = Object.fromEntries(new FormData(event.currentTarget));

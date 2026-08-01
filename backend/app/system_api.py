@@ -129,6 +129,10 @@ def _batch_result(item: dict[str, Any]) -> dict[str, Any]:
         if key not in {"input_path", "train_path", "rca_json"}
     }
     result["summary"] = _json(result.pop("summary_json", "{}"), {})
+    # severity_dist 和 resolved_count 由 list_log_batches 附加，直接透传
+    # （get_log_batch 单条查询无聚合时给出空默认值，保持兼容）
+    result.setdefault("severity_dist", {"critical": 0, "high": 0, "medium": 0, "low": 0})
+    result.setdefault("resolved_count", 0)
     return result
 
 

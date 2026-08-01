@@ -323,7 +323,7 @@ class SystemDatabase:
         return self.query_one("SELECT * FROM log_batches WHERE id = ?", (batch_id,))
 
     def list_log_batches(self, project_id: str) -> list[dict[str, Any]]:
-        return self.query_all(
+        rows = self.query_all(
             """
             SELECT id, project_id, filename, train_filename, output_path, status, summary_json,
                    error_message, created_by, created_at, completed_at
@@ -331,6 +331,36 @@ class SystemDatabase:
             """,
             (project_id,),
         )
+        # 为每个批次附加严重度分布和已解决计数（单次查询聚合，避免 N+1）
+        if rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            agg_rows = self.query_all(
+                f"""
+                SELECT log_batch_id,
+                       SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS cnt_critical,
+                       SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) AS cnt_high,
+                       SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) AS cnt_medium,
+                       SUM(CASE WHEN severity='low'      THEN 1 ELSE 0 END) AS cnt_low,
+                       SUM(CASE WHEN status='resolved'   THEN 1 ELSE 0 END) AS cnt_resolved,
+                       COUNT(*) AS cnt_total
+                FROM incidents
+                WHERE log_batch_id IN ({placeholders})
+                GROUP BY log_batch_id
+                """,
+                ids,
+            )
+            agg_map = {r["log_batch_id"]: r for r in agg_rows}
+            for row in rows:
+                agg = agg_map.get(row["id"], {})
+                row["severity_dist"] = {
+                    "critical": int(agg.get("cnt_critical") or 0),
+                    "high":     int(agg.get("cnt_high")     or 0),
+                    "medium":   int(agg.get("cnt_medium")   or 0),
+                    "low":      int(agg.get("cnt_low")      or 0),
+                }
+                row["resolved_count"] = int(agg.get("cnt_resolved") or 0)
+        return rows
 
     def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str) -> None:
         self.execute(

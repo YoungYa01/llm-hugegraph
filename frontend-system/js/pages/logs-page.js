@@ -20,25 +20,55 @@ export async function renderLogsPage(root, project) {
 
   function paint() {
     content.innerHTML = `
-      <div class="page-header"><div><h1>日志解析与检测</h1><p>上传 Spring 风格日志，由滑动窗口算法生成异常区间、日志根因证据，再与架构图谱联合推理。</p></div></div>
-      <div class="split-main" style="margin-bottom:20px">
-        <section class="card">
-          <div class="card-header"><div><h2>新建分析批次</h2><p>支持单个 .log/.txt、日志目录 ZIP；可选正常历史日志作为模型训练集。</p></div></div>
-          <div class="card-body">
-            <form class="form-stack" id="log-form">
-              <div class="field"><label>待检测日志</label><label class="file-drop"><input type="file" name="file" required accept=".log,.txt,.zip,text/plain,application/zip" /><strong id="target-file-label">选择待分析日志或 ZIP</strong><span>Spring Boot 多服务日志建议打包为 ZIP</span></label></div>
-              <div class="notice notice-warning">当前 MVP 采用同步分析。浏览器会等待任务完成，请不要重复点击；生产部署建议换成 Celery / Redis 队列。</div>
-              <button class="button button-primary" id="run-analysis" type="submit">开始异常检测与 RCA</button>
-            </form>
-          </div>
-        </section>
-        <aside class="card">
-          <div class="card-header"><div><h2>最近一次结果</h2><p>算法运行和图谱融合摘要。</p></div></div>
-          <div class="card-body" id="last-result">${resultHtml(lastResult, project.id)}</div>
-        </aside>
+      <div class="page-header">
+        <div>
+          <h1>日志解析与统计</h1>
+          <p>上传 Spring 风格服务日志，由滑动窗口算法生成异常区间、日志根因证据，再与系统架构拓扑联合推理。</p>
+        </div>
       </div>
+
+      <section class="card" style="margin-bottom:24px">
+        <div class="card-header">
+          <div>
+            <h2>新建分析批次</h2>
+            <p>支持上传单个 .log / .txt 或多服务日志包 ZIP；自动执行日志解析、窗口异常挖掘与图谱 RCA 推理。</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <form class="form-stack" id="log-form">
+            <div class="field">
+              <label class="file-drop" style="padding:28px 20px;text-align:center">
+                <input type="file" name="file" required accept=".log,.txt,.zip,text/plain,application/zip" />
+                <strong id="target-file-label" style="font-size:16px;color:var(--brand)">点击选择或拖拽日志文件 (ZIP / LOG / TXT)</strong>
+                <span style="margin-top:6px;color:var(--ink-500)">Spring Boot 多服务日志建议打包为 ZIP 文件上传</span>
+              </label>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px;flex-wrap:wrap">
+              <div class="notice notice-warning" style="margin:0;flex:1;min-width:280px">
+                当前采用同步分析模式。浏览器会等待算法与图谱推理完成，请勿重复点击。
+              </div>
+              <button class="button button-primary" id="run-analysis" type="submit" style="padding:10px 28px;font-size:14px">
+                开始异常检测与 RCA
+              </button>
+            </div>
+          </form>
+        </div>
+      </section>
+
       <section class="card">
-        <div class="card-header"><div><h2>日志批次</h2><p>原始输入和分析产物按项目、批次隔离保存。</p></div></div>
+        <div class="card-header">
+          <div>
+            <h2>日志批次历史</h2>
+            <p>原始输入和分析产物按项目、批次隔离保存。</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-shrink:0;font-size:12px;color:var(--ink-500)">
+            <span style="font-weight:600;margin-right:2px">故障等级：</span>
+            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#dc2626;display:inline-block"></span>严重</span>
+            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#f97316;display:inline-block"></span>高</span>
+            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#eab308;display:inline-block"></span>中</span>
+            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span>低</span>
+          </div>
+        </div>
         <div class="card-body flush">${batchesTable(batches, project.id)}</div>
       </section>`;
     bind();
@@ -94,28 +124,17 @@ export async function renderLogsPage(root, project) {
   await load();
 }
 
-function resultHtml(result, projectId) {
-  if (!result) return `<p style="color:var(--ink-500)">运行一个分析批次后，这里会显示事件、窗口、故障数量和跳转入口。</p>`;
-  const summary = result.summary || {};
-  return `<div class="grid grid-2" style="margin-bottom:18px">
-    ${miniStat("日志事件", summary.events)}${miniStat("异常窗口", summary.anomaly_windows)}${miniStat("故障事件", summary.incidents)}${miniStat("PCA 维数", summary.pca_components)}
-  </div>
-  <dl class="kv-list">
-    <div class="kv-row"><dt>检测模式</dt><dd>${escapeHtml(summary.detection_mode || "—")}</dd></div>
-    <div class="kv-row"><dt>模型可靠</dt><dd>${summary.model_reliable ? "是" : "否（使用规则兜底）"}</dd></div>
-    <div class="kv-row"><dt>图谱写入</dt><dd>${result.integration?.nodes_written || 0} 节点 / ${result.integration?.edges_written || 0} 关系</dd></div>
-  </dl>
-  <a class="button button-primary button-block" style="margin-top:16px" href="#/projects/${projectId}/incidents?batch=${result.batch?.id || ""}">查看此批次故障与根因</a>`;
-}
 
-function miniStat(label, value) {
-  return `<div style="padding:13px;border-radius:9px;background:var(--surface-soft)"><span class="stat-label">${escapeHtml(label)}</span><strong style="display:block;font-size:22px">${Number(value || 0)}</strong></div>`;
-}
 
 function batchesTable(items, projectId) {
   void projectId;
   if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。 ");
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>分析时长</th><th>检测模式</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
+
+  // 统计同名文件，同名时需要在文件名下显示上传时间加以区分
+  const nameCounts = {};
+  items.forEach((item) => { nameCounts[item.filename] = (nameCounts[item.filename] || 0) + 1; });
+
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>分析时长</th><th>故障等级分布</th><th>处理进度</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
     const summary = item.summary || {};
     const durationSec = summary.duration_seconds || item.duration_seconds;
     let durationDisplay = "—";
@@ -131,6 +150,40 @@ function batchesTable(items, projectId) {
     }
     const incidentCnt = summary.incidents;
     const incidentsLink = incidentCnt != null ? `<a href="#/projects/${projectId}/incidents?batch=${item.id}" title="查看此批次故障" style="font-weight:700;color:var(--brand)">${incidentCnt}</a>` : "—";
-    return `<tr><td><a class="table-title" href="#/projects/${projectId}/incidents?batch=${item.id}" title="点击直达此批次故障根因">${escapeHtml(item.filename)}</a>${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${incidentsLink}</td><td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td><td><span class="table-subtitle">${escapeHtml(summary.detection_mode || "—")}</span></td><td>${badge(item.status)}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td></tr>`;
+
+    // 同名文件加时间副标题
+    const showTimeSub = nameCounts[item.filename] > 1;
+    const fileCell = `<a class="table-title" href="#/projects/${projectId}/incidents?batch=${item.id}" title="点击直达此批次故障根因">${escapeHtml(item.filename)}</a>${showTimeSub ? `<span class="table-subtitle">${formatDate(item.created_at)}</span>` : ""}${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}`;
+
+    // 故障等级分布色块
+    const dist = item.severity_dist || {};
+    const distParts = [];
+    if (dist.critical) distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#dc2626;display:inline-block"></span><span style="font-size:12px;font-weight:700;color:#dc2626">${dist.critical}</span></span>`);
+    if (dist.high)     distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#f97316;display:inline-block"></span><span style="font-size:12px;font-weight:700;color:#f97316">${dist.high}</span></span>`);
+    if (dist.medium)   distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#eab308;display:inline-block"></span><span style="font-size:12px;font-weight:600;color:#a16207">${dist.medium}</span></span>`);
+    if (dist.low)      distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:12px;color:var(--ink-500)">${dist.low}</span></span>`);
+    const distCell = distParts.length ? distParts.join("") : `<span class="table-subtitle">—</span>`;
+
+    // 处理进度
+    const total = incidentCnt ?? 0;
+    const resolved = item.resolved_count ?? 0;
+    const pending = total - resolved;
+    let progressCell = `<span class="table-subtitle">—</span>`;
+    if (total > 0) {
+      const pct = Math.round((resolved / total) * 100);
+      const barColor = pending === 0 ? "#22c55e" : pending <= 2 ? "#f97316" : "#dc2626";
+      progressCell = `<div style="min-width:90px">
+        <div style="font-size:12px;margin-bottom:3px;display:flex;justify-content:space-between">
+          <span style="color:${barColor};font-weight:700">${pending > 0 ? `${pending} 待处理` : "全部已解决"}</span>
+          <span style="color:var(--ink-500)">${resolved}/${total}</span>
+        </div>
+        <div style="height:4px;border-radius:2px;background:var(--surface-soft);overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:${barColor};border-radius:2px;transition:width .3s"></div>
+        </div>
+      </div>`;
+    }
+
+    return `<tr><td>${fileCell}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${incidentsLink}</td><td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td><td>${distCell}</td><td>${progressCell}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td></tr>`;
   }).join("")}</tbody></table></div>`;
 }
+

@@ -72,7 +72,11 @@ export async function renderLogsPage(root, project) {
       const incidentCount = Number(batch.summary?.incidents || 0);
       const message = `删除日志批次“${batch.filename}”？${incidentCount ? `\n它关联的 ${incidentCount} 个故障记录、RCA 动态图节点和分析产物也会永久删除。` : "\n原始文件和分析产物也会永久删除。"}`;
       if (!window.confirm(message)) return;
+      
+      const tr = button.closest("tr");
+      if (tr) tr.classList.add("is-deleting-row");
       setBusy(button, true, "删除中…");
+
       try {
         const result = await api.deleteBatch(project.id, batch.id);
         batches = batches.filter((item) => item.id !== batch.id);
@@ -80,6 +84,7 @@ export async function renderLogsPage(root, project) {
         toast(result.warnings?.length ? `批次已删除；${result.warnings.join("；")}` : "日志批次及关联故障已删除");
         paint();
       } catch (error) {
+        if (tr) tr.classList.remove("is-deleting-row");
         toast(error.message, "error");
         setBusy(button, false);
       }
@@ -100,7 +105,7 @@ function resultHtml(result, projectId) {
     <div class="kv-row"><dt>模型可靠</dt><dd>${summary.model_reliable ? "是" : "否（使用规则兜底）"}</dd></div>
     <div class="kv-row"><dt>图谱写入</dt><dd>${result.integration?.nodes_written || 0} 节点 / ${result.integration?.edges_written || 0} 关系</dd></div>
   </dl>
-  <a class="button button-primary button-block" style="margin-top:16px" href="#/projects/${projectId}/incidents">查看故障与根因</a>`;
+  <a class="button button-primary button-block" style="margin-top:16px" href="#/projects/${projectId}/incidents?batch=${result.batch?.id || ""}">查看此批次故障与根因</a>`;
 }
 
 function miniStat(label, value) {
@@ -110,8 +115,22 @@ function miniStat(label, value) {
 function batchesTable(items, projectId) {
   void projectId;
   if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。 ");
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>检测模式</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>分析时长</th><th>检测模式</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
     const summary = item.summary || {};
-    return `<tr><td><strong>${escapeHtml(item.filename)}</strong>${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${summary.incidents ?? "—"}</td><td><span class="table-subtitle">${escapeHtml(summary.detection_mode || "—")}</span></td><td>${badge(item.status)}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td></tr>`;
+    const durationSec = summary.duration_seconds || item.duration_seconds;
+    let durationDisplay = "—";
+    if (durationSec != null) {
+      const s = Number(durationSec);
+      if (s >= 60) {
+        const m = Math.floor(s / 60);
+        const remS = Math.round(s % 60);
+        durationDisplay = `${m}分 ${remS}秒`;
+      } else {
+        durationDisplay = `${s.toFixed(2)}s`;
+      }
+    }
+    const incidentCnt = summary.incidents;
+    const incidentsLink = incidentCnt != null ? `<a href="#/projects/${projectId}/incidents?batch=${item.id}" title="查看此批次故障" style="font-weight:700;color:var(--brand)">${incidentCnt}</a>` : "—";
+    return `<tr><td><a class="table-title" href="#/projects/${projectId}/incidents?batch=${item.id}" title="点击直达此批次故障根因">${escapeHtml(item.filename)}</a>${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${incidentsLink}</td><td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td><td><span class="table-subtitle">${escapeHtml(summary.detection_mode || "—")}</span></td><td>${badge(item.status)}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td></tr>`;
   }).join("")}</tbody></table></div>`;
 }

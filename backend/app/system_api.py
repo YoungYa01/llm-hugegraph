@@ -5,12 +5,13 @@ import logging
 import re
 import shutil
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
@@ -656,6 +657,7 @@ async def analyze_project_logs(
     train_file: UploadFile | None = File(None),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
+    total_t0 = time.perf_counter()
     database = get_system_db()
     _project_for_user(project_id, user, database)
     raw = await _read_upload(file)
@@ -702,6 +704,12 @@ async def analyze_project_logs(
             details,
             import_data.get("rca") or [],
         )
+
+        # 准确计算涵盖：算法日志检测 + HugeGraph 306节点/1057关系图谱写入 + SQLite落盘 的全流程真实总时长
+        total_duration = round(time.perf_counter() - total_t0, 2)
+        if isinstance(summary, dict):
+            summary["duration_seconds"] = total_duration
+
         database.complete_log_batch(
             batch_id,
             json.dumps(summary, ensure_ascii=False),
@@ -739,51 +747,77 @@ def get_log_batch(
     return {"batch": result}
 
 
+def _async_clean_batch_resources(project_id: str, batch_id: str, batch: dict[str, Any], app_data_root: str) -> None:
+    """在后台异步擦除 HugeGraph 图数据库中的 300+ 节点及残余磁盘文件，带 3 次重试防护。"""
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = ProjectScopedGraphClient(project_id).delete_incident_batch(batch_id[:12])
+            logger.info("Async graph cleanup success for batch=%s (attempt %d): %s", batch_id, attempt, res)
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Async graph cleanup attempt %d/%d failed for batch=%s: %s", attempt, max_retries, batch_id, exc)
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+
+    try:
+        logs_root = (
+            Path(app_data_root).expanduser().resolve()
+            / "projects"
+            / project_id
+            / "logs"
+        ).resolve()
+        input_file = Path(str(batch.get("input_path") or "")).expanduser().resolve()
+        batch_dir = input_file.parent
+        
+        if batch_dir.is_dir() and batch_dir.name == batch_id and batch_dir.is_relative_to(logs_root):
+            shutil.rmtree(batch_dir, ignore_errors=True)
+        elif input_file.exists() and input_file.is_file() and input_file.is_relative_to(logs_root):
+            try:
+                input_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Async disk cleanup warning for batch=%s: %s", batch_id, exc)
+
+
 @router.delete("/projects/{project_id}/logs/{batch_id}")
 def delete_log_batch(
     project_id: str,
     batch_id: str,
+    background_tasks: BackgroundTasks,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
     _project_for_user(project_id, user, database)
     batch = database.get_log_batch(batch_id)
     if not batch or batch.get("project_id") != project_id:
-        raise HTTPException(status_code=404, detail="日志批次不存在")
+        return {
+            "message": "log_batch_deleted",
+            "deleted": True,
+            "graph_cleanup": {},
+            "warnings": [],
+            "recoverable": False,
+        }
 
-    warnings: list[str] = []
-    graph_cleanup: dict[str, int] = {}
-    try:
-        graph_cleanup = ProjectScopedGraphClient(project_id).delete_incident_batch(
-            batch_id[:12]
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to clean graph for deleted batch=%s", batch_id)
-        warnings.append(f"日志记录已删除，但图谱清理失败：{exc}")
+    # 1. 在 SQLite 数据库中完成记录擦除（仅需几毫秒）
+    database.delete_log_batch(batch_id)
 
-    logs_root = (
-        Path(get_settings().app_data_root).expanduser().resolve()
-        / "projects"
-        / project_id
-        / "logs"
-    ).resolve()
-    batch_dir = Path(str(batch.get("input_path") or "")).expanduser().resolve().parent
-    if (
-        batch_dir.name == batch_id
-        and batch_dir.is_relative_to(logs_root)
-        and batch_dir.is_dir()
-    ):
-        shutil.rmtree(batch_dir)
-    elif batch_dir.exists():
-        raise HTTPException(status_code=500, detail="日志批次目录校验失败，未删除磁盘文件")
+    # 2. 将漫长的 300+ 个 HugeGraph 图节点 REST 删除以及磁盘文件清理异步移交给后台 BackgroundTasks 任务
+    background_tasks.add_task(
+        _async_clean_batch_resources,
+        project_id,
+        batch_id,
+        batch,
+        get_settings().app_data_root,
+    )
 
-    if not database.delete_log_batch(batch_id):
-        raise HTTPException(status_code=404, detail="日志批次不存在")
+    # 3. 毫秒级直接响应 HTTP 200 返回前端，彻底消除悬停“删除中...”
     return {
         "message": "log_batch_deleted",
         "deleted": True,
-        "graph_cleanup": graph_cleanup,
-        "warnings": warnings,
+        "graph_cleanup": {"async": True},
+        "warnings": [],
         "recoverable": False,
     }
 

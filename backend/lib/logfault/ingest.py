@@ -19,7 +19,13 @@ LOG_START_RE = re.compile(
     r"\[(?P<thread>[^\]]+)\]\s+"
     r"(?P<logger>.*?)\s*:\s*(?P<message>.*)$"
 )
-TRACE_PREFIX_RE = re.compile(r"^\[(?P<trace>[0-9a-fA-F]{8,32})\]\s*(?P<message>.*)$")
+TRACE_PREFIX_RE = re.compile(r"^\[(?P<trace>[A-Za-z0-9_.-]{4,64})\]\s*(?P<message>.*)$")
+INLINE_TRACE_RE = re.compile(
+    r"(?i)\b(?:trace_?id|request_?id|req_?id|uuid|span_?id|correlation_?id)\s*[=:]\s*['\"]?([A-Za-z0-9_.-]{4,64})['\"]?"
+)
+DOWNSTREAM_RE = re.compile(
+    r"(?i)\b(?:downstream|target\s+physical\s+host|target\s+host|target_?service|calling\s+downstream\s+service)\s*[=:]\s*['\"]?([A-Za-z0-9_.-]{2,64})['\"]?"
+)
 EXCEPTION_CLASS_RE = re.compile(r"(?P<class>[A-Za-z_$][\w.$]*(?:Exception|Error))\b")
 EXCEPTION_HEADER_RE = re.compile(
     r"^(?:(?P<prefix>Caused by|Suppressed)\s*:\s*)?"
@@ -48,6 +54,7 @@ class ParsedEvent:
     raw_block: str
     source_file: str
     source_line: int
+    downstream_target: str = ""
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
@@ -173,6 +180,18 @@ def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace")
             first_message = trace_match.group("message")
 
         continuation = item["continuation"]
+        raw_text = "\n".join([first_message, *continuation])
+
+        if not trace_id:
+            inline_match = INLINE_TRACE_RE.search(raw_text)
+            if inline_match:
+                trace_id = inline_match.group(1)
+
+        downstream_target = ""
+        downstream_match = DOWNSTREAM_RE.search(raw_text)
+        if downstream_match:
+            downstream_target = downstream_match.group(1)
+
         exception_class, root_exception_class, root_cause, exception_chain = _parse_exception_details(
             first_message, continuation
         )
@@ -200,6 +219,7 @@ def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace")
             raw_block="\n".join(item["raw_lines"]),
             source_file=str(path),
             source_line=item["source_line"],
+            downstream_target=downstream_target,
         )
 
     with path.open("r", encoding=encoding, errors=errors) as handle:

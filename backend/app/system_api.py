@@ -965,6 +965,158 @@ def delete_log_batch(
     }
 
 
+# Admin Log Database Management ---------------------------------------------
+
+
+@router.get("/admin/log-batches")
+def admin_list_log_batches(
+    project_id: str | None = None,
+    status_filter: str | None = Query(None, alias="status"),
+    has_fault: bool | None = None,
+    search: str | None = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requires admin role")
+    database = get_system_db()
+    res = database.list_all_log_batches_admin(
+        project_id=project_id,
+        status_filter=status_filter,
+        has_fault=has_fault,
+        search=search,
+        page=page,
+        limit=limit,
+    )
+    res["items"] = [_batch_result(item) for item in res["items"]]
+    return res
+
+
+@router.get("/admin/log-batches/stats")
+def admin_get_log_stats(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requires admin role")
+    database = get_system_db()
+    return database.get_global_log_stats_admin()
+
+
+@router.get("/admin/log-batches/{batch_id}/analytics")
+def admin_get_log_batch_analytics(
+    batch_id: str,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requires admin role")
+    database = get_system_db()
+    res = database.get_log_batch_analytics_admin(batch_id)
+    if not res:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log batch not found")
+    if res.get("batch"):
+        res["batch"] = _batch_result(res["batch"])
+    return res
+
+
+@router.delete("/admin/log-batches/{batch_id}")
+def admin_delete_log_batch(
+    batch_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requires admin role")
+    database = get_system_db()
+    batch = database.get_log_batch(batch_id)
+    if not batch:
+        _clean_batch_disk_files("", batch_id, None)
+        return {"message": "log_batch_deleted", "deleted": True}
+
+    project_id = str(batch["project_id"])
+    _clean_batch_disk_files(project_id, batch_id, batch)
+    database.delete_log_batch(batch_id)
+
+    settings = get_settings()
+    root_str = str(getattr(settings, "app_data_root", None) or getattr(settings, "data_dir", ""))
+    background_tasks.add_task(
+        _async_clean_batch_resources,
+        project_id,
+        batch_id,
+        batch,
+        root_str,
+    )
+    return {"message": "log_batch_deleted", "deleted": True}
+
+
+def _bg_reanalyze_log_batch(project_id: str, batch_id: str, user_id: str, input_path: Path, output_dir: Path, train_path: Path | None):
+    database = get_system_db()
+    try:
+        total_t0 = time.perf_counter()
+        runner = LogFaultRunner()
+        summary = runner._run_pipeline(input_path, output_dir, train_path)
+        scoped = ProjectScopedGraphClient(project_id)
+        imported = IncidentGraphIntegrator(scoped).import_path(output_dir, input_path.name, batch_id[:12])
+        import_data = imported.model_dump()
+        runner._write_rca_artifacts(output_dir, import_data.get("rca") or [])
+        details = _load_details(output_dir)
+        _persist_incidents(
+            database,
+            project_id,
+            batch_id,
+            user_id,
+            details,
+            import_data.get("rca") or [],
+        )
+        total_duration = round(time.perf_counter() - total_t0, 2)
+        if isinstance(summary, dict):
+            summary["duration_seconds"] = total_duration
+
+        database.complete_log_batch(
+            batch_id,
+            json.dumps(summary, ensure_ascii=False),
+            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+        )
+    except Exception as exc:
+        logger.exception("Admin reanalyze failed batch=%s", batch_id)
+        database.fail_log_batch(batch_id, str(exc))
+
+
+@router.post("/admin/log-batches/{batch_id}/reanalyze")
+def admin_reanalyze_log_batch(
+    batch_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requires admin role")
+    database = get_system_db()
+    batch = database.get_log_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log batch not found")
+
+    input_path = Path(batch["input_path"])
+    if not input_path.exists():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="原始日志输入文件不存在，无法重新分析")
+
+    database.execute("UPDATE log_batches SET status = 'processing', error_message = '' WHERE id = ?", (batch_id,))
+
+    output_dir = Path(batch["output_path"])
+    train_path = Path(batch["train_path"]) if batch.get("train_path") else None
+
+    background_tasks.add_task(
+        _bg_reanalyze_log_batch,
+        project_id=str(batch["project_id"]),
+        batch_id=batch_id,
+        user_id=str(user["id"]),
+        input_path=input_path,
+        output_dir=output_dir,
+        train_path=train_path,
+    )
+    return {"message": "reanalyze_started", "batch_id": batch_id}
+
+
+
 @router.get("/projects/{project_id}/logs/{batch_id}/artifacts/{filename}")
 def download_log_artifact(
     project_id: str,

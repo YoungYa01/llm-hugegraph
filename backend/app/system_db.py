@@ -598,6 +598,294 @@ class SystemDatabase:
             (incident_id,),
         )
 
+    def list_all_log_batches_admin(
+        self,
+        project_id: str | None = None,
+        status_filter: str | None = None,
+        has_fault: bool | None = None,
+        search: str | None = None,
+        page: int = 1,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Admin cross-project query for log batches with pagination and rich filters."""
+        where_clauses = ["1=1"]
+        params: list[Any] = []
+
+        if project_id:
+            where_clauses.append("lb.project_id = ?")
+            params.append(project_id)
+
+        if status_filter:
+            where_clauses.append("lb.status = ?")
+            params.append(status_filter)
+
+        if search:
+            where_clauses.append(
+                "(lb.filename LIKE ? OR p.name LIKE ? OR u.display_name LIKE ? OR u.username LIKE ?)"
+            )
+            term = f"%{search.strip()}%"
+            params.extend([term, term, term, term])
+
+        where_sql = " AND ".join(where_clauses)
+
+        # Count query
+        count_sql = f"""
+            SELECT COUNT(*) as total
+            FROM log_batches lb
+            JOIN projects p ON p.id = lb.project_id
+            JOIN users u ON u.id = lb.created_by
+            WHERE {where_sql}
+        """
+
+        # Having clause for fault filter if specified
+        having_sql = ""
+        if has_fault is True:
+            having_sql = " HAVING incident_count > 0"
+        elif has_fault is False:
+            having_sql = " HAVING incident_count = 0"
+
+        offset = max(0, (page - 1) * limit)
+
+        query_sql = f"""
+            SELECT lb.id, lb.project_id, lb.filename, lb.input_path, lb.train_filename, lb.output_path,
+                   lb.status, lb.summary_json, lb.error_message, lb.created_by, lb.created_at, lb.completed_at,
+                   p.name AS project_name,
+                   u.username AS creator_username,
+                   u.display_name AS creator_display_name,
+                   COUNT(i.id) AS incident_count,
+                   SUM(CASE WHEN i.severity='critical' THEN 1 ELSE 0 END) AS cnt_critical,
+                   SUM(CASE WHEN i.severity='high'     THEN 1 ELSE 0 END) AS cnt_high,
+                   SUM(CASE WHEN i.severity='medium'   THEN 1 ELSE 0 END) AS cnt_medium,
+                   SUM(CASE WHEN i.severity='low'      THEN 1 ELSE 0 END) AS cnt_low
+            FROM log_batches lb
+            JOIN projects p ON p.id = lb.project_id
+            JOIN users u ON u.id = lb.created_by
+            LEFT JOIN incidents i ON i.log_batch_id = lb.id
+            WHERE {where_sql}
+            GROUP BY lb.id
+            {having_sql}
+            ORDER BY lb.created_at DESC
+        """
+
+        raw_rows = self.query_all(query_sql, params)
+        total_items = len(raw_rows)
+        paged_rows = raw_rows[offset : offset + limit]
+
+        items = []
+        for r in paged_rows:
+            item = dict(r)
+            file_size_bytes = 0
+            try:
+                if item.get("input_path") and Path(item["input_path"]).exists():
+                    file_size_bytes = Path(item["input_path"]).stat().st_size
+                elif item.get("output_path") and Path(item["output_path"]).exists():
+                    file_size_bytes = Path(item["output_path"]).stat().st_size
+            except Exception:
+                pass
+            item["file_size_bytes"] = file_size_bytes
+            item["severity_dist"] = {
+                "critical": int(item.get("cnt_critical") or 0),
+                "high": int(item.get("cnt_high") or 0),
+                "medium": int(item.get("cnt_medium") or 0),
+                "low": int(item.get("cnt_low") or 0),
+            }
+            items.append(item)
+
+        return {
+            "items": items,
+            "total": total_items,
+            "page": page,
+            "limit": limit,
+        }
+
+    def get_global_log_stats_admin(self) -> dict[str, Any]:
+        """Admin global summary metrics for log database management."""
+        batch_counts = self.query_one(
+            """
+            SELECT
+                COUNT(*) AS total_batches,
+                SUM(CASE WHEN status = 'completed'  THEN 1 ELSE 0 END) AS total_completed,
+                SUM(CASE WHEN status = 'failed'     THEN 1 ELSE 0 END) AS total_failed,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS total_processing
+            FROM log_batches
+            """
+        ) or {}
+
+        fault_batch_row = self.query_one(
+            """
+            SELECT COUNT(DISTINCT log_batch_id) AS fault_batches FROM incidents
+            """
+        ) or {}
+
+        incidents_row = self.query_one(
+            """
+            SELECT COUNT(*) AS total_incidents FROM incidents
+            """
+        ) or {}
+
+        projects_row = self.query_all(
+            """
+            SELECT p.id AS project_id, p.name AS project_name,
+                   COUNT(DISTINCT lb.id) AS batch_count,
+                   COUNT(DISTINCT i.id) AS incident_count
+            FROM projects p
+            LEFT JOIN log_batches lb ON lb.project_id = p.id
+            LEFT JOIN incidents i ON i.project_id = p.id
+            GROUP BY p.id
+            ORDER BY batch_count DESC
+            """
+        )
+
+        all_batches = self.query_all("SELECT input_path, output_path, summary_json FROM log_batches")
+        total_bytes = 0
+        total_parsed_lines = 0
+
+        for b in all_batches:
+            try:
+                ip = b.get("input_path")
+                if ip and Path(ip).exists():
+                    total_bytes += Path(ip).stat().st_size
+                elif b.get("output_path") and Path(b["output_path"]).exists():
+                    total_bytes += Path(b["output_path"]).stat().st_size
+            except Exception:
+                pass
+
+            sj = b.get("summary_json")
+            if sj:
+                try:
+                    import json
+                    parsed = json.loads(sj) if isinstance(sj, str) else sj
+                    total_parsed_lines += int(parsed.get("events") or parsed.get("lines_count") or parsed.get("total_lines") or 0)
+                except Exception:
+                    pass
+
+        return {
+            "total_batches": int(batch_counts.get("total_batches") or 0),
+            "total_completed": int(batch_counts.get("total_completed") or 0),
+            "total_failed": int(batch_counts.get("total_failed") or 0),
+            "total_processing": int(batch_counts.get("total_processing") or 0),
+            "fault_batches": int(fault_batch_row.get("fault_batches") or 0),
+            "total_incidents": int(incidents_row.get("total_incidents") or 0),
+            "total_file_size_bytes": total_bytes,
+            "total_parsed_lines": total_parsed_lines,
+            "projects_distribution": projects_row,
+        }
+
+    def get_log_batch_analytics_admin(self, batch_id: str) -> dict[str, Any] | None:
+        """Get deep analytics and details for a specific log batch."""
+        import csv
+
+        row = self.query_one(
+            """
+            SELECT lb.*, p.name AS project_name, u.display_name AS creator_display_name, u.username AS creator_username
+            FROM log_batches lb
+            JOIN projects p ON p.id = lb.project_id
+            JOIN users u ON u.id = lb.created_by
+            WHERE lb.id = ?
+            """,
+            (batch_id,),
+        )
+        if not row:
+            return None
+
+        batch = dict(row)
+        incidents = self.query_all(
+            "SELECT * FROM incidents WHERE log_batch_id = ? ORDER BY created_at DESC",
+            (batch_id,),
+        )
+
+        file_exists = False
+        file_size = 0
+        if batch.get("input_path") and Path(batch["input_path"]).exists():
+            file_exists = True
+            file_size = Path(batch["input_path"]).stat().st_size
+        elif batch.get("output_path") and Path(batch["output_path"]).exists():
+            file_exists = True
+            file_size = Path(batch["output_path"]).stat().st_size
+
+        templates_list = []
+        events_sample = []
+        report_md = ""
+
+        output_dir = Path(batch.get("output_path") or "")
+        if output_dir.exists() and output_dir.is_dir():
+            tmpl_csv = output_dir / "templates.csv"
+            if tmpl_csv.exists():
+                try:
+                    with open(tmpl_csv, "r", encoding="utf-8", errors="replace") as f:
+                        reader = csv.DictReader(f)
+                        for r in reader:
+                            templates_list.append({
+                                "id": r.get("EventId") or r.get("id") or r.get("TemplateId") or "",
+                                "template": r.get("EventTemplate") or r.get("template") or r.get("Event") or "",
+                                "count": int(r.get("Occurrences") or r.get("count") or 1)
+                            })
+                except Exception:
+                    pass
+
+            events_csv = output_dir / "events.csv"
+            if events_csv.exists():
+                try:
+                    with open(events_csv, "r", encoding="utf-8", errors="replace") as f:
+                        reader = csv.DictReader(f)
+                        for i, r in enumerate(reader):
+                            if i >= 100:
+                                break
+                            events_sample.append(dict(r))
+                except Exception:
+                    pass
+
+            rep_path = output_dir / "report.md"
+            if not rep_path.exists():
+                rep_path = output_dir / "kg_rca_report.md"
+            if rep_path.exists():
+                try:
+                    report_md = rep_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
+            unassigned_errors = []
+            unassigned_csv = output_dir / "unassigned_error_events.csv"
+            if unassigned_csv.exists():
+                try:
+                    with open(unassigned_csv, "r", encoding="utf-8", errors="replace") as f:
+                        reader = csv.DictReader(f)
+                        for i, r in enumerate(reader):
+                            if i >= 50:
+                                break
+                            unassigned_errors.append(dict(r))
+                except Exception:
+                    pass
+
+            anomaly_windows = []
+            windows_csv = output_dir / "anomaly_windows.csv"
+            if windows_csv.exists():
+                try:
+                    with open(windows_csv, "r", encoding="utf-8", errors="replace") as f:
+                        reader = csv.DictReader(f)
+                        for i, r in enumerate(reader):
+                            if i >= 50:
+                                break
+                            anomaly_windows.append(dict(r))
+                except Exception:
+                    pass
+
+        return {
+            "batch": batch,
+            "incidents": incidents,
+            "templates": templates_list,
+            "events_sample": events_sample,
+            "unassigned_errors": unassigned_errors,
+            "anomaly_windows": anomaly_windows,
+            "report_md": report_md,
+            "file_info": {
+                "exists": file_exists,
+                "size_bytes": file_size,
+            },
+        }
+
+
+
 
 _database: SystemDatabase | None = None
 

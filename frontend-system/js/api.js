@@ -98,4 +98,23 @@ export const api = {
   incident: (projectId, incidentId) => request(`/projects/${projectId}/incidents/${incidentId}`),
   incidentGraph: (projectId, incidentId, includeEvents = false) => request(`/projects/${projectId}/incidents/${incidentId}/graph?include_events=${includeEvents}&event_limit=30`),
   updateIncidentStatus: (projectId, incidentId, payload) => request(`/projects/${projectId}/incidents/${incidentId}/status`, { method: "PATCH", body: JSON.stringify(payload) }),
+
+  adminLogBatches: (params = {}) => {
+    const query = new URLSearchParams();
+    if (params.project_id) query.set("project_id", params.project_id);
+    if (params.status) query.set("status", params.status);
+    if (params.has_fault !== undefined && params.has_fault !== null && params.has_fault !== "") {
+      query.set("has_fault", params.has_fault);
+    }
+    if (params.search) query.set("search", params.search);
+    if (params.page) query.set("page", params.page);
+    if (params.limit) query.set("limit", params.limit);
+    const q = query.toString();
+    return request(`/admin/log-batches${q ? `?${q}` : ""}`);
+  },
+  adminLogStats: () => request("/admin/log-batches/stats"),
+  adminLogAnalytics: (batchId) => request(`/admin/log-batches/${batchId}/analytics`),
+  adminDeleteLogBatch: (batchId) => request(`/admin/log-batches/${batchId}`, { method: "DELETE" }),
+  adminReanalyzeLogBatch: (batchId) => request(`/admin/log-batches/${batchId}/reanalyze`, { method: "POST" }),
 };
+

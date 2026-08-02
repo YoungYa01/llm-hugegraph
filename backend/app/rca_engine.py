@@ -34,6 +34,22 @@ DYNAMIC_KINDS = {
     "UnresolvedDependency",
 }
 
+# Fault modes that originate at the infrastructure layer (Host/Pod/Instance).
+# These must NOT cause Host/Pod nodes to be systematically downgraded in scoring.
+INFRASTRUCTURE_FAULT_MODES: frozenset[str] = frozenset(
+    {
+        "JVM_OOM",
+        "DISK_IO_FAILURE",
+        "CPU_OVERLOAD",
+        "NETWORK_FAILURE",
+        "DB_POOL_EXHAUSTED",
+    }
+)
+
+# Node kinds accepted as root-cause anchor when SERVICE_KINDS resolution fails
+# (e.g. root_service_candidate = "Physical-Host-01").
+ANCHOR_FALLBACK_KINDS: frozenset[str] = frozenset({"Host", "Instance", "VM"})
+
 
 def _compact(value: Any, limit: int = 420) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -262,6 +278,47 @@ class ArchitectureSnapshot:
     def find_dependency_path(self, start: str, target: str, max_depth: int = 5) -> tuple[list[str], list[str]] | None:
         return self.paths_from(start, max_depth=max_depth).get(target)
 
+    def paths_to(self, target: str, max_depth: int = 4) -> dict[str, tuple[list[str], list[str]]]:
+        """Reverse BFS: find all nodes that are transitively hosted-on / depend-on `target`.
+
+        Unlike :meth:`paths_from` (consumer→dependency forward direction), this
+        traverses edges **backwards**.  Used when the RCA anchor is a Host or
+        Instance: all Pods it hosts are potential impact victims.
+
+        Path tuples follow the same convention as paths_from:
+        ``(names, relations)`` where ``names[0]`` is the affected leaf node
+        and ``names[-1]`` is `target` (the root cause).  This makes
+        :meth:`_causal_path` work correctly without modification.
+        """
+        if target not in self.nodes:
+            return {}
+        # Build reverse adjacency on the fly (snapshot is bounded in size).
+        incoming: dict[str, list[ArchitectureEdge]] = {}
+        for edge in self.edges:
+            incoming.setdefault(edge.target, []).append(edge)
+
+        _REVERSE_OK = DEPENDENCY_RELATIONS | MEMBERSHIP_RELATIONS | {"HOSTED_ON", "RUNS_ON", "CONNECTS_TO"}
+        # Target itself: zero-hop path.
+        found: dict[str, tuple[list[str], list[str]]] = {target: ([target], [])}
+        queue: deque[tuple[str, list[str], list[str]]] = deque([(target, [target], [])])
+        while queue:
+            current, names, relations = queue.popleft()
+            if len(relations) >= max_depth:
+                continue
+            for edge in incoming.get(current, []):
+                if edge.relation not in _REVERSE_OK:
+                    continue
+                if edge.source in names:
+                    continue
+                # Prepend source so path reads: leaf -> ... -> target (root cause last).
+                new_names = [edge.source, *names]
+                new_relations = [edge.relation, *relations]
+                old = found.get(edge.source)
+                if old is None or len(new_relations) < len(old[1]):
+                    found[edge.source] = (new_names, new_relations)
+                    queue.append((edge.source, new_names, new_relations))
+        return found
+
     def _traversable(self, edge: ArchitectureEdge) -> bool:
         if edge.relation in DEPENDENCY_RELATIONS or edge.relation == "HAS_MEMBER":
             return True
@@ -301,12 +358,47 @@ class RootCauseEngine:
     def analyze(self, detail: dict[str, Any], top_k: int = 5) -> RootCauseAnalysis:
         incident_id = str(detail.get("incident_id") or "I00000")
         raw_service = str(detail.get("root_service_candidate") or "")
+        # Try service/component kinds first; fall back to infrastructure kinds when
+        # root_service_candidate points at a Host or Instance (e.g. "Physical-Host-01").
         anchor = self.graph.resolve(raw_service, self.SERVICE_KINDS)
+        if not anchor:
+            anchor = self.graph.resolve(raw_service, ANCHOR_FALLBACK_KINDS)
         signals = self._signals(detail)
         endpoints = self._endpoint_tokens(detail)
         candidates: list[dict[str, Any]] = []
 
-        dependency_paths = self.graph.paths_from(anchor) if anchor else {}
+        anchor_node = self.graph.nodes.get(anchor) if anchor else None
+        anchor_is_infra = anchor_node is not None and anchor_node.kind in ANCHOR_FALLBACK_KINDS
+        # Infrastructure anchors (Host/Instance): traverse backwards to all hosted
+        # Pods/services.  Normal service anchors: forward dependency traversal.
+        if anchor_is_infra:
+            dependency_paths = self.graph.paths_to(anchor)
+        else:
+            dependency_paths = self.graph.paths_from(anchor) if anchor else {}
+
+        # ── Pre-populate self-fault candidates ──────────────────────────────
+        # For faults that reside within the anchor service itself (JVM OOM, auth
+        # token failure, open circuit-breaker) the SERVICE filter (match < 2)
+        # would otherwise exclude the anchor.  Inject it with a high score.
+        _SERVICE_INTERNAL_MODES = frozenset({"JVM_OOM", "AUTH_FAILURE", "CIRCUIT_BREAKER_OPEN"})
+        if anchor and anchor in self.graph.nodes:
+            _anchor_node_ref = self.graph.nodes[anchor]
+            for _sig in signals:
+                if _sig.fault_mode in _SERVICE_INTERNAL_MODES:
+                    candidates.append(
+                        {
+                            "node": _anchor_node_ref,
+                            "signal": _sig,
+                            "path": ([anchor], []),
+                            "score": min(_sig.base_score + 0.34, 0.90),
+                            "reasons": [
+                                f"故障特征匹配：{_sig.description}",
+                                f"{anchor} 自身触发 {_sig.fault_mode}，服务内部故障",
+                            ],
+                            "direct_endpoint": "",
+                        }
+                    )
+
         for signal in signals:
             for node in self.graph.nodes.values():
                 path = dependency_paths.get(node.name)
@@ -340,8 +432,16 @@ class RootCauseEngine:
                 if node.kind == "Cluster":
                     score += 0.03
                 if node.kind in {"Instance", "Host", "Pod"} and not direct_endpoint:
-                    score -= 0.20
-                    reasons.append("缺少指向该具体实例的日志或健康检查，实例级候选降权")
+                    # Infrastructure-level fault modes originate at Host/Pod layer;
+                    # do NOT penalise these candidates.  For other fault types apply
+                    # a reduced penalty (was -0.20) to still favour explicit evidence.
+                    if signal.fault_mode not in INFRASTRUCTURE_FAULT_MODES and not anchor_is_infra:
+                        score -= 0.15
+                        reasons.append("缺少与该实例直接匹配的端点标识，轻微降权")
+                # Small boost for the directly-reported anchor node.
+                if node.name == anchor and path is not None:
+                    score += 0.04
+                    reasons.append("候选即为故障锚点节点（直接命名的根故障组件）")
                 candidates.append(
                     {
                         "node": node,
@@ -355,7 +455,25 @@ class RootCauseEngine:
 
         candidates = self._dedupe_candidates(candidates)
         if not candidates:
-            candidates.append(self._fallback_candidate(anchor, raw_service, signals, detail))
+            fb = self._fallback_candidate(anchor, raw_service, signals, detail)
+            # When endpoint evidence names a missing infrastructure node (e.g. a
+            # RabbitMQ broker not in the graph), substitute an UnresolvedDependency
+            # instead of incorrectly returning the anchor as the root cause.
+            if (
+                endpoints
+                and signals
+                and signals[0].fault_mode in {"MESSAGE_BROKER_FAILURE", "REDIS_UNREACHABLE", "DATABASE_UNREACHABLE"}
+                and fb.get("architecture_node")
+                and fb["node"].name == anchor
+            ):
+                ep = next(iter(sorted(endpoints)))
+                fb["node"] = ArchitectureNode(name=f"未知组件@{ep}", kind="UnresolvedDependency")
+                fb["architecture_node"] = False
+                fb["score"] = min(signals[0].base_score + 0.05, 0.38)
+                fb.setdefault("reasons", []).append(
+                    f"日志命中端点 {ep}，但架构图缺少对应节点，请补充拓扑"
+                )
+            candidates.append(fb)
 
         candidates.sort(key=lambda item: (-item["score"], item["node"].name))
         hypotheses: list[RootCauseHypothesis] = []
@@ -383,7 +501,7 @@ class RootCauseEngine:
             limitations=list(dict.fromkeys(limitations)),
         )
 
-    def _signals(self, detail: dict[str, Any]) -> list[FaultSignal]:
+    def _signals(self, detail: dict[str, Any]) -> list[FaultSignal]:  # noqa: C901
         evidence_parts = [
             detail.get("root_cause_candidate"),
             detail.get("root_evidence"),
@@ -400,8 +518,25 @@ class RootCauseEngine:
         text = evidence.lower()
         signals: list[FaultSignal] = []
 
+        # ── JVM / 内存耗尽 ───────────────────────────────────────────────────
+        if any(token in text for token in ("outofmemoryerror", "java heap space", "metaspace", "gc overhead limit")):
+            signals.append(
+                FaultSignal(
+                    "JVM_OOM",
+                    (),  # Fault is inside the service itself; token-match not useful.
+                    ("Service", "Pod", "Instance"),
+                    0.44,
+                    "JVM 堆内存溢出 (OOM)",
+                    evidence,
+                )
+            )
+
+        # ── Redis ────────────────────────────────────────────────────────────
         if any(token in text for token in ("redis", "lettuce", "jedis")):
-            if any(token in text for token in ("connection refused", "redisconnectionexception", "cannot connect", "connection reset")):
+            if any(token in text for token in (
+                "connection refused", "redisconnectionexception", "cannot connect",
+                "connection reset", "nic link down",
+            )):
                 signals.append(
                     FaultSignal(
                         "REDIS_UNREACHABLE",
@@ -412,7 +547,9 @@ class RootCauseEngine:
                         evidence,
                     )
                 )
-            elif any(token in text for token in ("timeout", "timed out", "querytimeoutexception")):
+            elif any(token in text for token in (
+                "timeout", "timed out", "querytimeoutexception", "rediscommandtimeoutexception",
+            )):
                 signals.append(
                     FaultSignal(
                         "REDIS_TIMEOUT",
@@ -425,34 +562,161 @@ class RootCauseEngine:
                     )
                 )
 
-        if any(token in text for token in ("mysql", "jdbc", "hikari", "sql")):
-            mode = "DATABASE_UNREACHABLE" if "connection refused" in text else "DATABASE_FAILURE"
+        # ── 数据库连接池耗尽（精确于通用 DB 失败，优先检测）──────────────────
+        if any(token in text for token in ("hikaripool", "hikari")) and any(
+            token in text for token in (
+                "connection is not available", "sqltransientconnectionexception", "timed out after",
+            )
+        ):
             signals.append(
                 FaultSignal(
-                    mode,
-                    ("mysql", "database", "数据库", "jdbc", "hikari"),
-                    ("Database", "Cluster", "Instance", "Host"),
-                    0.38,
-                    "数据库连接或查询失败",
+                    "DB_POOL_EXHAUSTED",
+                    ("hikari", "hikaripool", "database", "mysql", "jdbc"),
+                    ("Database", "Service", "Cluster", "Host"),
+                    0.42,
+                    "数据库连接池耗尽 (HikariCP)",
                     evidence,
-                    timeout_only="timeout" in text or "timed out" in text,
+                    timeout_only=True,
                 )
             )
 
-        if any(token in text for token in ("kafka", "rabbitmq", "rocketmq")):
+        # ── MySQL / JDBC 特定故障 ─────────────────────────────────────────────
+        if any(token in text for token in ("mysql", "jdbc", "sql")):
+            if "deadlock" in text or "mysqltransactionrollbackexception" in text:
+                signals.append(
+                    FaultSignal(
+                        "DB_DEADLOCK",
+                        ("mysql", "database", "数据库", "jdbc"),
+                        ("Database", "Cluster", "Instance", "Host"),
+                        0.48,
+                        "数据库事务死锁",
+                        evidence,
+                    )
+                )
+            elif "lock wait timeout" in text:
+                signals.append(
+                    FaultSignal(
+                        "DB_LOCK_TIMEOUT",
+                        ("mysql", "database", "数据库", "jdbc"),
+                        ("Database", "Cluster", "Instance", "Host"),
+                        0.44,
+                        "数据库行/表锁等待超时",
+                        evidence,
+                        timeout_only=True,
+                    )
+                )
+            elif not any(token in text for token in ("hikaripool", "hikari")):
+                # Generic DB failure; avoid double-counting HikariCP pool exhaustion.
+                mode = "DATABASE_UNREACHABLE" if "connection refused" in text else "DATABASE_FAILURE"
+                signals.append(
+                    FaultSignal(
+                        mode,
+                        ("mysql", "database", "数据库", "jdbc", "hikari"),
+                        ("Database", "Cluster", "Instance", "Host"),
+                        0.38,
+                        "数据库连接或查询失败",
+                        evidence,
+                        timeout_only="timeout" in text or "timed out" in text,
+                    )
+                )
+
+        # ── 消息中间件 ───────────────────────────────────────────────────────
+        if any(token in text for token in ("kafka", "rabbitmq", "rocketmq", "alreadyclosedexception", "amqp")):
             signals.append(
                 FaultSignal(
                     "MESSAGE_BROKER_FAILURE",
-                    ("kafka", "rabbitmq", "rocketmq", "mq"),
+                    ("kafka", "rabbitmq", "rocketmq", "mq", "amqp"),
                     ("Queue", "Cluster", "Instance", "Host", "Middleware"),
-                    0.38,
+                    0.40,
                     "消息中间件连接或处理失败",
                     evidence,
                     timeout_only="timeout" in text or "timed out" in text,
                 )
             )
 
-        if not signals and any(token in text for token in ("timeout", "timed out", "connection refused", "connection reset")):
+        # ── 磁盘 / 文件系统故障 ──────────────────────────────────────────────
+        if any(token in text for token in ("read-only file system", "readonly filesystem")) or (
+            "ioexception" in text
+            and any(token in text for token in ("disk", "file system", "filesystem", "/var/", "physical-host"))
+        ):
+            signals.append(
+                FaultSignal(
+                    "DISK_IO_FAILURE",
+                    ("disk", "filesystem", "physical-host", "host"),
+                    ("Host", "Instance", "Pod", "VM"),
+                    0.46,
+                    "磁盘 I/O 故障或文件系统只读",
+                    evidence,
+                )
+            )
+
+        # ── CPU 过载 / 宿主机资源争用 ────────────────────────────────────────
+        if any(token in text for token in ("cpu 100%", "cpu load", "thread contention")) and any(
+            token in text for token in ("physical-host", "host", "pod", "node")
+        ):
+            signals.append(
+                FaultSignal(
+                    "CPU_OVERLOAD",
+                    ("cpu", "physical-host", "host", "load"),
+                    ("Host", "Instance", "Pod", "VM"),
+                    0.42,
+                    "宿主机 CPU 过载/线程争用高延迟",
+                    evidence,
+                    timeout_only=True,
+                )
+            )
+
+        # ── 物理网络/宿主机硬件故障 ──────────────────────────────────────────
+        if any(token in text for token in ("nic link down", "network packet loss", "hardware host crash")) or (
+            any(token in text for token in ("physical-host", "host"))
+            and any(token in text for token in ("connectexception", "unreachable", "disconnected", "packet loss"))
+        ):
+            signals.append(
+                FaultSignal(
+                    "NETWORK_FAILURE",
+                    ("physical-host", "host", "nic", "network"),
+                    ("Host", "Instance", "VM", "Cluster"),
+                    0.48,
+                    "物理网络/宿主机硬件故障",
+                    evidence,
+                )
+            )
+
+        # ── 鉴权/Token 失效 (HTTP 401) ───────────────────────────────────────
+        if any(token in text for token in (
+            " 401 ", "unauthorized", "invalid oauth", "expired signature",
+            "invalid token", "token expired",
+        )):
+            signals.append(
+                FaultSignal(
+                    "AUTH_FAILURE",
+                    (),  # Auth failure is in the security service itself.
+                    ("Service", "API", "Component"),
+                    0.40,
+                    "鉴权失败/Token 失效 (HTTP 401)",
+                    evidence,
+                )
+            )
+
+        # ── 熔断器触发 ───────────────────────────────────────────────────────
+        if any(token in text for token in ("circuit breaker", "circuitbreaker", "hystrix", "resilience4j")) and any(
+            token in text for token in ("open", "tripped", "short-circuit", "fallback")
+        ):
+            signals.append(
+                FaultSignal(
+                    "CIRCUIT_BREAKER_OPEN",
+                    (),
+                    ("Service", "API", "Component", "Middleware"),
+                    0.30,
+                    "熔断器打开，下游依赖不可用",
+                    evidence,
+                )
+            )
+
+        # ── 通用连接/超时兜底（无更具体信号时） ──────────────────────────────
+        if not signals and any(
+            token in text for token in ("timeout", "timed out", "connection refused", "connection reset")
+        ):
             signals.append(
                 FaultSignal(
                     "DEPENDENCY_FAILURE",
@@ -464,6 +728,8 @@ class RootCauseEngine:
                     timeout_only="timeout" in text or "timed out" in text,
                 )
             )
+
+        # ── 最终兜底 ─────────────────────────────────────────────────────────
         if not signals:
             signals.append(
                 FaultSignal(
@@ -754,6 +1020,102 @@ class RootCauseEngine:
                 "日志只暴露通用超时/连接异常，需要沿图谱链路逐跳确认依赖是否可用。",
                 "按 RCA 链路从调用方到候选依赖逐跳执行健康检查、端口连通性和错误日志核对",
             )
+        elif signal.fault_mode == "JVM_OOM":
+            add(
+                "jvm_heap_dump",
+                "获取 JVM 堆转储（Heap Dump）并分析内存泄漏",
+                "high",
+                "jvm_memory",
+                "OOM 需要通过 heap dump 定位泄漏对象；同时检查 JVM -Xmx 是否过低。",
+                "jmap -dump:format=b,file=heap.hprof <pid>；检查 JVM -Xmx/-Xms 参数；核对近期大对象缓存变更",
+            )
+            add(
+                "gc_log_analysis",
+                "分析 GC 日志，确认 Full GC 频率和停顿时长",
+                "high",
+                "jvm_gc",
+                "OOM 通常伴随频繁 Full GC，GC 日志能还原内存压力历史。",
+                "开启 -Xlog:gc*；查看 GC 时间线；核对 GC 停顿是否与业务高峰重叠",
+            )
+        elif signal.fault_mode in {"DB_DEADLOCK", "DB_LOCK_TIMEOUT"}:
+            add(
+                "db_lock_analysis",
+                "分析数据库锁等待链和死锁日志",
+                "high",
+                "database_lock",
+                "死锁/锁超时需要从数据库侧获取锁等待链，才能确认涉及的事务和 SQL。",
+                "SHOW ENGINE INNODB STATUS；SELECT * FROM information_schema.INNODB_LOCKS；核对高并发写入路径",
+            )
+        elif signal.fault_mode == "DB_POOL_EXHAUSTED":
+            add(
+                "db_pool_config",
+                "检查 HikariCP 连接池配置和当前连接数",
+                "high",
+                "database_pool",
+                "连接池耗尽可能由配置过小、连接泄漏或数据库响应慢引起。",
+                "核对 maximumPoolSize/connectionTimeout；SHOW PROCESSLIST；检查慢 SQL",
+            )
+        elif signal.fault_mode == "DISK_IO_FAILURE":
+            add(
+                "disk_health_check",
+                "检查宿主机磁盘健康状态和文件系统挂载模式",
+                "high",
+                "disk_health",
+                "只读文件系统通常由磁盘 I/O 错误触发内核自动保护切换导致，需优先确认磁盘是否物理损坏。",
+                "dmesg | grep -i 'error\\|i/o\\|readonly'；smartctl -a /dev/sda；mount | grep ro",
+            )
+        elif signal.fault_mode == "CPU_OVERLOAD":
+            add(
+                "cpu_load_analysis",
+                "分析宿主机 CPU 负载来源（进程/线程/内核）",
+                "high",
+                "cpu_health",
+                "CPU 100% 可能由 JVM GC、热点代码、外部流量突增或 D 状态进程引起，需线程粒度分析。",
+                "top -H（线程粒度）；perf top；jstack <pid>；核对 D 状态进程",
+            )
+            add(
+                "cpu_resource_quota",
+                "确认容器 CPU limit（cgroup）是否正确设置",
+                "medium",
+                "resource_quota",
+                "容器 CPU limit 缺失时单个 Pod 可能耗尽宿主机全部算力，影响同宿主机其他服务。",
+                "kubectl describe pod <pod>；cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+            )
+        elif signal.fault_mode == "NETWORK_FAILURE":
+            add(
+                "nic_status_check",
+                "确认宿主机网卡状态和物理链路",
+                "high",
+                "network_hardware",
+                "NIC link down 表示物理层断连，需先恢复硬件链路再处理上层服务恢复。",
+                "ip link show；ethtool <eth0>；核对交换机端口状态和光模块告警",
+            )
+            add(
+                "pod_migration",
+                "将受影响 Pod 迁移到健康宿主机",
+                "high",
+                "failover",
+                "硬件故障期间快速迁移是恢复服务的最短路径，同时隔离故障节点。",
+                "kubectl drain <node> --ignore-daemonsets；kubectl cordon <node>；确认 Pod 重调度情况",
+            )
+        elif signal.fault_mode == "AUTH_FAILURE":
+            add(
+                "token_expiry_check",
+                "确认 OAuth2 Token 有效期和签名密钥配置",
+                "high",
+                "auth_config",
+                "HTTP 401 通常由 Token 过期、签名密钥不匹配或证书轮换后配置未同步引起。",
+                "核对 security-service 密钥配置；检查各服务 Token 有效期设置；确认 NTP 时钟同步",
+            )
+        elif signal.fault_mode == "CIRCUIT_BREAKER_OPEN":
+            add(
+                "circuit_breaker_state",
+                "确认熔断器状态和触发阈值配置",
+                "high",
+                "circuit_breaker",
+                "熔断器打开说明下游错误率超过阈值；需先定位并修复下游服务的真实故障。",
+                "查看 Hystrix Dashboard / Resilience4j metrics；核对 failureRateThreshold；确认下游服务状态",
+            )
         else:
             add(
                 "application_error_context",
@@ -817,6 +1179,9 @@ class RootCauseEngine:
         for effect in detail.get("upstream_effects") or []:
             if isinstance(effect, dict):
                 raw_candidates.append(str(effect.get("service") or ""))
+            elif isinstance(effect, str) and effect.strip():
+                # upstream_effects may be a plain string list (e.g. ["User_Login_Func"]).
+                raw_candidates.append(effect.strip())
         for event in detail.get("timeline") or []:
             if isinstance(event, dict) and str(event.get("level") or "").upper() == "ERROR":
                 raw_candidates.append(str(event.get("service") or ""))

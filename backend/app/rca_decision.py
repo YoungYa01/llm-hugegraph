@@ -360,15 +360,21 @@ class RcaDecisionService:
             "选出一个最可能原因，并给出可执行的排查方法。不要编造候选根因或不存在的证据。\n"
             "incident.log_context 已经过确定性日志压缩：key_events 是按严重度、异常信号、稀有度、"
             "服务/trace 多样性和故障邻域筛选的关键事件；repeated_patterns 汇总被折叠的重复日志。\n"
+            "决策规则（按优先级）：\n"
+            "1. chain 中最后一个节点（最下游依赖）通常是根因，第一个节点通常是受害服务；优先选造成传播的最下游组件。\n"
+            "2. architecture_node=false 的候选缺乏图谱支撑，仅在其他候选置信度均极低时才选。\n"
+            "3. fault_mode 属于 JVM_OOM/DISK_IO_FAILURE/CPU_OVERLOAD/NETWORK_FAILURE 时，优先选 candidate_kind 为 Host/Instance/Pod 的候选。\n"
+            "4. 多个候选均指向同一基础设施节点（如数据库、宿主机）时，选该节点而非其上层服务。\n"
+            "5. 上游网关报 5xx 通常是传播结果而非根因；confidence 较低的网关候选不应被选择。\n"
             "请严格返回 JSON 对象，不要 Markdown，不要解释，不要代码块。JSON 格式：\n"
             "{"
-            "\"selected_candidate\":\"候选名称\","
-            "\"selected_candidate_rank\":1,"
-            "\"selected_fault_mode\":\"故障模式\","
-            "\"most_likely_reason\":\"为什么它最可能\","
-            "\"troubleshooting_methods\":[\"排查步骤1\",\"排查步骤2\"],"
-            "\"confidence\":0.0,"
-            "\"notes\":[\"需要补充的证据或注意点\"]"
+            '"selected_candidate":"候选名称",'
+            '"selected_candidate_rank":1,'
+            '"selected_fault_mode":"故障模式",'
+            '"most_likely_reason":"为什么它最可能",'
+            '"troubleshooting_methods":["排查步骤1","排查步骤2"],'
+            '"confidence":0.0,'
+            '"notes":["需要补充的证据或注意点"]'
             "}\n"
             f"输入数据：\n{json.dumps(prompt_data, ensure_ascii=False, indent=2)}"
         )
@@ -380,6 +386,7 @@ class RcaDecisionService:
         allowed = (
             "rank",
             "candidate",
+            "candidate_kind",
             "architecture_node",
             "fault_mode",
             "confidence",

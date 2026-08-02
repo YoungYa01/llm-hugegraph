@@ -224,6 +224,13 @@ class SystemDatabase:
         )
         return self.get_project(project_id) or {}
 
+    def delete_project(self, project_id: str) -> bool:
+        """物理删除项目及其关联的所有架构、日志批次与故障记录（触发级联删除）。"""
+        with self.connect() as connection:
+            cursor = connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            connection.commit()
+            return cursor.rowcount > 0
+
     def dashboard(self, project_id: str) -> dict[str, Any]:
         counts = self.query_one(
             """

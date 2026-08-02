@@ -29,19 +29,30 @@ export function projectShell(project, current, content) {
   return `<div class="app-shell" id="app-shell">
     <aside class="sidebar">
       <a class="brand" href="#/projects"><span class="brand-mark">L</span><span>LogScope RCA <small class="brand-version">${escapeHtml(APP_VERSION)}</small></span></a>
-      <a class="project-switcher" href="#/projects" title="切换项目">
-        <small>当前项目 · 点击切换</small><strong>${escapeHtml(project.name)}</strong>
+      
+      <!-- 项目选择与切回项目列表 (专属项目层级) -->
+      <a class="project-switcher" href="#/projects" title="点击返回所有项目列表" style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;margin-bottom:14px">
+        <div>
+          <small style="display:block;font-size:11px;color:rgba(255,255,255,0.6)">当前项目 · 点击切换</small>
+          <strong style="font-size:13px;color:#ffffff">${escapeHtml(project.name)}</strong>
+        </div>
+        <span style="font-size:11px;padding:3px 7px;border-radius:4px;background:rgba(255,255,255,0.12);color:rgba(255,255,255,0.85);white-space:nowrap">所有项目 ‹</span>
       </a>
+
       <nav class="nav">${navigation}</nav>
-      <div class="sidebar-footer">
-        <div class="user-chip">
+
+      <!-- 底部账号与安全区 (专属账号退出层级) -->
+      <div class="sidebar-footer" style="padding-top:14px;border-top:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:space-between">
+        <div class="user-chip" style="margin:0">
           <span class="avatar">${escapeHtml(initial)}</span>
-          <div class="user-chip-text"><strong>${escapeHtml(account.display_name || account.username)}</strong><span>${escapeHtml(account.role || "user")}</span></div>
+          <div class="user-chip-text">
+            <strong style="font-size:13px">${escapeHtml(account.display_name || account.username)}</strong>
+            <span style="font-size:11px;color:rgba(255,255,255,0.5)">${escapeHtml(account.role || "user")}</span>
+          </div>
         </div>
-        <div class="sidebar-actions">
-          <a class="button button-ghost button-small" href="#/projects">所有项目</a>
-          <button class="button button-ghost button-small" id="logout-button">退出</button>
-        </div>
+        <button class="button button-ghost button-small" id="logout-button" style="color:#f87171;border:1px solid rgba(248,113,113,0.3);padding:4px 10px;font-size:12px;white-space:nowrap" title="退出当前登录账号">
+          退出登录
+        </button>
       </div>
     </aside>
     <section class="workspace">

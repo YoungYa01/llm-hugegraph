@@ -242,16 +242,25 @@ def update_project(
 
 
 @router.delete("/projects/{project_id}")
-def archive_project(
+def delete_project(
     project_id: str,
+    background_tasks: BackgroundTasks,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
-    project = _project_for_user(project_id, user, database)
-    updated = database.update_project(
-        project_id, str(project["name"]), str(project.get("description") or ""), "archived"
+    _project_for_user(project_id, user, database)
+
+    # 1. 异步清理 HugeGraph 图数据库中属于该项目的静态架构节点与动态日志/故障节点
+    background_tasks.add_task(
+        ProjectScopedGraphClient(project_id).clear_project_graph
     )
-    return {"message": "project_archived", "project": _public_project(updated)}
+
+    # 2. 物理删除 SQLite 系统数据库中的项目及级联关联数据
+    success = database.delete_project(project_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+
+    return {"message": "project_deleted", "project_id": project_id}
 
 
 @router.get("/projects/{project_id}/dashboard")

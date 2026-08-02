@@ -63,6 +63,7 @@ export const api = {
   createProject: (payload) => request("/projects", { method: "POST", body: JSON.stringify(payload) }),
   updateProject: (id, payload) => request(`/projects/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
   archiveProject: (id) => request(`/projects/${id}`, { method: "DELETE" }),
+  deleteProject: (id) => request(`/projects/${id}`, { method: "DELETE" }),
   dashboard: (id) => request(`/projects/${id}/dashboard`),
 
   architectures: (id) => request(`/projects/${id}/architectures`),

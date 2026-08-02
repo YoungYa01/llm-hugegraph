@@ -22,7 +22,7 @@ export async function renderLogsPage(root, project) {
     content.innerHTML = `
       <div class="page-header">
         <div>
-          <h1>日志解析与统计</h1>
+          <h1>日志解析检测</h1>
           <p>上传 Spring 风格服务日志，由滑动窗口算法生成异常区间、日志根因证据，再与系统架构拓扑联合推理。</p>
         </div>
       </div>
@@ -59,14 +59,7 @@ export async function renderLogsPage(root, project) {
         <div class="card-header">
           <div>
             <h2>日志批次历史</h2>
-            <p>原始输入和分析产物按项目、批次隔离保存。</p>
-          </div>
-          <div style="display:flex;align-items:center;gap:12px;flex-shrink:0;font-size:12px;color:var(--ink-500)">
-            <span style="font-weight:600;margin-right:2px">故障等级：</span>
-            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#dc2626;display:inline-block"></span>严重</span>
-            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#f97316;display:inline-block"></span>高</span>
-            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#eab308;display:inline-block"></span>中</span>
-            <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span>低</span>
+            <p>原始输入、滑动窗口解析及挖掘段落按项目、批次隔离保存。</p>
           </div>
         </div>
         <div class="card-body flush">${batchesTable(batches, project.id)}</div>
@@ -128,13 +121,13 @@ export async function renderLogsPage(root, project) {
 
 function batchesTable(items, projectId) {
   void projectId;
-  if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。 ");
+  if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。");
 
   // 统计同名文件，同名时需要在文件名下显示上传时间加以区分
   const nameCounts = {};
   items.forEach((item) => { nameCounts[item.filename] = (nameCounts[item.filename] || 0) + 1; });
 
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口</th><th>故障数</th><th>分析时长</th><th>故障等级分布</th><th>处理进度</th><th>时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>输入文件</th><th>事件 / 窗口数</th><th>挖掘异常段数</th><th>分析时长</th><th>解析完成时间</th><th>操作</th></tr></thead><tbody>${items.map((item, index) => {
     const summary = item.summary || {};
     const durationSec = summary.duration_seconds || item.duration_seconds;
     let durationDisplay = "—";
@@ -149,41 +142,20 @@ function batchesTable(items, projectId) {
       }
     }
     const incidentCnt = summary.incidents;
-    const incidentsLink = incidentCnt != null ? `<a href="#/projects/${projectId}/incidents?batch=${item.id}" title="查看此批次故障" style="font-weight:700;color:var(--brand)">${incidentCnt}</a>` : "—";
+    const incidentsLink = incidentCnt != null ? `<a href="#/projects/${projectId}/incidents?batch=${item.id}" title="查看此批次挖掘到的异常事件" style="font-weight:700;color:var(--brand);font-size:13px">${incidentCnt} 段</a>` : "—";
 
     // 同名文件加时间副标题
     const showTimeSub = nameCounts[item.filename] > 1;
     const fileCell = `<a class="table-title" href="#/projects/${projectId}/incidents?batch=${item.id}" title="点击直达此批次故障根因">${escapeHtml(item.filename)}</a>${showTimeSub ? `<span class="table-subtitle">${formatDate(item.created_at)}</span>` : ""}${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}`;
 
-    // 故障等级分布色块
-    const dist = item.severity_dist || {};
-    const distParts = [];
-    if (dist.critical) distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#dc2626;display:inline-block"></span><span style="font-size:12px;font-weight:700;color:#dc2626">${dist.critical}</span></span>`);
-    if (dist.high)     distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#f97316;display:inline-block"></span><span style="font-size:12px;font-weight:700;color:#f97316">${dist.high}</span></span>`);
-    if (dist.medium)   distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#eab308;display:inline-block"></span><span style="font-size:12px;font-weight:600;color:#a16207">${dist.medium}</span></span>`);
-    if (dist.low)      distParts.push(`<span style="display:inline-flex;align-items:center;gap:3px;margin-right:4px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:12px;color:var(--ink-500)">${dist.low}</span></span>`);
-    const distCell = distParts.length ? distParts.join("") : `<span class="table-subtitle">—</span>`;
-
-    // 处理进度
-    const total = incidentCnt ?? 0;
-    const resolved = item.resolved_count ?? 0;
-    const pending = total - resolved;
-    let progressCell = `<span class="table-subtitle">—</span>`;
-    if (total > 0) {
-      const pct = Math.round((resolved / total) * 100);
-      const barColor = pending === 0 ? "#22c55e" : pending <= 2 ? "#f97316" : "#dc2626";
-      progressCell = `<div style="min-width:90px">
-        <div style="font-size:12px;margin-bottom:3px;display:flex;justify-content:space-between">
-          <span style="color:${barColor};font-weight:700">${pending > 0 ? `${pending} 待处理` : "全部已解决"}</span>
-          <span style="color:var(--ink-500)">${resolved}/${total}</span>
-        </div>
-        <div style="height:4px;border-radius:2px;background:var(--surface-soft);overflow:hidden">
-          <div style="height:100%;width:${pct}%;background:${barColor};border-radius:2px;transition:width .3s"></div>
-        </div>
-      </div>`;
-    }
-
-    return `<tr><td>${fileCell}</td><td>${summary.events ?? "—"} / ${summary.windows ?? "—"}</td><td>${incidentsLink}</td><td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td><td>${distCell}</td><td>${progressCell}</td><td>${formatDate(item.completed_at || item.created_at)}</td><td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td></tr>`;
+    return `<tr>
+      <td>${fileCell}</td>
+      <td><span style="font-weight:600;color:var(--ink-800)">${summary.events ?? "—"}</span> <small style="color:var(--ink-500)">/ ${summary.windows ?? "—"} 窗口</small></td>
+      <td>${incidentsLink}</td>
+      <td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td>
+      <td>${formatDate(item.completed_at || item.created_at)}</td>
+      <td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td>
+    </tr>`;
   }).join("")}</tbody></table></div>`;
 }
 

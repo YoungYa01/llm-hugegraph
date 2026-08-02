@@ -12,7 +12,7 @@ const icons = {
 const navItems = [
   ["overview", "总览"],
   ["architecture", "系统架构拓扑"],
-  ["logs", "日志解析与统计"],
+  ["logs", "日志解析检测"],
   ["incidents", "故障根因定位"],
 ];
 

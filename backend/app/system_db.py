@@ -236,11 +236,46 @@ class SystemDatabase:
             """,
             (project_id, project_id, project_id, project_id, project_id),
         ) or {}
+        severity_row = self.query_one(
+            """
+            SELECT
+              SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS cnt_critical,
+              SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) AS cnt_high,
+              SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) AS cnt_medium,
+              SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) AS cnt_low
+            FROM incidents WHERE project_id = ?
+            """,
+            (project_id,),
+        ) or {}
+        status_row = self.query_one(
+            """
+            SELECT
+              SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS cnt_open,
+              SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS cnt_in_progress,
+              SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS cnt_resolved
+            FROM incidents WHERE project_id = ?
+            """,
+            (project_id,),
+        ) or {}
         recent = self.query_all(
             "SELECT id, title, severity, status, root_candidate, root_confidence, created_at FROM incidents WHERE project_id = ? ORDER BY created_at DESC LIMIT 8",
             (project_id,),
         )
-        return {**counts, "recent_incidents": recent}
+        return {
+            **counts,
+            "severity_dist": {
+                "critical": int(severity_row.get("cnt_critical") or 0),
+                "high": int(severity_row.get("cnt_high") or 0),
+                "medium": int(severity_row.get("cnt_medium") or 0),
+                "low": int(severity_row.get("cnt_low") or 0),
+            },
+            "status_dist": {
+                "open": int(status_row.get("cnt_open") or 0),
+                "in_progress": int(status_row.get("cnt_in_progress") or 0),
+                "resolved": int(status_row.get("cnt_resolved") or 0),
+            },
+            "recent_incidents": recent,
+        }
 
     # Architecture imports
     def create_architecture_import(

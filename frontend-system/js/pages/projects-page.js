@@ -1,44 +1,145 @@
 import { api } from "../api.js";
-import { user } from "../auth.js";
+import { setUser, user } from "../auth.js";
 import { cacheProject } from "../state.js";
 import { badge, emptyState, errorState, escapeHtml, formatDate, loading, setBusy, toast } from "../ui.js";
 
+const SVG = {
+  projects: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>`,
+  users: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 1 0 7.75"></path></svg>`,
+  gear: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`,
+  pencil: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`,
+  plus: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`,
+};
+
 export async function renderProjectsPage(root, { onLogout }) {
   const account = user() || {};
-  root.innerHTML = `<div class="workspace">
-    <header class="topbar">
-      <a class="brand" href="#/projects" style="color:var(--ink-950);padding:0"><span class="brand-mark">L</span><span>LogScope RCA</span></a>
-      <div style="display:flex;align-items:center;gap:12px">
-        <span style="color:var(--ink-600)">${escapeHtml(account.display_name || account.username)}</span>
-        <button class="button button-secondary button-small" id="logout-button">退出</button>
-      </div>
-    </header>
-    <main class="content">
-      <div class="page-header">
-        <div><h1>项目空间</h1><p>每个项目拥有独立的架构图谱、日志批次和故障处理记录。</p></div>
-        <button class="button button-primary" id="create-project">＋ 新建项目</button>
-      </div>
-      <div id="projects-content">${loading("正在加载项目…")}</div>
-    </main>
-  </div>`;
-  root.querySelector("#logout-button")?.addEventListener("click", onLogout);
-  root.querySelector("#create-project")?.addEventListener("click", () => showProjectModal(root, load));
+  const isAdmin = account.role === "admin";
+  const initial = (account.display_name || account.username || "U").slice(0, 1).toUpperCase();
+  let currentTab = "projects"; // "projects" | "users"
 
-  async function load() {
-    const content = root.querySelector("#projects-content");
+  function renderShell() {
+    root.innerHTML = `
+      <div class="app-shell" id="app-shell">
+        <aside class="sidebar">
+          <a class="brand" href="#/projects" style="margin-bottom:18px;text-decoration:none">
+            <span class="brand-mark">L</span>
+            <span>LogScope RCA <small class="brand-version">v2.0</small></span>
+          </a>
+
+          <div style="padding:10px 12px;margin-bottom:16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
+            <small style="display:block;font-size:11px;color:rgba(255,255,255,0.5)">控制台与项目空间</small>
+            <strong style="font-size:13px;color:#ffffff;display:flex;align-items:center;gap:6px;margin-top:2px">
+              数据管理中心
+              <span style="font-size:10px;padding:1px 6px;border-radius:4px;background:${isAdmin ? '#2563eb' : 'rgba(255,255,255,0.15)'};color:#fff;font-weight:600">
+                ${isAdmin ? '管理员' : '普通用户'}
+              </span>
+            </strong>
+          </div>
+
+          <nav class="nav">
+            <a class="nav-link ${currentTab === "projects" ? "active" : ""}" id="tab-projects-btn" href="javascript:void(0)">
+              <span class="nav-icon">${SVG.projects}</span><span>项目列表</span>
+            </a>
+            ${isAdmin ? `
+              <a class="nav-link ${currentTab === "users" ? "active" : ""}" id="tab-users-btn" href="javascript:void(0)">
+                <span class="nav-icon">${SVG.users}</span><span>用户与权限管理</span>
+              </a>
+            ` : ""}
+          </nav>
+
+          <!-- 底部账号与退出登录 -->
+          <div class="sidebar-footer" style="padding-top:14px;border-top:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:space-between">
+            <div class="user-chip" id="open-my-profile" style="margin:0;cursor:pointer" title="点击修改个人资料与密码">
+              <span class="avatar">${escapeHtml(initial)}</span>
+              <div class="user-chip-text">
+                <strong style="font-size:13px;display:flex;align-items:center;gap:4px">${escapeHtml(account.display_name || account.username)} <span style="opacity:0.7">${SVG.gear}</span></strong>
+                <span style="font-size:11px;color:rgba(255,255,255,0.5)">${escapeHtml(account.role || "user")}</span>
+              </div>
+            </div>
+            <button class="button button-ghost button-small" id="logout-button" style="color:#f87171;border:1px solid rgba(248,113,113,0.3);padding:4px 10px;font-size:12px;white-space:nowrap" title="退出当前账号">
+              退出登录
+            </button>
+          </div>
+        </aside>
+
+        <section class="workspace">
+          <header class="topbar">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:14px;font-weight:700;color:var(--ink-900)">
+                ${currentTab === "projects" ? "项目空间" : "全站用户与权限管理"}
+              </span>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px">
+              <span style="font-size:12px;color:var(--ink-500)">
+                当前用户: <strong style="color:var(--ink-800)">${escapeHtml(account.display_name || account.username)}</strong>
+              </span>
+              <button class="button button-secondary button-small" id="topbar-my-profile" style="font-size:11px;display:flex;align-items:center;gap:4px">${SVG.gear} 个人设置</button>
+            </div>
+          </header>
+          <main class="content" id="main-workspace-content">
+            ${loading("正在加载页面数据…")}
+          </main>
+        </section>
+      </div>
+    `;
+
+    root.querySelector("#logout-button")?.addEventListener("click", onLogout);
+    root.querySelector("#open-my-profile")?.addEventListener("click", () => showProfileModal(root));
+    root.querySelector("#topbar-my-profile")?.addEventListener("click", () => showProfileModal(root));
+
+    root.querySelector("#tab-projects-btn")?.addEventListener("click", async () => {
+      if (currentTab !== "projects") {
+        currentTab = "projects";
+        renderShell();
+        await loadProjectsTab();
+      }
+    });
+
+    root.querySelector("#tab-users-btn")?.addEventListener("click", async () => {
+      if (currentTab !== "users") {
+        currentTab = "users";
+        renderShell();
+        await loadUsersTab();
+      }
+    });
+  }
+
+  renderShell();
+  await loadProjectsTab();
+
+  // 1. 加载项目列表视图
+  async function loadProjectsTab() {
+    const content = root.querySelector("#main-workspace-content");
+    if (!content) return;
     try {
+      content.innerHTML = `
+        <div class="page-header">
+          <div>
+            <h1>项目空间</h1>
+            <p>${isAdmin ? "管理员权限：全站所有用户的项目空间及架构数据全景。" : "每个项目拥有独立的架构图谱、日志批次和故障处理记录。"}</p>
+          </div>
+          <button class="button button-primary" id="create-project" style="display:flex;align-items:center;gap:6px">${SVG.plus} 新建项目</button>
+        </div>
+        <div id="projects-content-area">${loading("正在拉取项目列表…")}</div>
+      `;
+
+      content.querySelector("#create-project")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
+      const area = content.querySelector("#projects-content-area");
+
       const { items } = await api.projects();
       items.forEach(cacheProject);
+
       if (!items.length) {
-        content.innerHTML = emptyState(
+        area.innerHTML = emptyState(
           "还没有项目",
           "先创建一个项目，再导入该系统的架构描述。",
-          '<button class="button button-primary" id="empty-create">创建第一个项目</button>',
+          `<button class="button button-primary" id="empty-create" style="display:inline-flex;align-items:center;gap:6px">${SVG.plus} 创建第一个项目</button>`,
         );
-        content.querySelector("#empty-create")?.addEventListener("click", () => showProjectModal(root, load));
+        area.querySelector("#empty-create")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
         return;
       }
-      content.innerHTML = `<div class="grid grid-3">
+
+      area.innerHTML = `<div class="grid grid-3">
         ${items.map((project) => `
           <div class="card project-card" style="position:relative;display:flex;flex-direction:column;justify-content:space-between">
             <div style="position:absolute;top:12px;right:12px;z-index:3">
@@ -47,29 +148,33 @@ export async function renderProjectsPage(root, { onLogout }) {
               </button>
             </div>
             <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;flex:1;display:flex;flex-direction:column">
-              <div class="project-card-top" style="margin-bottom:12px">
+              <div class="project-card-top" style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between">
                 <span class="project-symbol">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span>
               </div>
-              <h2 style="font-size:16px;font-weight:700;margin-bottom:6px;padding-right:90px;word-break:break-all">${escapeHtml(project.name)}</h2>
-              <p style="color:var(--ink-600);font-size:13px;line-height:1.5;margin-bottom:16px;flex:1">${escapeHtml(project.description || "暂无项目描述")}</p>
-              <div class="project-meta" style="border-top:1px solid var(--border);padding-top:12px;margin-top:auto">
-                <span style="font-size:12px;color:var(--ink-500)">更新于 ${formatDate(project.updated_at)}</span>
-                <strong style="color:var(--brand);font-size:13px">进入项目 →</strong>
+              <h2 style="font-size:16px;font-weight:700;margin-bottom:6px;padding-right:60px;word-break:break-all">${escapeHtml(project.name)}</h2>
+              <p style="color:var(--ink-600);font-size:13px;line-height:1.5;margin-bottom:14px;flex:1">${escapeHtml(project.description || "暂无项目描述")}</p>
+              
+              <div class="project-meta" style="border-top:1px solid var(--border);padding-top:10px;margin-top:auto;display:flex;align-items:center;justify-content:space-between">
+                <div>
+                  <span style="font-size:11px;color:var(--ink-500);display:block">创建者: <strong style="color:var(--ink-700)">${escapeHtml(project.owner_display_name || project.owner_name || "创建人")}</strong></span>
+                  <span style="font-size:10px;color:var(--ink-400)">${formatDate(project.updated_at)}</span>
+                </div>
+                <strong style="color:var(--brand);font-size:12px">进入项目 →</strong>
               </div>
             </a>
           </div>
         `).join("")}
         <button class="card project-card new-project-card" id="card-create" style="min-height:160px">
-          <span class="project-symbol">＋</span>
+          <span class="project-symbol" style="display:inline-flex;align-items:center;justify-content:center">${SVG.plus}</span>
           <strong>新建项目</strong>
           <span class="field-hint">创建独立图谱与日志空间</span>
         </button>
       </div>`;
 
-      content.querySelector("#card-create")?.addEventListener("click", () => showProjectModal(root, load));
-      
+      area.querySelector("#card-create")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
+
       // 绑定删除按钮事件
-      content.querySelectorAll(".project-delete-btn").forEach((button) => {
+      area.querySelectorAll(".project-delete-btn").forEach((button) => {
         button.addEventListener("click", async (event) => {
           event.stopPropagation();
           event.preventDefault();
@@ -86,7 +191,7 @@ export async function renderProjectsPage(root, { onLogout }) {
           try {
             await api.deleteProject(projectId);
             toast(`项目“${projectName}”已永久删除`);
-            await load();
+            await loadProjectsTab();
           } catch (error) {
             toast(error.message, "error");
             setBusy(button, false);
@@ -95,10 +200,286 @@ export async function renderProjectsPage(root, { onLogout }) {
       });
     } catch (error) {
       content.innerHTML = errorState(error, "retry-projects");
-      content.querySelector("#retry-projects")?.addEventListener("click", load);
+      content.querySelector("#retry-projects")?.addEventListener("click", loadProjectsTab);
     }
   }
-  await load();
+
+  // 2. 加载用户与权限管理视图 (管理员专属)
+  async function loadUsersTab() {
+    const content = root.querySelector("#main-workspace-content");
+    if (!content) return;
+    try {
+      content.innerHTML = `
+        <div class="page-header">
+          <div>
+            <h1>用户与权限管理</h1>
+            <p>管理全站注册用户、修改姓名/重置密码、角色权限（管理员 / 普通用户）及账号启用/停用状态。</p>
+          </div>
+        </div>
+        <div id="users-content-area">${loading("正在拉取用户列表…")}</div>
+      `;
+
+      const area = content.querySelector("#users-content-area");
+      const { items } = await api.users();
+
+      area.innerHTML = `
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2>系统用户名录 (${items.length} 人)</h2>
+              <p>管理员可以修改用户姓名、重置密码、调整角色权限及账号状态。</p>
+            </div>
+          </div>
+          <div class="card-body flush">
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>用户名 / 显示名</th>
+                    <th>账号角色</th>
+                    <th>账号状态</th>
+                    <th>注册时间</th>
+                    <th>操作与权限设定</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${items.map((u) => `
+                    <tr>
+                      <td>
+                        <div style="display:flex;align-items:center;gap:10px">
+                          <span class="avatar" style="width:32px;height:32px;font-size:12px">${escapeHtml((u.display_name || u.username).slice(0, 1).toUpperCase())}</span>
+                          <div>
+                            <strong style="display:block;font-size:13px">${escapeHtml(u.username)}</strong>
+                            <span style="font-size:11px;color:var(--ink-500)">${escapeHtml(u.display_name || u.username)}</span>
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <span class="badge ${u.role === "admin" ? "badge-critical" : "badge-info"}">
+                          ${u.role === "admin" ? "管理员" : "普通用户"}
+                        </span>
+                      </td>
+                      <td>
+                        <span class="badge ${u.is_active ? "badge-resolved" : "badge-ignored"}">
+                          ${u.is_active ? "正常启用" : "已停用"}
+                        </span>
+                      </td>
+                      <td>
+                        <span style="font-size:12px;color:var(--ink-500)">${formatDate(u.created_at)}</span>
+                      </td>
+                      <td>
+                        <div style="display:flex;align-items:center;gap:8px">
+                          <button class="button button-secondary button-small edit-user-btn" data-user-json='${escapeHtml(JSON.stringify(u))}' style="font-size:11px;padding:4px 8px;border-radius:6px;display:flex;align-items:center;gap:4px">
+                            ${SVG.pencil} 编辑
+                          </button>
+                          <select class="role-select" data-user-id="${u.id}" data-is-active="${u.is_active}" style="font-size:12px;padding:5px 12px;border-radius:6px;border:1.5px solid var(--brand, #2563eb);background:#ffffff;color:var(--ink-800);font-weight:600;cursor:pointer;outline:none;box-shadow:0 1px 3px rgba(37,99,235,0.12)">
+                            <option value="user" ${u.role === "user" ? "selected" : ""}>普通用户</option>
+                            <option value="admin" ${u.role === "admin" ? "selected" : ""}>管理员</option>
+                          </select>
+                          ${u.role === "admin" ? `
+                            <button class="button button-ghost button-small" disabled title="出于系统安全保护，管理员账号不可被停用" style="font-size:12px;padding:4px 12px;border-radius:6px;border:1px solid var(--border);color:var(--ink-400);background:var(--surface-soft);opacity:0.6;cursor:not-allowed">
+                              不可停用
+                            </button>
+                          ` : `
+                            <button class="button button-ghost button-small toggle-active-btn" data-user-id="${u.id}" data-role="${u.role}" data-is-active="${u.is_active}" style="font-size:12px;padding:4px 12px;border-radius:6px;border:1px solid ${u.is_active ? 'rgba(220,38,38,0.3)' : 'rgba(22,163,74,0.3)'};color:${u.is_active ? '#dc2626' : '#16a34a'};background:${u.is_active ? 'rgba(220,38,38,0.05)' : 'rgba(22,163,74,0.05)'}">
+                              ${u.is_active ? "停用" : "启用"}
+                            </button>
+                          `}
+                        </div>
+                      </td>
+                    </tr>
+                  `).join("")}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      `;
+
+      // 绑定编辑账号按钮事件
+      area.querySelectorAll(".edit-user-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          try {
+            const userObj = JSON.parse(btn.dataset.userJson);
+            showAdminEditUserModal(root, userObj, loadUsersTab);
+          } catch (e) {
+            console.error("解析用户失败", e);
+          }
+        });
+      });
+
+      // 绑定角色切换下拉框事件
+      area.querySelectorAll(".role-select").forEach((select) => {
+        select.addEventListener("change", async (e) => {
+          const userId = select.dataset.userId;
+          const isActive = Number(select.dataset.isActive);
+          const newRole = e.target.value;
+          try {
+            await api.updateUser(userId, { role: newRole, is_active: isActive });
+            toast("用户角色权限已成功更新");
+            await loadUsersTab();
+          } catch (err) {
+            toast(err.message, "error");
+            await loadUsersTab();
+          }
+        });
+      });
+
+      // 绑定账号启停按钮事件
+      area.querySelectorAll(".toggle-active-btn").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const userId = button.dataset.userId;
+          const role = button.dataset.role;
+          const currentActive = Number(button.dataset.isActive);
+          const newActive = currentActive === 1 ? 0 : 1;
+          try {
+            await api.updateUser(userId, { role: role, is_active: newActive });
+            toast(`用户状态已切换为${newActive === 1 ? '启用' : '停用'}`);
+            await loadUsersTab();
+          } catch (err) {
+            toast(err.message, "error");
+          }
+        });
+      });
+
+    } catch (error) {
+      content.innerHTML = errorState(error, "retry-users");
+      content.querySelector("#retry-users")?.addEventListener("click", loadUsersTab);
+    }
+  }
+}
+
+// 个人设置弹窗 (支持所有用户自行修改姓名与密码)
+function showProfileModal(root) {
+  const account = user() || {};
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" style="max-width:440px">
+      <header class="modal-header">
+        <h2 id="modal-title" style="display:flex;align-items:center;gap:6px">${SVG.gear} 个人账号设置</h2>
+        <button class="button button-ghost" data-close aria-label="关闭">✕</button>
+      </header>
+      <div class="modal-body">
+        <form class="form-stack" id="profile-form">
+          <div class="field">
+            <label>登录用户名</label>
+            <input class="input" value="${escapeHtml(account.username)}" disabled style="background:var(--surface-soft);opacity:0.7;cursor:not-allowed" />
+            <span class="field-hint">用户名用于登录验证，不可修改</span>
+          </div>
+          <div class="field">
+            <label for="profile-display-name">显示姓名 / 团队称呼</label>
+            <input class="input" id="profile-display-name" name="display_name" value="${escapeHtml(account.display_name || account.username)}" required maxlength="120" />
+          </div>
+          <hr style="border:none;border-top:1px solid var(--border);margin:14px 0" />
+          <span style="font-size:12px;font-weight:700;color:var(--ink-800);display:block;margin-bottom:8px">修改密码 (不填写则保持原密码不变)</span>
+          <div class="field">
+            <label for="profile-old-pass">当前旧密码</label>
+            <input class="input" type="password" id="profile-old-pass" name="old_password" placeholder="若要更新密码，请输入旧密码" />
+          </div>
+          <div class="field">
+            <label for="profile-new-pass">新密码</label>
+            <input class="input" type="password" id="profile-new-pass" name="new_password" placeholder="包含至少 4 位字符" />
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:16px">
+            <button type="button" class="button button-secondary" data-close>取消</button>
+            <button class="button button-primary" id="save-profile" type="submit">保存修改</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  `;
+  root.append(backdrop);
+  const close = () => backdrop.remove();
+  backdrop.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", close));
+  backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
+  backdrop.querySelector("#profile-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = backdrop.querySelector("#save-profile");
+    setBusy(btn, true, "保存中…");
+    try {
+      const payload = Object.fromEntries(new FormData(e.currentTarget));
+      const res = await api.updateProfile(payload);
+      setUser(res.user);
+      close();
+      toast("个人账号信息已成功修改");
+      setTimeout(() => window.location.reload(), 600);
+    } catch (err) {
+      toast(err.message, "error");
+      setBusy(btn, false);
+    }
+  });
+}
+
+// 管理员编辑指定用户弹窗 (修改显示姓名或重置密码)
+function showAdminEditUserModal(root, targetUser, onUpdated) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" style="max-width:440px">
+      <header class="modal-header">
+        <h2 id="modal-title" style="display:flex;align-items:center;gap:6px">${SVG.pencil} 编辑账号：${escapeHtml(targetUser.username)}</h2>
+        <button class="button button-ghost" data-close aria-label="关闭">✕</button>
+      </header>
+      <div class="modal-body">
+        <form class="form-stack" id="admin-user-form">
+          <div class="field">
+            <label>登录用户名</label>
+            <input class="input" value="${escapeHtml(targetUser.username)}" disabled style="background:var(--surface-soft);opacity:0.7" />
+          </div>
+          <div class="field">
+            <label for="admin-user-display">显示姓名 / 团队称呼</label>
+            <input class="input" id="admin-user-display" name="display_name" value="${escapeHtml(targetUser.display_name || targetUser.username)}" required />
+          </div>
+          <div class="field">
+            <label for="admin-user-role">账号角色</label>
+            <select class="select" id="admin-user-role" name="role">
+              <option value="user" ${targetUser.role === "user" ? "selected" : ""}>普通用户</option>
+              <option value="admin" ${targetUser.role === "admin" ? "selected" : ""}>管理员</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="admin-user-active">账号状态</label>
+            <select class="select" id="admin-user-active" name="is_active" ${targetUser.role === "admin" ? "disabled" : ""}>
+              <option value="1" ${targetUser.is_active ? "selected" : ""}>正常启用</option>
+              <option value="0" ${!targetUser.is_active ? "selected" : ""}>停用</option>
+            </select>
+            ${targetUser.role === "admin" ? `<span class="field-hint" style="color:var(--danger)">管理员账号受系统保护，不可被停用</span>` : ""}
+          </div>
+          <hr style="border:none;border-top:1px solid var(--border);margin:14px 0" />
+          <div class="field">
+            <label for="admin-user-reset-pass">重置新密码 (可选)</label>
+            <input class="input" type="password" id="admin-user-reset-pass" name="new_password" placeholder="若无需重置，留空即可" />
+            <span class="field-hint">管理员可以直接为此用户设置新密码，无需原密码</span>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:16px">
+            <button type="button" class="button button-secondary" data-close>取消</button>
+            <button class="button button-primary" id="admin-save-user" type="submit">保存修改</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  `;
+  root.append(backdrop);
+  const close = () => backdrop.remove();
+  backdrop.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", close));
+  backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
+  backdrop.querySelector("#admin-user-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = backdrop.querySelector("#admin-save-user");
+    setBusy(btn, true, "保存中…");
+    try {
+      const payload = Object.fromEntries(new FormData(e.currentTarget));
+      payload.is_active = Number(payload.is_active ?? targetUser.is_active);
+      await api.updateUser(targetUser.id, payload);
+      close();
+      toast(`用户“${targetUser.username}”的信息已更新`);
+      await onUpdated();
+    } catch (err) {
+      toast(err.message, "error");
+      setBusy(btn, false);
+    }
+  });
 }
 
 function showProjectModal(root, onCreated) {

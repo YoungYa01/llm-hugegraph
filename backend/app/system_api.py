@@ -23,6 +23,7 @@ from .auth import (
     require_user,
     verify_password,
 )
+from pydantic import BaseModel, Field
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
@@ -64,7 +65,7 @@ def _project_for_user(
     database: SystemDatabase | None = None,
 ) -> dict[str, Any]:
     project = (database or get_system_db()).get_project(project_id)
-    if not project or project.get("owner_id") != user.get("id"):
+    if not project or (user.get("role") != "admin" and project.get("owner_id") != user.get("id")):
         # Returning 404 avoids leaking project identifiers between users.
         raise HTTPException(status_code=404, detail="项目不存在")
     return project
@@ -111,7 +112,7 @@ def _data_dir(project_id: str, category: str, item_id: str) -> Path:
 
 
 def _public_project(project: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in project.items() if key != "owner_id"}
+    return dict(project)
 
 
 def _architecture_result(item: dict[str, Any]) -> dict[str, Any]:
@@ -204,8 +205,99 @@ def list_projects(
     include_archived: bool = Query(False),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
-    items = get_system_db().list_projects(str(user["id"]), include_archived)
+    del include_archived
+    items = get_system_db().list_projects_for_user(user)
     return {"items": [_public_project(item) for item in items]}
+
+
+@router.get("/users")
+def list_users(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅系统管理员有权查看所有用户")
+    database = get_system_db()
+    return {"items": database.list_all_users()}
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field("", max_length=120)
+    old_password: str = Field("", max_length=120)
+    new_password: str = Field("", max_length=120)
+
+
+@router.patch("/auth/profile")
+def update_own_profile(
+    payload: ProfileUpdateRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    user_id = str(user["id"])
+    
+    new_hash = None
+    if payload.new_password.strip():
+        if not payload.old_password:
+            raise HTTPException(status_code=400, detail="修改密码时必须输入当前旧密码")
+        if not verify_password(payload.old_password, str(user.get("password_hash") or "")):
+            raise HTTPException(status_code=400, detail="旧密码验证错误")
+        if len(payload.new_password.strip()) < 4:
+            raise HTTPException(status_code=400, detail="新密码至少包含4位字符")
+        new_hash = hash_password(payload.new_password.strip())
+
+    display_name = payload.display_name.strip() if payload.display_name.strip() else None
+
+    updated = database.update_user_profile(
+        user_id,
+        display_name=display_name,
+        password_hash=new_hash,
+    )
+    return {"user": public_user(updated or user)}
+
+
+class AdminUserUpdateRequest(BaseModel):
+    display_name: str = Field("", max_length=120)
+    role: str = Field("user", max_length=20)
+    is_active: int = Field(1)
+    new_password: str = Field("", max_length=120)
+
+
+@router.patch("/users/{user_id}")
+def update_user(
+    user_id: str,
+    payload: AdminUserUpdateRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅系统管理员有权管理用户账号")
+    
+    database = get_system_db()
+    target_user = database.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
+    if not target_user:
+        raise HTTPException(status_code=404, detail="目标用户不存在")
+
+    # 安全拦截：管理员账号不允许被停用
+    if (target_user.get("role") == "admin" or payload.role == "admin") and payload.is_active == 0:
+        raise HTTPException(status_code=400, detail="出于安全保护，系统管理员账号不可被停用")
+
+    if user_id == str(user["id"]) and payload.role != "admin":
+        raise HTTPException(status_code=400, detail="出于安全保护，不能降级您自己的管理员权限")
+
+    new_hash = None
+    if payload.new_password.strip():
+        if len(payload.new_password.strip()) < 4:
+            raise HTTPException(status_code=400, detail="新密码至少包含4位字符")
+        new_hash = hash_password(payload.new_password.strip())
+
+    display_name = payload.display_name.strip() if payload.display_name.strip() else None
+
+    updated = database.update_user_profile(
+        user_id,
+        display_name=display_name,
+        role=payload.role,
+        is_active=payload.is_active,
+        password_hash=new_hash,
+    )
+    return {"user": public_user(updated or target_user)}
 
 
 @router.post("/projects", status_code=201)

@@ -57,6 +57,9 @@ export const api = {
   login: (payload) => request("/auth/login", { method: "POST", body: JSON.stringify(payload) }),
   me: () => request("/auth/me"),
   logout: () => request("/auth/logout", { method: "POST" }),
+  updateProfile: (payload) => request("/auth/profile", { method: "PATCH", body: JSON.stringify(payload) }),
+  users: () => request("/users"),
+  updateUser: (userId, payload) => request(`/users/${userId}`, { method: "PATCH", body: JSON.stringify(payload) }),
 
   projects: (archived = false) => request(`/projects?include_archived=${archived}`),
   project: (id) => request(`/projects/${id}`),

@@ -209,13 +209,78 @@ class SystemDatabase:
     def list_projects(self, owner_id: str, include_archived: bool = False) -> list[dict[str, Any]]:
         if include_archived:
             return self.query_all(
-                "SELECT * FROM projects WHERE owner_id = ? ORDER BY updated_at DESC",
+                "SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name FROM projects p LEFT JOIN users u ON p.owner_id = u.id WHERE p.owner_id = ? ORDER BY p.updated_at DESC",
                 (owner_id,),
             )
         return self.query_all(
-            "SELECT * FROM projects WHERE owner_id = ? AND status != 'archived' ORDER BY updated_at DESC",
+            "SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name FROM projects p LEFT JOIN users u ON p.owner_id = u.id WHERE p.owner_id = ? AND p.status != 'archived' ORDER BY p.updated_at DESC",
             (owner_id,),
         )
+
+    def list_projects_for_user(self, user: dict[str, Any]) -> list[dict[str, Any]]:
+        """管理员查看全系统所有人的项目，普通用户仅查看自己创建的项目。"""
+        if user.get("role") == "admin":
+            return self.query_all(
+                """
+                SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name
+                FROM projects p
+                LEFT JOIN users u ON p.owner_id = u.id
+                WHERE p.status != 'archived'
+                ORDER BY p.updated_at DESC
+                """
+            )
+        return self.query_all(
+            """
+            SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name
+            FROM projects p
+            LEFT JOIN users u ON p.owner_id = u.id
+            WHERE p.owner_id = ? AND p.status != 'archived'
+            ORDER BY p.updated_at DESC
+            """,
+            (user["id"],),
+        )
+
+    def list_all_users(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT id, username, display_name, role, is_active, created_at FROM users ORDER BY created_at ASC"
+        )
+
+    def update_user_role_and_status(self, user_id: str, role: str, is_active: int) -> dict[str, Any] | None:
+        self.execute(
+            "UPDATE users SET role = ?, is_active = ? WHERE id = ?",
+            (role, is_active, user_id),
+        )
+        return self.get_user(user_id)
+
+    def update_user_profile(
+        self,
+        user_id: str,
+        display_name: str | None = None,
+        role: str | None = None,
+        is_active: int | None = None,
+        password_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        updates = []
+        params = []
+        if display_name is not None:
+            updates.append("display_name = ?")
+            params.append(display_name)
+        if role is not None:
+            updates.append("role = ?")
+            params.append(role)
+        if is_active is not None:
+            updates.append("is_active = ?")
+            params.append(is_active)
+        if password_hash is not None:
+            updates.append("password_hash = ?")
+            params.append(password_hash)
+
+        if updates:
+            params.append(user_id)
+            query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+            self.execute(query, tuple(params))
+
+        return self.get_user(user_id)
 
     def update_project(self, project_id: str, name: str, description: str, status: str) -> dict[str, Any]:
         self.execute(

@@ -6,6 +6,10 @@ export function user() {
   return currentUser;
 }
 
+export function setUser(u) {
+  currentUser = u;
+}
+
 export function hasSession() {
   return Boolean(getToken());
 }

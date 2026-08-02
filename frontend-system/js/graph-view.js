@@ -125,7 +125,7 @@ function layout(nodes, hasDynamic) {
   });
 
   const totalWidth = currentLaneX + 15;
-  const totalHeight = Math.max(620, startY + maxLaneRows * rowHeight + 45);
+  const totalHeight = Math.max(420, startY + maxLaneRows * rowHeight + 40);
 
   return {
     positions,

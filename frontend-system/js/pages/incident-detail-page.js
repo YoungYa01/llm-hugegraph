@@ -55,67 +55,244 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       ? llmDecision.troubleshooting_methods
       : (top.validation_suggestions || []).map((item) => item.title || item.reason || item.check_id).filter(Boolean);
     const llmConfidence = llmDecision.confidence || top.confidence;
+    const nodesCount = fusionGraph.nodes?.length || 0;
+    const adaptiveCanvasHeight = Math.min(460, Math.max(240, 210 + Math.ceil(nodesCount * 8)));
+    const pathStepsHtml = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;flex-shrink:0">
+        <h3 style="font-size:12px;font-weight:700;margin-bottom:4px;color:var(--ink-800)">传播路径依据</h3>
+        ${top.path_steps?.length ? stepsHtml(top.path_steps) : `<div style="color:var(--ink-500);font-size:12px;padding:2px 0">暂无传播路径依据</div>`}
+      </div>
+    `;
+
     content.innerHTML = `
       <div class="page-header">
-        <div><a class="link" href="#/projects/${project.id}/incidents">← 返回故障列表</a><h1 style="margin-top:12px">${escapeHtml(incident.title)}</h1><p>${escapeHtml(incident.external_incident_id)} · 发现于 ${formatDate(incident.created_at)}</p></div>
-        <div class="page-actions">${badge(incident.severity, "severity")}${badge(incident.status)}</div>
+        <div>
+          <a class="link" href="#/projects/${project.id}/incidents" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:8px;font-size:13px">
+            ← 返回故障列表
+          </a>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <h1 style="margin:0;font-size:20px;font-weight:700;line-height:1.4">${escapeHtml(incident.title)}</h1>
+          </div>
+          <p style="margin-top:6px;color:var(--ink-500);font-size:13px">
+            故障单号：<code style="background:var(--surface-soft);padding:2px 6px;border-radius:4px;font-family:monospace">${escapeHtml(incident.external_incident_id)}</code>
+            &nbsp;·&nbsp; 发现时间：${formatDate(incident.created_at)}
+          </p>
+        </div>
+        <div class="page-actions" style="display:flex;align-items:center;gap:8px">
+          ${badge(incident.severity, "severity")}
+          ${badge(incident.status)}
+        </div>
       </div>
 
-      <section class="cause-hero" style="margin-bottom:20px">
-        <div class="llm-decision-grid">
-          <div class="llm-decision-panel">
-            <span class="stat-label">最可能原因</span>
-            <h3>${escapeHtml(llmCandidate)}</h3>
-            <p>${escapeHtml(llmReason)}</p>
-            <div class="llm-decision-meta">
-              <span class="badge">${escapeHtml(llmDecision.source || "fallback")}</span>
-              <span class="badge">候选排行：${escapeHtml(llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : `Top-${top.rank || 1}`)}</span>
-              <span class="badge">${escapeHtml(llmDecision.selected_fault_mode || top.fault_mode || "UNKNOWN")}</span>
-              ${llmConfidence ? `<span class="badge">置信度：${formatConfidence(llmConfidence)}</span>` : ""}
-              <span class="badge">日志定位：${escapeHtml(analysis.resolved_root_service || detail.root_service_candidate || "未知服务")}</span>
+      <!-- 核心诊断 Hero 面板 -->
+      <section class="cause-hero" style="margin-bottom:20px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,0.04)">
+        <div style="display:grid;grid-template-columns: 1fr 1fr;gap:24px" class="hero-grid-responsive">
+          <!-- 左侧：根因定位结论 -->
+          <div>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+              <span class="stat-label" style="font-size:12px;font-weight:700;letter-spacing:0.5px;color:var(--ink-500);text-transform:uppercase">🎯 最可能根因节点</span>
+              ${llmConfidence ? `<span class="badge badge-subtle" style="font-weight:600;color:var(--brand)">置信度: ${formatConfidence(llmConfidence)}</span>` : ""}
+            </div>
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+              <h2 style="margin:0;font-size:22px;color:var(--danger);font-weight:700">${escapeHtml(llmCandidate)}</h2>
+              <span class="badge" style="background:rgba(220,38,38,0.1);color:#dc2626;border:1px solid rgba(220,38,38,0.2)">${escapeHtml(llmDecision.selected_fault_mode || top.fault_mode || "故障未知")}</span>
+            </div>
+            <p style="color:var(--ink-700);font-size:14px;line-height:1.6;margin-bottom:14px;background:var(--surface-soft);padding:12px;border-radius:8px;border-left:4px solid var(--brand)">
+              ${escapeHtml(llmReason)}
+            </p>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px">
+              <span class="badge">来源: ${escapeHtml(llmDecision.source || "RCA 推理引擎")}</span>
+              <span class="badge">候选排名: ${escapeHtml(llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : `Top-${top.rank || 1}`)}</span>
+              <span class="badge">日志侧定位: ${escapeHtml(analysis.resolved_root_service || detail.root_service_candidate || "未知服务")}</span>
             </div>
           </div>
-          <div class="llm-decision-panel">
-            <span class="stat-label">排查方法</span>
-            ${llmSteps.length ? `<ol class="llm-step-list">${llmSteps.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>` : `<p>暂未生成排查方法。</p>`}
+
+          <!-- 右侧：推荐处置与排查步骤 -->
+          <div style="border-left:1px solid var(--border);padding-left:24px" class="hero-steps-border">
+            <span class="stat-label" style="font-size:12px;font-weight:700;letter-spacing:0.5px;color:var(--ink-500);text-transform:uppercase;display:block;margin-bottom:12px">🛠️ 建议排查与处置步骤</span>
+            ${llmSteps.length ? `
+              <ol style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:10px">
+                ${llmSteps.map((step) => `<li style="font-size:13px;line-height:1.5;color:var(--ink-800)">${escapeHtml(step)}</li>`).join("")}
+              </ol>
+            ` : `<p style="color:var(--ink-500);font-size:13px">暂无自动推荐的处置步骤，请核查下方证据与日志链。</p>`}
           </div>
         </div>
       </section>
 
+      <!-- 本次故障融合定位拓扑与传播链 -->
       <section class="card fusion-graph-card" style="margin-bottom:20px">
-        <div class="card-header"><div><h2>本次故障融合定位图</h2><p>仅在这里把当前 Incident、RCA 假设和证据节点与相关架构子图融合；不会污染架构管理页面。</p></div></div>
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <h2>本次故障融合定位拓扑与传播链</h2>
+            <p>融合静态架构子图与 RCA 根因候选节点，右侧直接对照呈现图谱推导的故障传播路径与节点明细。</p>
+          </div>
+        </div>
         <div class="card-body">
           ${fusionError ? `<div class="notice notice-warning" style="margin-bottom:12px">融合图暂不可用：${escapeHtml(fusionError)}。下方持久化 RCA 结论仍可正常查看。</div>` : ""}
           ${fusionGraph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(fusionGraph.warnings.join("；"))}</div>` : ""}
-          ${fusionGraph.nodes.length ? `<div class="graph-shell graph-shell-fusion"><div id="fusion-graph-canvas"></div><div class="graph-toolbar"><button class="button button-ghost button-small" id="fusion-zoom-out">−</button><button class="button button-ghost button-small" id="fusion-zoom-reset">复位</button><button class="button button-ghost button-small" id="fusion-zoom-in">＋</button></div><div class="graph-legend">${graphLegend(true)}</div></div><div class="notice" id="fusion-selection" style="margin-top:10px">点击图中的节点或连线查看它在本次根因定位中的属性。</div>` : `<div class="empty-state"><div class="empty-icon">◇</div><h3>尚未读取到融合子图</h3><p>请确认 HugeGraph 中仍保留该日志批次的动态节点。</p></div>`}
+          ${fusionGraph.nodes.length ? `
+            <div style="display:grid;grid-template-columns: 1fr 340px;gap:20px" class="graph-grid-responsive">
+              <!-- 左侧：5列平铺舒展的拓扑画布 (高度提升至 420px) -->
+              <div class="graph-shell graph-shell-fusion">
+                <div id="fusion-graph-canvas" style="height:420px;min-height:360px;max-height:480px"></div>
+                <div class="graph-toolbar">
+                  <button class="button button-ghost button-small" id="fusion-zoom-out" title="缩小">−</button>
+                  <button class="button button-ghost button-small" id="fusion-zoom-reset" title="复位画布">复位</button>
+                  <button class="button button-ghost button-small" id="fusion-zoom-in" title="放大">＋</button>
+                </div>
+                <div class="graph-legend">${graphLegend(true)}</div>
+              </div>
+              <!-- 右侧：拆分为三大独立边框卡片部分 (高度 420px，给卡片3分配 190px 充裕展示视口) -->
+              <div class="graph-side-panel" style="display:flex;flex-direction:column;gap:10px;background:var(--surface-soft);padding:10px;border-radius:8px;border:1px solid var(--border);height:420px;overflow:hidden">
+                <!-- 卡片 1: 故障传播链 (带独立边框与内部滚动) -->
+                <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;flex-shrink:0">
+                  <h3 style="font-size:12px;font-weight:700;margin-bottom:4px;color:var(--ink-800)">
+                    故障传播链 (Propagation Chain)
+                  </h3>
+                  <div style="max-height:105px;overflow-y:auto;padding-right:2px">
+                    ${chainHtml(chain, chainExpanded)}
+                  </div>
+                </div>
+
+                <!-- 卡片 2: 路径依据蓝框 (带独立边框，不上下滚动) -->
+                ${pathStepsHtml}
+
+                <!-- 卡片 3: 节点/连线属性解析 (带独立边框，分配 max-height:190px 充裕自适应视口) -->
+                <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:auto;flex:1;min-height:0;display:flex;flex-direction:column;max-height:190px">
+                  <h3 style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--ink-800);flex-shrink:0">节点/连线属性解析</h3>
+                  <div id="fusion-selection" style="font-size:12px;color:var(--ink-700);line-height:1.5;overflow-y:auto;flex:1;padding-right:2px">
+                    点击左侧图谱中的节点或连线，在此处实时查看具体定位属性与依赖。
+                  </div>
+                </div>
+              </div>
+            </div>
+          ` : `
+            <div class="empty-state"><div class="empty-icon">◇</div><h3>尚未读取到融合子图</h3><p>请确认 HugeGraph 中仍保留该日志批次的动态节点。</p></div>
+          `}
         </div>
       </section>
 
+      <!-- 主体双栏布局 -->
       <div class="split-main">
-        <div class="grid">
-          <section class="card"><div class="card-header"><div><h2>推断出的故障传播链</h2><p>从底层候选向上游受影响服务展示；长链默认折叠中间节点。</p></div></div><div class="card-body">${chainHtml(chain, chainExpanded)}${stepsHtml(top.path_steps || [])}</div></section>
-          <section class="card"><div class="card-header"><div><h2>为什么指向这个候选</h2><p>评分由日志故障特征、实体/端点命中与图距离共同构成。</p></div></div><div class="card-body">
-            <h3>评分依据</h3>${listHtml(top.reasons, "暂时没有可展示的评分依据。")}
-            <h3 style="margin-top:20px">直接证据</h3>${listHtml(top.evidence, detail.root_evidence || "没有独立的结构化证据。")}
-            <h3 style="margin-top:20px">建议验证项</h3>${validationSuggestionsHtml(top.validation_suggestions || [])}
-            ${top.missing_evidence?.length ? `<h3 style="margin-top:20px">仍需补充的证据</h3><div class="notice notice-warning">${top.missing_evidence.map((item) => `<p style="margin:0 0 7px">• ${escapeHtml(item)}</p>`).join("")}</div>` : ""}
-          </div></section>
-          <section class="card"><div class="card-header"><div><h2>日志错误时间线</h2><p>时间相邻只表示先后顺序；长时间线可按需展开。</p></div></div><div class="card-body">${timelineHtml(detail.timeline || [])}</div></section>
-          ${hypotheses.length > 1 ? `<section class="card"><div class="card-header"><div><h2>其他根因候选</h2><p>不要只看 Top-1；证据不足时应核查多个候选。</p></div></div><div class="card-body flush">${hypothesesTable(hypotheses.slice(1))}</div></section>` : ""}
+        <!-- 左栏：排查深度分析 -->
+        <div class="grid" style="gap:20px">
+          <!-- 1. 根因诊断依据与证据 -->
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2>根因判定依据与日志证据</h2>
+                <p>综合算法评分、日志异常堆栈及拓扑图距离判定。</p>
+              </div>
+            </div>
+            <div class="card-body">
+              <h3 style="font-size:14px;font-weight:700;margin-bottom:8px;color:var(--ink-700)">📊 评分依据权重</h3>
+              ${listHtml(top.reasons, "暂时没有可展示的评分依据。")}
+
+              <h3 style="font-size:14px;font-weight:700;margin-top:20px;margin-bottom:8px;color:var(--ink-700)">🔍 关键日志堆栈证据</h3>
+              ${renderFormattedEvidence(top.evidence, detail.root_evidence)}
+
+              <h3 style="font-size:14px;font-weight:700;margin-top:20px;margin-bottom:8px;color:var(--ink-700)">🛠️ 推荐验证项</h3>
+              ${validationSuggestionsHtml(top.validation_suggestions || [])}
+
+              ${top.missing_evidence?.length ? `
+                <h3 style="font-size:14px;font-weight:700;margin-top:20px;margin-bottom:8px;color:var(--danger)">⚠️ 建议补充收集的证据</h3>
+                <div class="notice notice-warning">${top.missing_evidence.map((item) => `<p style="margin:0 0 6px">• ${escapeHtml(item)}</p>`).join("")}</div>
+              ` : ""}
+            </div>
+          </section>
+
+          <!-- 2. 日志错误时间线 -->
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2>日志异常时间线 (Timeline)</h2>
+                <p>按事件发生时间升序排列，直观还原故障演进过程。</p>
+              </div>
+            </div>
+            <div class="card-body">
+              ${timelineHtml(detail.timeline || [])}
+            </div>
+          </section>
+
+          <!-- 3. 其他候选 (如果有) -->
+          ${hypotheses.length > 1 ? `
+            <section class="card">
+              <div class="card-header">
+                <div>
+                  <h2>备选根因候选 (Top-2 ~ Top-N)</h2>
+                  <p>主要证据不充足时，建议核查以下备选服务/组件。</p>
+                </div>
+              </div>
+              <div class="card-body flush">
+                ${hypothesesTable(hypotheses.slice(1))}
+              </div>
+            </section>
+          ` : ""}
         </div>
-        <aside class="grid">
-          <section class="card"><div class="card-header"><div><h2>处理故障</h2><p>更新状态并形成可审计的解决记录。</p></div></div><div class="card-body"><form class="form-stack" id="status-form">
-            <div class="field"><label>状态</label><select class="select" name="status"><option value="open" ${selected("open", incident.status)}>待处理</option><option value="in_progress" ${selected("in_progress", incident.status)}>处理中</option><option value="resolved" ${selected("resolved", incident.status)}>已解决</option><option value="ignored" ${selected("ignored", incident.status)}>已忽略</option></select></div>
-            <div class="field"><label>处理/解决说明</label><textarea class="textarea" name="resolution_note" placeholder="例如：替换 redis-2 节点并完成主从重建；监控恢复。">${escapeHtml(incident.resolution_note || "")}</textarea><span class="field-hint">标记“已解决”时必须填写解决说明。</span></div>
-            <button class="button button-primary" id="save-status" type="submit">保存处理结果</button>
-          </form></div></section>
-          <section class="card"><div class="card-header"><div><h2>日志侧原始定位</h2><p>这是异常栈和 trace 中的观测，不等同最终基础设施根因。</p></div></div><div class="card-body"><dl class="kv-list">
-            <div class="kv-row"><dt>根因服务</dt><dd>${escapeHtml(detail.root_service_candidate || "—")}</dd></div>
-            <div class="kv-row"><dt>底层异常</dt><dd>${escapeHtml(detail.root_cause_candidate || "—")}</dd></div>
-            <div class="kv-row"><dt>单一 traceId</dt><dd><code>${escapeHtml(detail.primary_trace_id || "—")}</code></dd></div>
-            <div class="kv-row"><dt>故障区间</dt><dd>${formatDate(detail.fault_start)}<br>至 ${formatDate(detail.fault_end)}</dd></div>
-          </dl></div></section>
-          <section class="card"><div class="card-header"><div><h2>处理历史</h2><p>记录检测和每次状态变更。</p></div></div><div class="card-body">${actionsHtml(incident.actions || [])}</div></section>
+
+        <!-- 右栏：运维操作与元数据 -->
+        <aside class="grid" style="gap:20px">
+          <!-- 1. 故障处理与处置 (置顶在右侧第一位) -->
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2>⚡ 故障处理跟进</h2>
+                <p>更新故障处理状态并存档闭环记录。</p>
+              </div>
+            </div>
+            <div class="card-body">
+              <form class="form-stack" id="status-form">
+                <div class="field">
+                  <label>更新状态</label>
+                  <select class="select" name="status" style="font-weight:600">
+                    <option value="open" ${selected("open", incident.status)}>🔴 待处理 (Open)</option>
+                    <option value="in_progress" ${selected("in_progress", incident.status)}>🟡 处理中 (In Progress)</option>
+                    <option value="resolved" ${selected("resolved", incident.status)}>🟢 已解决 (Resolved)</option>
+                    <option value="ignored" ${selected("ignored", incident.status)}>⚪ 已忽略 (Ignored)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>处理/恢复记录说明</label>
+                  <textarea class="textarea" name="resolution_note" rows="3" placeholder="例如：已完成死锁隔离与配置优化，服务恢复正常运行。">${escapeHtml(incident.resolution_note || "")}</textarea>
+                  <span class="field-hint">标记为“已解决”时，建议记录具体的故障原因与修复处理措施。</span>
+                </div>
+                <button class="button button-primary" id="save-status" type="submit" style="width:100%">
+                  保存处理结果
+                </button>
+              </form>
+            </div>
+          </section>
+
+          <!-- 2. 日志侧原始检测元数据 -->
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2>日志侧原始观测数据</h2>
+                <p>来自日志窗口算法与 TraceId 的观测上下文。</p>
+              </div>
+            </div>
+            <div class="card-body">
+              <dl class="kv-list">
+                <div class="kv-row"><dt>根因候选服务</dt><dd><strong>${escapeHtml(detail.root_service_candidate || "—")}</strong></dd></div>
+                <div class="kv-row"><dt>异常模式/类型</dt><dd><code style="font-size:12px">${escapeHtml(detail.root_cause_candidate || "—")}</code></dd></div>
+                <div class="kv-row"><dt>关联 TraceId</dt><dd><code>${escapeHtml(detail.primary_trace_id || "—")}</code></dd></div>
+                <div class="kv-row"><dt>异常故障窗口</dt><dd style="font-size:12px">${formatDate(detail.fault_start)}<br>至 ${formatDate(detail.fault_end)}</dd></div>
+              </dl>
+            </div>
+          </section>
+
+          <!-- 3. 审计与处理历史 -->
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2>处理操作历史</h2>
+                <p>记录本故障从创建到历次状态变更。</p>
+              </div>
+            </div>
+            <div class="card-body">
+              ${actionsHtml(incident.actions || [])}
+            </div>
+          </section>
         </aside>
       </div>`;
     bind();
@@ -127,11 +304,30 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
     graphController = renderGraph(canvas, fusionGraph, {
       onSelect: (node, edges) => {
         const panel = content.querySelector("#fusion-selection");
-        panel.innerHTML = `<strong>${escapeHtml(node.name)}</strong> · ${escapeHtml(node.kind)}<br>${escapeHtml(node.description || "暂无描述")}<br><small>相邻关系：${edges.length}</small>`;
+        panel.innerHTML = `
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px">
+              <code style="font-weight:700;color:var(--brand);font-size:12px;word-break:break-all">${escapeHtml(node.name)}</code>
+              <span class="badge" style="font-size:10px;background:var(--surface-soft);color:var(--ink-700);flex-shrink:0">${escapeHtml(node.kind || "Node")}</span>
+            </div>
+            ${node.description ? `<div style="margin:4px 0;color:var(--ink-700);line-height:1.4;word-break:break-all">${escapeHtml(node.description)}</div>` : ""}
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px;padding-top:4px;border-top:1px dashed var(--border);color:var(--ink-500);font-size:11px">
+              <span>相邻关联实体:</span>
+              <strong style="color:var(--ink-800)">${edges.length} 个关系</strong>
+            </div>
+          </div>`;
       },
       onSelectEdge: (edge) => {
         const panel = content.querySelector("#fusion-selection");
-        panel.innerHTML = `<strong>${escapeHtml(edge.source)} —[${escapeHtml(edge.type)}]→ ${escapeHtml(edge.target)}</strong><br>${escapeHtml(edge.description || "暂无关系说明")}`;
+        panel.innerHTML = `
+          <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px">
+            <div style="display:flex;align-items:center;gap:4px;margin-bottom:4px;font-weight:700;color:var(--ink-800);flex-wrap:wrap">
+              <code>${escapeHtml(edge.source)}</code>
+              <span class="badge" style="background:rgba(37,99,235,0.1);color:var(--brand);font-size:10px">-[ ${escapeHtml(edge.type)} ]→</span>
+              <code>${escapeHtml(edge.target)}</code>
+            </div>
+            ${edge.description ? `<div style="margin-top:4px;color:var(--ink-700);line-height:1.4">${escapeHtml(edge.description)}</div>` : `<div style="margin-top:4px;color:var(--ink-500);font-style:italic">暂无直接关系描述</div>`}
+          </div>`;
       },
     });
   }
@@ -175,27 +371,54 @@ function chainHtml(chain, expanded) {
   const visible = shouldFold
     ? [chain[0], chain[1], `__fold__${chain.length - 4}`, chain.at(-2), chain.at(-1)]
     : chain;
+
   const nodes = visible.map((node, index) => {
     if (String(node).startsWith("__fold__")) {
       const count = String(node).replace("__fold__", "");
-      return `${index ? '<span class="chain-arrow">→</span>' : ""}<button class="chain-node chain-fold" id="toggle-chain">中间 ${count} 个节点<br><small>点击展开</small></button>`;
+      return `
+        <div style="text-align:center;padding:2px 0;color:var(--ink-400);font-weight:bold;font-size:14px">↓</div>
+        <div style="text-align:center">
+          <button class="button button-ghost button-small" id="toggle-chain" style="font-size:11px;color:var(--brand);padding:2px 6px">展开中间 ${count} 个节点</button>
+        </div>
+        <div style="text-align:center;padding:2px 0;color:var(--ink-400);font-weight:bold;font-size:14px">↓</div>`;
     }
-    return `${index ? '<span class="chain-arrow">→</span>' : ""}<span class="chain-node">${escapeHtml(node)}${index === 0 ? '<small style="display:block;color:var(--danger);margin-top:3px">根因候选</small>' : ""}</span>`;
+    const isRoot = index === 0;
+    const isLast = index === visible.length - 1;
+    const arrow = !isLast ? `<div style="text-align:center;padding:3px 0;color:var(--ink-400);font-weight:bold;font-size:14px">↓</div>` : "";
+
+    return `
+      <div style="background:#fff;border:1.5px solid ${isRoot ? '#dc2626' : '#cbd5e1'};padding:8px 12px;border-radius:6px;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:space-between;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
+        <span style="color:${isRoot ? '#dc2626' : 'var(--ink-800)'}">${escapeHtml(node)}</span>
+        ${isRoot ? `<span class="badge" style="background:rgba(220,38,38,0.1);color:#dc2626;font-size:10px;padding:1px 5px;border:1px solid rgba(220,38,38,0.2)">根因候选</span>` : ""}
+      </div>
+      ${arrow}`;
   }).join("");
-  const collapse = chain.length > 6 && expanded ? '<button class="button button-secondary button-small" id="toggle-chain" style="margin-top:8px">折叠中间节点</button>' : "";
-  return `<div class="chain">${nodes}</div>${collapse}`;
+
+  const collapse = chain.length > 6 && expanded ? '<button class="button button-secondary button-small" id="toggle-chain" style="margin-top:6px;font-size:11px;width:100%">折叠中间节点</button>' : "";
+
+  return `<div class="chain-vertical" style="display:flex;flex-direction:column;max-height:220px;overflow-y:auto;padding-right:4px;gap:0">${nodes}</div>${collapse}`;
 }
 
 function stepsHtml(steps) {
   if (!steps?.length) return "";
-  const rows = steps.map((step) => `<div>${escapeHtml(step.source)} → ${escapeHtml(step.target)} <small>(${escapeHtml(step.basis || step.relation)})</small></div>`);
-  if (rows.length <= 6) return `<div class="notice" style="margin-top:10px">${rows.join("")}</div>`;
-  return `<details class="collapsible-details"><summary>展开 ${rows.length} 个路径依据</summary><div class="notice">${rows.join("")}</div></details>`;
+  const rows = steps.map((step) => `<div style="line-height:1.4;margin-bottom:3px">${escapeHtml(step.source)} → ${escapeHtml(step.target)} <small style="color:var(--ink-500)">(${escapeHtml(step.basis || step.relation)})</small></div>`);
+  if (rows.length <= 6) return `<div class="notice" style="margin:0;padding:6px 8px;font-size:11px">${rows.join("")}</div>`;
+  return `<details class="collapsible-details" style="margin:0;font-size:11px"><summary style="padding:4px 6px">展开 ${rows.length} 个路径依据</summary><div class="notice" style="margin:4px;padding:6px">${rows.join("")}</div></details>`;
 }
 
 function listHtml(items, fallback) {
   const values = items?.length ? items : [fallback];
   return `<ul class="evidence-list">${values.map((item) => `<li class="evidence-item">${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function renderFormattedEvidence(evidenceList, fallbackRaw) {
+  const items = evidenceList?.length ? evidenceList : (fallbackRaw ? [fallbackRaw] : []);
+  if (!items.length) return `<p style="color:var(--ink-500)">没有独立的结构化日志证据。</p>`;
+  return `<div class="evidence-code-blocks">${items.map((item) => `
+    <div style="margin-bottom:10px">
+      <pre style="background:#1e293b;color:#f8fafc;padding:12px 14px;border-radius:8px;font-family:Consolas,Monaco,monospace;font-size:12px;line-height:1.5;overflow-x:auto;white-space:pre-wrap;word-break:break-all"><code>${escapeHtml(String(item))}</code></pre>
+    </div>
+  `).join("")}</div>`;
 }
 
 function validationSuggestionsHtml(items) {

@@ -145,8 +145,8 @@
 .chain-arrow { display: grid; flex: 0 0 42px; place-items: center; color: var(--brand); font-size: 19px; }
 .chain-fold { cursor: pointer; border-style: dashed; color: var(--brand); background: var(--surface-tint); }
 .chain-fold small { color: var(--ink-500); font-weight: 500; }
-.graph-shell-fusion { min-height: 640px; }
-.graph-shell-fusion svg { height: 640px; }
+.graph-shell-fusion { min-height: 360px; max-height: 480px; height: 420px; }
+.graph-shell-fusion svg { height: 100%; min-height: 360px; max-height: 480px; }
 .collapsible-details { margin-top: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
 .collapsible-details > summary { padding: 10px 13px; cursor: pointer; color: var(--brand); font-weight: 650; }
 .collapsible-details > .timeline { padding: 10px 16px 0 38px; }

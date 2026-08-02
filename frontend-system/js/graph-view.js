@@ -107,7 +107,7 @@ function layout(nodes, hasDynamic) {
 
   groups.forEach((items, colIdx) => {
     const numSubCols = items.length > 5 ? 2 : 1;
-    const laneWidth = numSubCols === 2 ? 395 : 220;
+    const laneWidth = items.length === 0 ? 140 : (numSubCols === 2 ? 380 : 210);
     laneWidths.push(laneWidth);
 
     items.forEach((node, idx) => {
@@ -121,7 +121,7 @@ function layout(nodes, hasDynamic) {
     const numRows = Math.ceil(items.length / numSubCols);
     if (numRows > maxLaneRows) maxLaneRows = numRows;
 
-    currentLaneX += laneWidth + 32;
+    currentLaneX += laneWidth + 16;
   });
 
   const totalWidth = currentLaneX + 15;
@@ -266,7 +266,7 @@ export function renderGraph(container, graph, options = {}) {
     headerText.textContent = title;
 
     swimlaneLayer.append(laneBg, headerBox, headerText);
-    currentLaneX += laneW + 18;
+    currentLaneX += laneW + 16;
   });
   viewport.append(swimlaneLayer);
 
@@ -286,12 +286,43 @@ export function renderGraph(container, graph, options = {}) {
     const target = positions.get(edge.target);
     if (!source || !target) return;
 
-    const x1 = source.x + 185;
-    const y1 = source.y + 28;
-    const x2 = target.x;
-    const y2 = target.y + 28;
-    const bend = Math.max(40, Math.abs(x2 - x1) * 0.38);
-    const pathData = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+    const nodeW = 180;
+    let x1, y1, x2, y2, cp1x, cp2x;
+
+    if (Math.abs(source.x - target.x) < 15) {
+      // 同一泳道列内的上下垂直连线 (如 Incident 与同列 Exception/RCAHypothesis 的连线)
+      const isUpward = source.y > target.y;
+      x1 = source.x;
+      y1 = source.y + (isUpward ? 14 : 38);
+      x2 = target.x;
+      y2 = target.y + (isUpward ? 38 : 14);
+
+      const arcOffset = 26;
+      cp1x = source.x - arcOffset;
+      cp2x = target.x - arcOffset;
+    } else if (source.x < target.x) {
+      // 跨列：从左侧节点指向右侧节点
+      x1 = source.x + nodeW;
+      y1 = source.y + 26;
+      x2 = target.x;
+      y2 = target.y + 26;
+
+      const bend = Math.max(25, Math.abs(x2 - x1) * 0.35);
+      cp1x = x1 + bend;
+      cp2x = x2 - bend;
+    } else {
+      // 跨列：从右侧节点指向左侧节点
+      x1 = source.x;
+      y1 = source.y + 26;
+      x2 = target.x + nodeW;
+      y2 = target.y + 26;
+
+      const bend = Math.max(25, Math.abs(x1 - x2) * 0.35);
+      cp1x = x1 - bend;
+      cp2x = x2 + bend;
+    }
+
+    const pathData = `M ${x1} ${y1} C ${cp1x} ${y1}, ${cp2x} ${y2}, ${x2} ${y2}`;
 
     const edgeGroup = svgElement("g", {
       class: "edge-group",

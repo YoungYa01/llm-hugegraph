@@ -860,8 +860,49 @@ def get_log_batch(
     return {"batch": result}
 
 
+def _clean_batch_disk_files(project_id: str, batch_id: str, batch: dict[str, Any] | None = None) -> None:
+    """彻底物理清除日志批次对应的所有磁盘文件与目录。"""
+    try:
+        settings = get_settings()
+        root_path = getattr(settings, "app_data_root", None) or getattr(settings, "data_dir", None)
+        if not root_path:
+            return
+        data_dir = Path(root_path).expanduser().resolve()
+        logs_root = data_dir / "projects" / project_id / "logs"
+
+        # 1. 直接删除专属子目录 projects/<project_id>/logs/<batch_id>/
+        batch_dir = logs_root / batch_id
+        if batch_dir.exists():
+            if batch_dir.is_dir():
+                shutil.rmtree(batch_dir, ignore_errors=True)
+            else:
+                batch_dir.unlink(missing_ok=True)
+
+        # 2. 如果批次对象里记录了具体的 input_path, output_path 或 train_path
+        if batch:
+            for key in ("input_path", "output_path", "train_path"):
+                raw = batch.get(key)
+                if not raw:
+                    continue
+                p = Path(str(raw)).expanduser().resolve()
+                if p.exists():
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink(missing_ok=True)
+                        if p.parent.exists() and p.parent != logs_root and p.parent.is_relative_to(logs_root):
+                            try:
+                                if not any(p.parent.iterdir()):
+                                    shutil.rmtree(p.parent, ignore_errors=True)
+                            except Exception:
+                                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("清理日志批次磁盘文件异常 batch=%s: %s", batch_id, exc)
+
+
 def _async_clean_batch_resources(project_id: str, batch_id: str, batch: dict[str, Any], app_data_root: str) -> None:
     """在后台异步擦除 HugeGraph 图数据库中的 300+ 节点及残余磁盘文件，带 3 次重试防护。"""
+    del app_data_root
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
@@ -873,25 +914,7 @@ def _async_clean_batch_resources(project_id: str, batch_id: str, batch: dict[str
             if attempt < max_retries:
                 time.sleep(2 * attempt)
 
-    try:
-        logs_root = (
-            Path(app_data_root).expanduser().resolve()
-            / "projects"
-            / project_id
-            / "logs"
-        ).resolve()
-        input_file = Path(str(batch.get("input_path") or "")).expanduser().resolve()
-        batch_dir = input_file.parent
-        
-        if batch_dir.is_dir() and batch_dir.name == batch_id and batch_dir.is_relative_to(logs_root):
-            shutil.rmtree(batch_dir, ignore_errors=True)
-        elif input_file.exists() and input_file.is_file() and input_file.is_relative_to(logs_root):
-            try:
-                input_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Async disk cleanup warning for batch=%s: %s", batch_id, exc)
+    _clean_batch_disk_files(project_id, batch_id, batch)
 
 
 @router.delete("/projects/{project_id}/logs/{batch_id}")
@@ -905,6 +928,8 @@ def delete_log_batch(
     _project_for_user(project_id, user, database)
     batch = database.get_log_batch(batch_id)
     if not batch or batch.get("project_id") != project_id:
+        # 即便数据库记录已不在，也强制尝试清理磁盘
+        _clean_batch_disk_files(project_id, batch_id, None)
         return {
             "message": "log_batch_deleted",
             "deleted": True,
@@ -913,16 +938,21 @@ def delete_log_batch(
             "recoverable": False,
         }
 
-    # 1. 在 SQLite 数据库中完成记录擦除（仅需几毫秒）
+    # 1. 立即同步从磁盘擦除对应的 logs/<batch_id> 文件夹与日志文件
+    _clean_batch_disk_files(project_id, batch_id, batch)
+
+    # 2. 在 SQLite 数据库中完成记录擦除
     database.delete_log_batch(batch_id)
 
-    # 2. 将漫长的 300+ 个 HugeGraph 图节点 REST 删除以及磁盘文件清理异步移交给后台 BackgroundTasks 任务
+    # 3. 将 HugeGraph 图节点 REST 清理异步移交给后台 BackgroundTasks 任务
+    settings = get_settings()
+    root_str = str(getattr(settings, "app_data_root", None) or getattr(settings, "data_dir", ""))
     background_tasks.add_task(
         _async_clean_batch_resources,
         project_id,
         batch_id,
         batch,
-        get_settings().app_data_root,
+        root_str,
     )
 
     # 3. 毫秒级直接响应 HTTP 200 返回前端，彻底消除悬停“删除中...”

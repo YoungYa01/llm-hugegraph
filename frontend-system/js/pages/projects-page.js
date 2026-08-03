@@ -169,25 +169,28 @@ export async function renderProjectsPage(root, { onLogout }) {
               : '<span class="badge badge-success" style="font-size:10px;padding:2px 6px">正常运行</span>';
 
             return `
-              <div class="card project-card" style="position:relative;display:flex;flex-direction:column;justify-content:space-between;transition:transform 0.15s ease, box-shadow 0.15s ease">
-                <div style="position:absolute;top:12px;right:12px;z-index:3;display:flex;align-items:center;gap:6px">
-                  <button class="button button-ghost button-small project-edit-btn" data-edit-id="${project.id}" title="编辑项目属性" style="color:var(--brand);padding:3px 8px;font-size:12px;background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.2);display:inline-flex;align-items:center;gap:3px">
-                    ${SVG.pencil} 编辑
-                  </button>
-                  <button class="button button-ghost button-small project-delete-btn" data-delete-id="${project.id}" data-delete-name="${escapeHtml(project.name)}" title="删除此项目" style="color:var(--danger);padding:3px 8px;font-size:12px;background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2)">
-                    删除
-                  </button>
-                </div>
-                <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;flex:1;display:flex;flex-direction:column">
-                  <div class="project-card-top" style="margin-bottom:10px;display:flex;align-items:center;gap:10px">
-                    <span class="project-symbol">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span>
-                    <div>
+              <div class="card project-card" style="display:flex;flex-direction:column;justify-content:space-between;transition:transform 0.15s ease, box-shadow 0.15s ease">
+                <div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:8px">
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <span class="project-symbol" style="margin:0">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span>
                       ${statusBadge}
                     </div>
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <button class="button button-ghost button-small project-edit-btn" data-edit-id="${project.id}" title="编辑项目属性" style="color:var(--brand);padding:3px 8px;font-size:12px;background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.2);display:inline-flex;align-items:center;gap:3px">
+                        ${SVG.pencil} 编辑
+                      </button>
+                      <button class="button button-ghost button-small project-delete-btn" data-delete-id="${project.id}" data-delete-name="${escapeHtml(project.name)}" title="删除此项目" style="color:var(--danger);padding:3px 8px;font-size:12px;background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2)">
+                        删除
+                      </button>
+                    </div>
                   </div>
-                  <h2 style="font-size:16px;font-weight:700;margin-bottom:6px;padding-right:120px;word-break:break-all">${escapeHtml(project.name)}</h2>
-                  <p style="color:var(--ink-600);font-size:13px;line-height:1.5;margin-bottom:14px;flex:1">${escapeHtml(project.description || "暂无项目描述")}</p>
-                  
+                  <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;display:block">
+                    <h2 style="font-size:16px;font-weight:700;margin-bottom:6px;word-break:break-all">${escapeHtml(project.name)}</h2>
+                    <p style="color:var(--ink-600);font-size:13px;line-height:1.5;margin-bottom:14px">${escapeHtml(project.description || "暂无项目描述")}</p>
+                  </a>
+                </div>
+                <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;display:block">
                   <div class="project-meta" style="border-top:1px solid var(--border);padding-top:10px;margin-top:auto;display:flex;align-items:center;justify-content:space-between">
                     <div>
                       <span style="font-size:11px;color:var(--ink-500);display:block">创建者: <strong style="color:var(--ink-700)">${escapeHtml(project.owner_display_name || project.owner_name || "创建人")}</strong></span>

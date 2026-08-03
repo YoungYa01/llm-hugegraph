@@ -1,4 +1,5 @@
 import { api } from "../api.js";
+import { showProjectModal } from "./projects-page.js";
 import { projectShell } from "../shell.js";
 import { badge, emptyState, errorState, escapeHtml, formatConfidence, formatDate, loading } from "../ui.js";
 
@@ -17,11 +18,14 @@ export async function renderOverviewPage(root, project) {
 
     // 绘制主结构
     content.innerHTML = `
-      <div class="page-header">
+      <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
         <div>
-          <h1>${escapeHtml(project.name)}</h1>
-          <p>${escapeHtml(project.description || "项目架构与日志根因分析工作台")}</p>
+          <h1 style="margin:0 0 4px 0">${escapeHtml(project.name)}</h1>
+          <p style="margin:0">${escapeHtml(project.description || "项目架构与日志根因分析工作台")}</p>
         </div>
+        <button class="button button-secondary button-small" id="edit-overview-project-btn" style="font-size:12px;display:inline-flex;align-items:center;gap:4px;height:34px">
+          ✏️ 编辑项目配置
+        </button>
       </div>
 
       <!-- 核心 KPI 统计卡片 -->
@@ -222,6 +226,13 @@ export async function renderOverviewPage(root, project) {
 
     renderPosture("all");
     select?.addEventListener("change", (e) => renderPosture(e.target.value));
+
+    content.querySelector("#edit-overview-project-btn")?.addEventListener("click", () => {
+      showProjectModal(root, async () => {
+        const fresh = await api.project(project.id);
+        renderOverviewPage(root, fresh.project);
+      }, project);
+    });
 
   } catch (error) {
     content.innerHTML = errorState(error);

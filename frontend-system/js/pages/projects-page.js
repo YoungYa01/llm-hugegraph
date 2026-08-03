@@ -135,91 +135,163 @@ export async function renderProjectsPage(root, { onLogout }) {
     if (!content) return;
     try {
       content.innerHTML = `
-        <div class="page-header">
+        <div class="page-header" style="margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
           <div>
-            <h1>项目空间</h1>
-            <p>${isAdmin ? "管理员权限：全站所有用户的项目空间及架构数据全景。" : "每个项目拥有独立的架构图谱、日志批次和故障处理记录。"}</p>
+            <h1 style="margin:0 0 4px 0">项目空间</h1>
+            <p style="margin:0">${isAdmin ? "管理员权限：全站所有用户的项目空间及架构数据全景。" : "每个项目拥有独立的架构图谱、日志批次和故障处理记录。"}</p>
           </div>
-          <button class="button button-primary" id="create-project" style="display:flex;align-items:center;gap:6px">${SVG.plus} 新建项目</button>
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="position:relative;width:240px">
+              <input type="text" id="project-search-input" class="input" placeholder="搜索项目名称或描述..." style="padding-left:32px;font-size:13px;height:36px" />
+              <span style="position:absolute;left:10px;top:8px;color:var(--ink-400);font-size:14px;pointer-events:none">🔍</span>
+            </div>
+            <button class="button button-primary" id="create-project" style="display:flex;align-items:center;gap:6px;height:36px;white-space:nowrap">${SVG.plus} 新建项目</button>
+          </div>
         </div>
         <div id="projects-content-area">${loading("正在拉取项目列表…")}</div>
       `;
 
       content.querySelector("#create-project")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
       const area = content.querySelector("#projects-content-area");
+      const searchInput = content.querySelector("#project-search-input");
 
       const { items } = await api.projects();
       items.forEach(cacheProject);
 
-      if (!items.length) {
-        area.innerHTML = emptyState(
-          "还没有项目",
-          "先创建一个项目，再导入该系统的架构描述。",
-          `<button class="button button-primary" id="empty-create" style="display:inline-flex;align-items:center;gap:6px">${SVG.plus} 创建第一个项目</button>`,
-        );
-        area.querySelector("#empty-create")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
-        return;
+      function renderProjectGrid(projectList) {
+        if (!items.length) {
+          area.innerHTML = emptyState(
+            "还没有项目",
+            "先创建一个项目，再导入该系统的架构描述。",
+            `<button class="button button-primary" id="empty-create" style="display:inline-flex;align-items:center;gap:6px">${SVG.plus} 创建第一个项目</button>`,
+          );
+          area.querySelector("#empty-create")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
+          return;
+        }
+
+        if (!projectList.length) {
+          area.innerHTML = emptyState(
+            "未找到匹配的项目",
+            "尝试使用其他搜索关键词，或清除搜索框内容。",
+            `<button class="button button-secondary button-small" id="clear-search-btn">重置搜索</button>`
+          );
+          area.querySelector("#clear-search-btn")?.addEventListener("click", () => {
+            if (searchInput) searchInput.value = "";
+            renderProjectGrid(items);
+          });
+          return;
+        }
+
+        area.innerHTML = `<div class="grid grid-3">
+          ${projectList.map((project) => {
+            const statusBadge = project.status === "paused"
+              ? '<span class="badge badge-warning" style="font-size:10px;padding:2px 6px">已暂停</span>'
+              : project.status === "archived"
+              ? '<span class="badge" style="font-size:10px;padding:2px 6px;background:#94a3b8;color:#fff">已归档</span>'
+              : '<span class="badge badge-success" style="font-size:10px;padding:2px 6px">正常运行</span>';
+
+            return `
+              <div class="card project-card" style="display:flex;flex-direction:column;justify-content:space-between;transition:transform 0.15s ease, box-shadow 0.15s ease">
+                <div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:8px">
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <span class="project-symbol" style="margin:0">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span>
+                      ${statusBadge}
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <button class="button button-ghost button-small project-edit-btn" data-edit-id="${project.id}" title="编辑项目属性" style="color:var(--brand);padding:3px 8px;font-size:12px;background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.2);display:inline-flex;align-items:center;gap:3px">
+                        ${SVG.pencil} 编辑
+                      </button>
+                      <button class="button button-ghost button-small project-delete-btn" data-delete-id="${project.id}" data-delete-name="${escapeHtml(project.name)}" title="删除此项目" style="color:var(--danger);padding:3px 8px;font-size:12px;background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2)">
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                  <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;display:block">
+                    <h2 style="font-size:16px;font-weight:700;margin-bottom:6px;word-break:break-all">${escapeHtml(project.name)}</h2>
+                    <p style="color:var(--ink-600);font-size:13px;line-height:1.5;margin-bottom:14px">${escapeHtml(project.description || "暂无项目描述")}</p>
+                  </a>
+                </div>
+                <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;display:block">
+                  <div class="project-meta" style="border-top:1px solid var(--border);padding-top:10px;margin-top:auto;display:flex;align-items:center;justify-content:space-between">
+                    <div>
+                      <span style="font-size:11px;color:var(--ink-500);display:block">创建者: <strong style="color:var(--ink-700)">${escapeHtml(project.owner_display_name || project.owner_name || "创建人")}</strong></span>
+                      <span style="font-size:10px;color:var(--ink-400)">${formatDate(project.updated_at)}</span>
+                    </div>
+                    <strong style="color:var(--brand);font-size:12px">进入项目 →</strong>
+                  </div>
+                </a>
+              </div>
+            `;
+          }).join("")}
+          <button class="card project-card new-project-card" id="card-create" style="min-height:160px">
+            <span class="project-symbol" style="display:inline-flex;align-items:center;justify-content:center">${SVG.plus}</span>
+            <strong>新建项目</strong>
+            <span class="field-hint">创建独立图谱与日志空间</span>
+          </button>
+        </div>`;
+
+        area.querySelector("#card-create")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
+
+        // 绑定编辑按钮事件
+        area.querySelectorAll(".project-edit-btn").forEach((button) => {
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            const projectId = button.dataset.editId;
+            const target = items.find((p) => String(p.id) === String(projectId));
+            if (target) {
+              showProjectModal(root, loadProjectsTab, target);
+            }
+          });
+        });
+
+        // 绑定删除按钮事件
+        area.querySelectorAll(".project-delete-btn").forEach((button) => {
+          button.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            const projectId = button.dataset.deleteId;
+            const projectName = button.dataset.deleteName;
+            if (!projectId) return;
+
+            const confirmed = window.confirm(
+              `确定要永久删除项目“${projectName}”吗？\n\n该项目下的所有架构拓扑、日志检测批次、故障记录与 RCA 图谱节点将被一并永久清除，且无法撤销！`
+            );
+            if (!confirmed) return;
+
+            setBusy(button, true, "删除中…");
+            try {
+              await api.deleteProject(projectId);
+              toast(`项目“${projectName}”已永久删除`);
+              await loadProjectsTab();
+            } catch (error) {
+              toast(error.message, "error");
+              setBusy(button, false);
+            }
+          });
+        });
       }
 
-      area.innerHTML = `<div class="grid grid-3">
-        ${items.map((project) => `
-          <div class="card project-card" style="position:relative;display:flex;flex-direction:column;justify-content:space-between">
-            <div style="position:absolute;top:12px;right:12px;z-index:3">
-              <button class="button button-ghost button-small project-delete-btn" data-delete-id="${project.id}" data-delete-name="${escapeHtml(project.name)}" title="删除此项目" style="color:var(--danger);padding:3px 10px;font-size:12px;background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2)">
-                删除
-              </button>
-            </div>
-            <a href="#/projects/${encodeURIComponent(project.id)}/overview" style="text-decoration:none;color:inherit;flex:1;display:flex;flex-direction:column">
-              <div class="project-card-top" style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between">
-                <span class="project-symbol">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span>
-              </div>
-              <h2 style="font-size:16px;font-weight:700;margin-bottom:6px;padding-right:60px;word-break:break-all">${escapeHtml(project.name)}</h2>
-              <p style="color:var(--ink-600);font-size:13px;line-height:1.5;margin-bottom:14px;flex:1">${escapeHtml(project.description || "暂无项目描述")}</p>
-              
-              <div class="project-meta" style="border-top:1px solid var(--border);padding-top:10px;margin-top:auto;display:flex;align-items:center;justify-content:space-between">
-                <div>
-                  <span style="font-size:11px;color:var(--ink-500);display:block">创建者: <strong style="color:var(--ink-700)">${escapeHtml(project.owner_display_name || project.owner_name || "创建人")}</strong></span>
-                  <span style="font-size:10px;color:var(--ink-400)">${formatDate(project.updated_at)}</span>
-                </div>
-                <strong style="color:var(--brand);font-size:12px">进入项目 →</strong>
-              </div>
-            </a>
-          </div>
-        `).join("")}
-        <button class="card project-card new-project-card" id="card-create" style="min-height:160px">
-          <span class="project-symbol" style="display:inline-flex;align-items:center;justify-content:center">${SVG.plus}</span>
-          <strong>新建项目</strong>
-          <span class="field-hint">创建独立图谱与日志空间</span>
-        </button>
-      </div>`;
+      renderProjectGrid(items);
 
-      area.querySelector("#card-create")?.addEventListener("click", () => showProjectModal(root, loadProjectsTab));
-
-      // 绑定删除按钮事件
-      area.querySelectorAll(".project-delete-btn").forEach((button) => {
-        button.addEventListener("click", async (event) => {
-          event.stopPropagation();
-          event.preventDefault();
-          const projectId = button.dataset.deleteId;
-          const projectName = button.dataset.deleteName;
-          if (!projectId) return;
-
-          const confirmed = window.confirm(
-            `确定要永久删除项目“${projectName}”吗？\n\n该项目下的所有架构拓扑、日志检测批次、故障记录与 RCA 图谱节点将被一并永久清除，且无法撤销！`
-          );
-          if (!confirmed) return;
-
-          setBusy(button, true, "删除中…");
-          try {
-            await api.deleteProject(projectId);
-            toast(`项目“${projectName}”已永久删除`);
-            await loadProjectsTab();
-          } catch (error) {
-            toast(error.message, "error");
-            setBusy(button, false);
-          }
-        });
+      // 实时搜索监听
+      searchInput?.addEventListener("input", (e) => {
+        const query = (e.target.value || "").trim().toLowerCase();
+        if (!query) {
+          renderProjectGrid(items);
+          return;
+        }
+        const filtered = items.filter(
+          (p) =>
+            (p.name && p.name.toLowerCase().includes(query)) ||
+            (p.description && p.description.toLowerCase().includes(query)) ||
+            (p.owner_name && p.owner_name.toLowerCase().includes(query)) ||
+            (p.owner_display_name && p.owner_display_name.toLowerCase().includes(query))
+        );
+        renderProjectGrid(filtered);
       });
+
     } catch (error) {
       content.innerHTML = errorState(error, "retry-projects");
       content.querySelector("#retry-projects")?.addEventListener("click", loadProjectsTab);
@@ -918,6 +990,93 @@ async function showLogBatchAnalyticsModal(root, batchId) {
   } catch (err) {
     backdrop.querySelector("#analytics-modal-body").innerHTML = errorState(err, "retry-analytics");
   }
+}
+
+// 展现新建/编辑项目弹窗
+export function showProjectModal(root, onSaved, projectToEdit = null) {
+  const isEdit = !!projectToEdit;
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <section class="modal" role="dialog" style="max-width:540px;width:90%">
+      <header class="modal-header">
+        <h2 style="display:flex;align-items:center;gap:8px">
+          ${isEdit ? `${SVG.pencil} 编辑项目` : `${SVG.plus} 新建项目`}
+        </h2>
+        <button class="button button-ghost" data-close>✕</button>
+      </header>
+      <div class="modal-body">
+        <form id="project-form">
+          <div class="field">
+            <label for="project-name-input">项目名称 <span style="color:var(--danger)">*</span></label>
+            <input class="input" type="text" id="project-name-input" name="name" required placeholder="例如：电商微服务集群系统" value="${escapeHtml(projectToEdit?.name || "")}" />
+            <span class="field-hint">建议使用具有标识度的系统或项目名称</span>
+          </div>
+
+          <div class="field" style="margin-top:14px">
+            <label for="project-desc-input">项目描述</label>
+            <textarea class="input" id="project-desc-input" name="description" rows="3" placeholder="填写该项目的架构特点、核心模块或负责团队...">${escapeHtml(projectToEdit?.description || "")}</textarea>
+          </div>
+
+          ${isEdit ? `
+            <div class="field" style="margin-top:14px">
+              <label for="project-status-input">项目运行状态</label>
+              <select class="select" id="project-status-input" name="status">
+                <option value="active" ${projectToEdit.status === "active" ? "selected" : ""}>🟢 正常运行 (active)</option>
+                <option value="paused" ${projectToEdit.status === "paused" ? "selected" : ""}>🟡 暂停检测 (paused)</option>
+                <option value="archived" ${projectToEdit.status === "archived" ? "selected" : ""}>⚪ 已归档 (archived)</option>
+              </select>
+              <span class="field-hint">状态更新将同步影响该项目的日志诊断与监控调度</span>
+            </div>
+          ` : ""}
+
+          <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:14px;border-top:1px solid var(--border)">
+            <button type="button" class="button button-secondary" data-close>取消</button>
+            <button type="submit" class="button button-primary" id="save-project-btn">
+              ${isEdit ? "保存修改" : "立即创建项目"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </section>
+  `;
+
+  root.append(backdrop);
+  const close = () => backdrop.remove();
+  backdrop.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", close));
+  backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
+
+  const form = backdrop.querySelector("#project-form");
+  const saveBtn = backdrop.querySelector("#save-project-btn");
+
+  form?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const formData = new FormData(form);
+    const name = (formData.get("name") || "").toString().trim();
+    const description = (formData.get("description") || "").toString().trim();
+    const status = (formData.get("status") || "active").toString().trim();
+
+    if (!name) {
+      toast("请输入项目名称", "error");
+      return;
+    }
+
+    setBusy(saveBtn, true, isEdit ? "保存中…" : "创建中…");
+    try {
+      if (isEdit) {
+        await api.updateProject(projectToEdit.id, { name, description, status });
+        toast(`项目“${name}”配置更新成功`);
+      } else {
+        await api.createProject({ name, description });
+        toast(`项目“${name}”创建成功`);
+      }
+      close();
+      if (typeof onSaved === "function") await onSaved();
+    } catch (err) {
+      toast(err.message || "操作失败", "error");
+      setBusy(saveBtn, false);
+    }
+  });
 }
 
 

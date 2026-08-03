@@ -39,6 +39,31 @@ def test_auth_project_and_dashboard_api(tmp_path, monkeypatch) -> None:
     assert dashboard.status_code == 200
     assert dashboard.json()["dashboard"]["incidents"] == 0
 
+    # Test Update Project (PUT /api/projects/{project_id})
+    updated = client.put(
+        f"/api/projects/{project_id}",
+        headers=headers,
+        json={"name": "Order Platform v2", "description": "Updated description", "status": "paused"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["project"]["name"] == "Order Platform v2"
+    assert updated.json()["project"]["description"] == "Updated description"
+    assert updated.json()["project"]["status"] == "paused"
+
+    # Test Get Project (GET /api/projects/{project_id})
+    fetched = client.get(f"/api/projects/{project_id}", headers=headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["project"]["name"] == "Order Platform v2"
+
+    # Test Delete Project (DELETE /api/projects/{project_id})
+    deleted = client.delete(f"/api/projects/{project_id}", headers=headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["message"] == "project_deleted"
+
+    # Verify project list is empty
+    empty_list = client.get("/api/projects", headers=headers)
+    assert len(empty_list.json()["items"]) == 0
+
     assert client.get("/api/projects").status_code == 401
 
 

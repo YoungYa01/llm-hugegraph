@@ -353,7 +353,7 @@ def delete_project(
         raise HTTPException(status_code=404, detail="项目不存在或已被删除")
 
     # 3. 彻底物理删除该项目在磁盘 backend/data/projects/<project_id> 中的所有架构、日志与 RCA 文件目录
-    project_dir = get_settings().data_dir / "projects" / project_id
+    project_dir = Path(get_settings().app_data_root) / "projects" / project_id
     if project_dir.exists():
         try:
             shutil.rmtree(project_dir, ignore_errors=True)

@@ -19,17 +19,34 @@ class GraphBuilderService:
     def initialize_system(self) -> list[str]:
         return self.db.ensure_schema()
 
-    def build_ontology_graph(self, doc_text: str, source_file: str = "") -> tuple[dict, list[str]]:
+    def build_ontology_graph(
+        self,
+        doc_text: str,
+        source_file: str = "",
+        progress_callback: Any | None = None,
+    ) -> tuple[dict, list[str]]:
+        def _report(pct: int, msg: str) -> None:
+            if callable(progress_callback):
+                try:
+                    progress_callback(pct, msg)
+                except Exception:
+                    pass
+
+        _report(15, "初始化 HugeGraph Schema Schema 与环境...")
         execution_logs: list[str] = []
         execution_logs.extend(self.initialize_system())
 
         chunks = split_text(doc_text, self.settings.llm_chunk_chars)
         if not chunks:
+            _report(100, "输入文件为空，未写入图谱。")
             return {"services": [], "calls": []}, [*execution_logs, "输入文件为空，未写入图谱。"]
 
         merged = ExtractedGraph()
+        total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
-            execution_logs.append(f"LLM 抽取分片 {index}/{len(chunks)}，字符数={len(chunk)}")
+            pct = 20 + int((index / total_chunks) * 50)  # 20% ~ 70%
+            _report(pct, f"LLM 正在抽取分片 ({index}/{total_chunks})，字符数={len(chunk)}...")
+            execution_logs.append(f"LLM 抽取分片 {index}/{total_chunks}，字符数={len(chunk)}")
             data = self.analyzer.analyze_architecture(chunk)
             execution_logs.append(f"抽取模式: {self.analyzer.last_mode}")
             execution_logs.extend(self.analyzer.last_logs)
@@ -39,6 +56,7 @@ class GraphBuilderService:
         # Normalize relationships again; ensure all endpoints are nodes.
         merged = self._complete_missing_nodes(merged)
 
+        _report(75, f"向 HugeGraph 写入 {len(merged.services)} 个架构节点...")
         real_id_map: dict[str, str] = {}
         for node in merged.services:
             res = self.db.upsert_node(
@@ -56,6 +74,7 @@ class GraphBuilderService:
             else:
                 execution_logs.append(f"警告：节点 {node.name} 写入后未返回 id。返回={res}")
 
+        _report(85, f"向 HugeGraph 写入 {len(merged.calls)} 条依赖关系...")
         seen_edges: set[tuple[str, str, str]] = set()
         for call in merged.calls:
             key = (call.source, call.target, call.type)
@@ -70,6 +89,7 @@ class GraphBuilderService:
             res = self.db.add_edge(out_id, in_id, call.type, call.description, call.meta)
             execution_logs.append(f"写入关系: {call.source} -[{call.type}]-> {call.target} -> {res.get('id', '')}")
 
+        _report(95, "生成图谱快照并保存...")
         return merged.model_dump(), execution_logs
 
     def _merge_graphs(self, left: ExtractedGraph, right: ExtractedGraph) -> ExtractedGraph:

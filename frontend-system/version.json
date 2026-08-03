@@ -1,6 +1,6 @@
 {
   "name": "LogScope RCA",
-  "version": "2026.07.21-r2",
+  "version": "2026.08.03-r1",
   "frontend": "frontend-system",
   "features": [
     "architecture-node-edge-crud",

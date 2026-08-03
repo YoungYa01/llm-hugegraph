@@ -2,21 +2,116 @@ import { api } from "../api.js";
 import { graphLegend, renderGraph } from "../graph-view.js";
 import { projectShell } from "../shell.js";
 import { badge, emptyState, errorState, escapeHtml, formatDate, loading, setBusy, toast } from "../ui.js";
+import { taskManager } from "../taskManager.js";
+
+const archCache = {};
 
 export async function renderArchitecturePage(root, project) {
-  root.innerHTML = projectShell(project, "architecture", `<div id="page-content">${loading("正在读取架构图谱…")}</div>`);
+  root.innerHTML = projectShell(project, "architecture", `<div id="page-content"></div>`);
   const content = root.querySelector("#page-content");
-  let graph = { nodes: [], edges: [], warnings: [] };
-  let imports = [];
+  let graph = archCache[project.id]?.graph || { nodes: [], edges: [], warnings: [] };
+  let imports = archCache[project.id]?.imports || [];
   let selectedNode = null;
   let selectedEdge = null;
   let controller = null;
 
   let selectedNodeNames = new Set();
   let selectedEdgeKeys = new Set();
+  let selectedArchitectureFile = null;
+
+  function inPageTaskCardHtml() {
+    const activeTask = taskManager.getTaskByType("architecture");
+    if (!activeTask) return "";
+    const pct = activeTask.progress || 0;
+    return `
+      <div class="tech-task-card" style="background:linear-gradient(135deg, #f8fafc 0%, #edf2f7 100%);border:1px solid #cbd5e1;border-left:4px solid #2563eb;border-radius:12px;padding:18px 22px;margin-bottom:24px;box-shadow:0 10px 25px -5px rgba(37,99,235,0.1);position:relative;overflow:hidden">
+        <div class="tech-task-header" style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:12px">
+          <div class="tech-task-title-group" style="display:flex;align-items:center;gap:12px">
+            <div style="width:12px;height:12px;border-radius:50%;background:#2563eb;box-shadow:0 0 10px #3b82f6;display:inline-block;flex-shrink:0"></div>
+            <div>
+              <div class="tech-task-title" style="font-size:15px;font-weight:700;color:#0f172a;display:flex;align-items:center;gap:8px">
+                架构大模型抽取处理中
+                <span class="tech-task-tag" style="font-size:11px;font-weight:600;color:#2563eb;background:#dbeafe;padding:2px 8px;border-radius:6px;border:1px solid rgba(37,99,235,0.2)">${escapeHtml(activeTask.filename || activeTask.task_name)}</span>
+              </div>
+              <div class="tech-task-subtitle" style="font-size:12px;color:#64748b;margin-top:2px">后台线程独立运行中 · 离开本页或切换操作不会中断</div>
+            </div>
+          </div>
+          <div class="tech-task-percent-badge" style="font-family:monospace,Consolas;font-size:22px;font-weight:800;color:#2563eb">${pct}%</div>
+        </div>
+
+        <div class="tech-progress-bar-outer" style="width:100%;height:14px;background:#cbd5e1;border-radius:999px;padding:2px;overflow:hidden;margin-bottom:14px;box-shadow:inset 0 1px 3px rgba(0,0,0,0.12)">
+          <div class="tech-progress-bar-inner" style="width:${pct}%;height:100%;background:linear-gradient(90deg, #3b82f6 0%, #6366f1 50%, #8b5cf6 100%);border-radius:999px;transition:width 0.4s ease;box-shadow:0 2px 10px rgba(99,102,241,0.45)"></div>
+        </div>
+
+        <div class="tech-task-footer" style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+          <div class="tech-task-status-text" style="font-size:13px;color:#334155;font-weight:500;display:flex;align-items:center;gap:6px">
+            <span>⚡</span>
+            <span>${escapeHtml(activeTask.progress_message || '正在处理...')}</span>
+          </div>
+          <div class="tech-task-steps" style="display:flex;align-items:center;gap:6px">
+            <span style="font-size:11px;padding:3px 8px;border-radius:6px;background:${pct >= 5 ? '#dbeafe' : '#f1f5f9'};color:${pct >= 5 ? '#1e40af' : '#94a3b8'};font-weight:${pct >= 5 ? '600' : '400'};border:1px solid ${pct >= 5 ? '#93c5fd' : '#e2e8f0'}">1. 准备文件</span>
+            <span style="color:#cbd5e1;font-size:11px">›</span>
+            <span style="font-size:11px;padding:3px 8px;border-radius:6px;background:${pct >= 20 ? '#dbeafe' : '#f1f5f9'};color:${pct >= 20 ? '#1e40af' : '#94a3b8'};font-weight:${pct >= 20 ? '600' : '400'};border:1px solid ${pct >= 20 ? '#93c5fd' : '#e2e8f0'}">2. LLM 抽取</span>
+            <span style="color:#cbd5e1;font-size:11px">›</span>
+            <span style="font-size:11px;padding:3px 8px;border-radius:6px;background:${pct >= 75 ? '#dbeafe' : '#f1f5f9'};color:${pct >= 75 ? '#1e40af' : '#94a3b8'};font-weight:${pct >= 75 ? '600' : '400'};border:1px solid ${pct >= 75 ? '#93c5fd' : '#e2e8f0'}">3. HugeGraph 建图</span>
+            <span style="color:#cbd5e1;font-size:11px">›</span>
+            <span style="font-size:11px;padding:3px 8px;border-radius:6px;background:${pct >= 95 ? '#dbeafe' : '#f1f5f9'};color:${pct >= 95 ? '#1e40af' : '#94a3b8'};font-weight:${pct >= 95 ? '600' : '400'};border:1px solid ${pct >= 95 ? '#93c5fd' : '#e2e8f0'}">4. 完成快照</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function toggleGraphLoadingOverlay(show, text = "正在同步最新拓扑数据…") {
+    const wrapper = content.querySelector("#graph-shell-wrapper") || content.querySelector(".architecture-graph-card .card-body");
+    if (!wrapper) return;
+    let overlay = wrapper.querySelector("#graph-loading-overlay");
+    if (show) {
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "graph-loading-overlay";
+        overlay.style.cssText = "position:absolute;inset:0;z-index:100;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(255,255,255,0.85);backdrop-filter:blur(5px);border-radius:12px;box-shadow:inset 0 0 20px rgba(59,130,246,0.1)";
+        overlay.innerHTML = `
+          <div class="spinner" style="width:34px;height:34px;border-width:3px"></div>
+          <div style="font-size:14px;font-weight:650;color:#1e40af;display:flex;align-items:center;gap:8px">
+            <span>⚡</span>
+            <span>${escapeHtml(text)}</span>
+          </div>
+        `;
+        if (getComputedStyle(wrapper).position === "static") {
+          wrapper.style.position = "relative";
+        }
+        wrapper.appendChild(overlay);
+      } else {
+        const textSpan = overlay.querySelector("span:last-child");
+        if (textSpan) textSpan.textContent = text;
+      }
+    } else {
+      overlay?.remove();
+    }
+  }
+
+  async function refreshSilently() {
+    try {
+      const [graphData, importData] = await Promise.all([
+        api.graph(project.id),
+        api.architectures(project.id),
+      ]);
+      archCache[project.id] = { graph: graphData, imports: importData.items || [] };
+      const changed = graph.nodes.length !== graphData.nodes.length || graph.edges.length !== graphData.edges.length;
+      graph = graphData;
+      imports = importData.items || [];
+      const hasFileSelected = content.querySelector('input[name="file"]')?.files?.length > 0;
+      if (changed && !hasFileSelected) paint();
+    } catch (_) {
+      // Ignore background refresh errors
+    }
+  }
 
   async function load() {
-    content.innerHTML = loading("正在读取架构图谱…");
+    if (!archCache[project.id]) {
+      content.innerHTML = loading("正在读取架构图谱…");
+    }
     try {
       const [graphData, importData] = await Promise.all([
         api.graph(project.id),
@@ -24,13 +119,25 @@ export async function renderArchitecturePage(root, project) {
       ]);
       graph = graphData;
       imports = importData.items || [];
+      archCache[project.id] = { graph, imports };
       selectedNodeNames.clear();
       selectedEdgeKeys.clear();
       paint();
     } catch (error) {
-      content.innerHTML = errorState(error, "retry-architecture");
-      content.querySelector("#retry-architecture")?.addEventListener("click", load);
+      if (!archCache[project.id]) {
+        content.innerHTML = errorState(error, "retry-architecture");
+        content.querySelector("#retry-architecture")?.addEventListener("click", load);
+      }
+    } finally {
+      toggleGraphLoadingOverlay(false);
     }
+  }
+
+  if (archCache[project.id]) {
+    paint();
+    refreshSilently();
+  } else {
+    load();
   }
 
   function paint() {
@@ -47,12 +154,13 @@ export async function renderArchitecturePage(root, project) {
         </div>
       </div>
 
-      <details class="card architecture-import" style="margin-bottom:20px" ${graph.nodes.length === 0 ? "open" : ""}>
+      <details class="card architecture-import" style="margin-bottom:20px" ${graph.nodes.length === 0 || taskManager.hasActiveTask("architecture") ? "open" : ""}>
         <summary><span><strong>从架构描述文本增量抽取 (LLM 大模型)</strong><small>使用本地 Qwen 大模型增量抽取节点与依赖关系</small></span><span>展开上传 ▾</span></summary>
         <div class="card-body">
+          <div id="architecture-task-container">${inPageTaskCardHtml()}</div>
           <form id="architecture-form" class="form-row" style="align-items:end">
-            <div class="field"><label>架构文本文件</label><label class="file-drop" style="min-height:105px"><input type="file" name="file" required accept=".txt,.md,text/plain,text/markdown" /><strong id="architecture-file-label">点击选择架构描述</strong><span>支持 UTF-8 的 .md / .txt</span></label></div>
-            <div class="form-stack"><div class="field"><label for="architecture-name">版本名称（可选）</label><input class="input" id="architecture-name" name="name" maxlength="120" placeholder="例如：生产环境 v2" /></div><button class="button button-primary" id="import-architecture" type="submit">大模型抽取并更新图谱</button></div>
+            <div class="field"><label>架构文本文件</label><div class="file-drop" style="min-height:105px;position:relative"><input type="file" id="architecture-file-input" name="file" accept=".txt,.md,text/plain,text/markdown" style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:2" /><strong id="architecture-file-label">点击选择架构描述</strong><span>支持 UTF-8 的 .md / .txt</span></div></div>
+            <div class="form-stack"><div class="field"><label for="architecture-name">版本名称（可选）</label><input class="input" id="architecture-name" name="name" maxlength="120" placeholder="例如：生产环境 v2" /></div><button class="button button-primary" id="import-architecture" type="submit" ${taskManager.hasActiveTask("architecture") ? "disabled" : ""}>${taskManager.hasActiveTask("architecture") ? "后台处理中..." : "大模型抽取并更新图谱"}</button></div>
           </form>
         </div>
       </details>
@@ -355,25 +463,59 @@ export async function renderArchitecturePage(root, project) {
     }));
 
     const fileInput = content.querySelector('input[name="file"]');
-    fileInput?.addEventListener("change", () => {
-      content.querySelector("#architecture-file-label").textContent = fileInput.files?.[0]?.name || "点击选择架构描述";
+    fileInput?.addEventListener("change", (e) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        selectedArchitectureFile = file;
+        const label = content.querySelector("#architecture-file-label");
+        if (label) label.textContent = file.name;
+      }
     });
+
     content.querySelector("#architecture-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const button = content.querySelector("#import-architecture");
-      const form = new FormData(event.currentTarget);
-      setBusy(button, true, "大模型抽取与写图中…");
+      const file = selectedArchitectureFile || content.querySelector('input[name="file"]')?.files?.[0];
+      if (!file) {
+        toast("请选择有效的架构描述文件 (.md / .txt)", "error");
+        return;
+      }
+
+      const form = new FormData();
+      form.append("file", file);
+      const nameVal = content.querySelector("#architecture-name")?.value;
+      if (nameVal) form.append("name", nameVal);
+
+      setBusy(button, true, "正在启动后台任务…");
       try {
-        const data = await api.importArchitecture(project.id, form);
-        graph = data.graph;
-        imports = (await api.architectures(project.id)).items || [];
-        toast(`架构已更新：${data.architecture.extracted_nodes} 节点 / ${data.architecture.extracted_edges} 关系`);
-        paint();
+        await api.importArchitecture(project.id, form);
+        toast("架构大模型抽取任务已在后台启动！您可以自由切换页面。", "info");
+        selectedArchitectureFile = null;
+        await taskManager.pollNow();
+        const el = content.querySelector("#architecture-task-container");
+        if (el) el.innerHTML = inPageTaskCardHtml();
+        button.disabled = true;
+        button.textContent = "后台处理中...";
+        setBusy(button, false);
       } catch (error) {
         toast(error.message, "error");
         setBusy(button, false);
       }
     });
+
+    const onTaskUpdate = () => {
+      const el = content.querySelector("#architecture-task-container");
+      if (el) el.innerHTML = inPageTaskCardHtml();
+    };
+    const onTaskComplete = async (e) => {
+      if (e.detail?.type === "architecture") {
+        toggleGraphLoadingOverlay(true, "⚡ 架构大模型抽取完成，正在同步并渲染最新拓扑图谱…");
+        delete archCache[project.id];
+        await load();
+      }
+    };
+    taskManager.addEventListener("task:updated", onTaskUpdate);
+    taskManager.addEventListener("task:completed", onTaskComplete);
   }
 
   function bindInspector(inspector) {

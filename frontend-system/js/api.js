@@ -68,6 +68,7 @@ export const api = {
   archiveProject: (id) => request(`/projects/${id}`, { method: "DELETE" }),
   deleteProject: (id) => request(`/projects/${id}`, { method: "DELETE" }),
   dashboard: (id) => request(`/projects/${id}/dashboard`),
+  activeTasks: (id) => request(`/projects/${id}/tasks/active`),
 
   architectures: (id) => request(`/projects/${id}/architectures`),
   importArchitecture: (id, form) => request(`/projects/${id}/architectures/import`, { method: "POST", body: form }),

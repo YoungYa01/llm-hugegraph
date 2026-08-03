@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -391,7 +392,39 @@ def list_architectures(
     }
 
 
-@router.post("/projects/{project_id}/architectures/import", status_code=201)
+async def _run_architecture_import_task(item_id: str, project_id: str, text: str, filename: str) -> None:
+    database = get_system_db()
+    scoped = ProjectScopedGraphClient(project_id)
+    if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
+        HugeGraphRestClient._deleted_node_keys.clear()
+
+    def _on_progress(pct: int, msg: str) -> None:
+        database.update_architecture_progress(item_id, pct, msg)
+
+    try:
+        _on_progress(10, "启动 LLM 大模型抽取引擎...")
+        builder = GraphBuilderService(scoped)
+        extracted, logs = await run_in_threadpool(
+            builder.build_ontology_graph,
+            text,
+            filename,
+            progress_callback=_on_progress,
+        )
+        _on_progress(92, "正在从 HugeGraph 读取最新架构拓扑快照...")
+        graph = await run_in_threadpool(scoped.read_architecture_graph, 3000)
+        database.complete_architecture_import(
+            item_id,
+            len(extracted.get("services") or []),
+            len(extracted.get("calls") or []),
+            json.dumps(logs, ensure_ascii=False),
+            json.dumps(graph.model_dump(), ensure_ascii=False),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Architecture import task failed project=%s item_id=%s", project_id, item_id)
+        database.fail_architecture_import(item_id, str(exc))
+
+
+@router.post("/projects/{project_id}/architectures/import", status_code=202)
 async def import_architecture(
     project_id: str,
     file: UploadFile = File(...),
@@ -412,35 +445,15 @@ async def import_architecture(
         text,
         str(user["id"]),
     )
-    scoped = ProjectScopedGraphClient(project_id)
-    if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
-        HugeGraphRestClient._deleted_node_keys.clear()
-    try:
-        extracted, logs = await run_in_threadpool(
-            GraphBuilderService(scoped).build_ontology_graph,
-            text,
-            filename,
-        )
-        graph = await run_in_threadpool(scoped.read_architecture_graph, 3000)
-        database.complete_architecture_import(
-            str(item["id"]),
-            len(extracted.get("services") or []),
-            len(extracted.get("calls") or []),
-            json.dumps(logs, ensure_ascii=False),
-            json.dumps(graph.model_dump(), ensure_ascii=False),
-        )
-        completed = database.get_architecture_import(str(item["id"])) or item
-        return {
-            "message": "architecture_imported",
-            "architecture": _architecture_result(completed),
-            "extracted": extracted,
-            "execution_logs": logs,
-            "graph": graph.model_dump(),
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Architecture import failed project=%s", project_id)
-        database.fail_architecture_import(str(item["id"]), str(exc))
-        raise HTTPException(status_code=500, detail=f"架构导入失败：{exc}") from exc
+    asyncio.create_task(_run_architecture_import_task(str(item["id"]), project_id, text, filename))
+    return {
+        "message": "architecture_import_started",
+        "task_id": str(item["id"]),
+        "architecture": _architecture_result(item),
+        "status": "processing",
+        "progress": 5,
+        "progress_message": "文件已接收，准备大模型抽取...",
+    }
 
 
 @router.get("/projects/{project_id}/graph")
@@ -763,7 +776,58 @@ def _persist_incidents(
     return saved
 
 
-@router.post("/projects/{project_id}/logs/analyze", status_code=201)
+async def _run_log_analysis_task(
+    batch_id: str,
+    project_id: str,
+    user_id: str,
+    input_path: Path,
+    output_dir: Path,
+    train_path: Path | None,
+    total_t0: float,
+) -> None:
+    database = get_system_db()
+    try:
+        database.update_log_batch_progress(batch_id, 20, "正在进行日志结构化解析与滑动窗口异常挖掘...")
+        runner = LogFaultRunner()
+        summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
+
+        database.update_log_batch_progress(batch_id, 65, "正在结合 HugeGraph 拓扑做图谱 RCA 根因推理...")
+        scoped = ProjectScopedGraphClient(project_id)
+        imported = await run_in_threadpool(
+            IncidentGraphIntegrator(scoped).import_path,
+            output_dir,
+            input_path.name,
+            batch_id[:12],
+        )
+        import_data = imported.model_dump()
+
+        database.update_log_batch_progress(batch_id, 88, "持久化故障事件与 RCA 诊断结论...")
+        await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
+        details = _load_details(output_dir)
+        _persist_incidents(
+            database,
+            project_id,
+            batch_id,
+            user_id,
+            details,
+            import_data.get("rca") or [],
+        )
+
+        total_duration = round(time.perf_counter() - total_t0, 2)
+        if isinstance(summary, dict):
+            summary["duration_seconds"] = total_duration
+
+        database.complete_log_batch(
+            batch_id,
+            json.dumps(summary, ensure_ascii=False),
+            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)
+        database.fail_log_batch(batch_id, str(exc))
+
+
+@router.post("/projects/{project_id}/logs/analyze", status_code=202)
 async def analyze_project_logs(
     project_id: str,
     file: UploadFile = File(...),
@@ -796,52 +860,26 @@ async def analyze_project_logs(
         str(user["id"]),
         batch_id=batch_id,
     )
-    try:
-        runner = LogFaultRunner()
-        summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
-        scoped = ProjectScopedGraphClient(project_id)
-        imported = await run_in_threadpool(
-            IncidentGraphIntegrator(scoped).import_path,
-            output_dir,
-            input_path.name,
-            batch_id[:12],
-        )
-        import_data = imported.model_dump()
-        await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
-        details = _load_details(output_dir)
-        incidents = _persist_incidents(
-            database,
-            project_id,
-            batch_id,
-            str(user["id"]),
-            details,
-            import_data.get("rca") or [],
-        )
+    asyncio.create_task(_run_log_analysis_task(batch_id, project_id, str(user["id"]), input_path, output_dir, train_path, total_t0))
+    return {
+        "message": "log_analysis_started",
+        "task_id": batch_id,
+        "batch": _batch_result(batch),
+        "status": "processing",
+        "progress": 5,
+        "progress_message": "日志包接收完成，准备执行分析...",
+    }
 
-        # 准确计算涵盖：算法日志检测 + HugeGraph 306节点/1057关系图谱写入 + SQLite落盘 的全流程真实总时长
-        total_duration = round(time.perf_counter() - total_t0, 2)
-        if isinstance(summary, dict):
-            summary["duration_seconds"] = total_duration
 
-        database.complete_log_batch(
-            batch_id,
-            json.dumps(summary, ensure_ascii=False),
-            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
-        )
-        completed = database.get_log_batch(batch_id) or batch
-        return {
-            "message": "log_analyzed",
-            "batch": _batch_result(completed),
-            "summary": summary,
-            "incidents": incidents,
-            "integration": {
-                key: value for key, value in import_data.items() if key != "rca"
-            },
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Log analysis failed project=%s batch=%s", project_id, batch_id)
-        database.fail_log_batch(batch_id, str(exc))
-        raise HTTPException(status_code=500, detail=f"日志分析失败：{exc}") from exc
+@router.get("/projects/{project_id}/tasks/active")
+def get_active_tasks(
+    project_id: str,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    _project_for_user(project_id, user, database)
+    tasks = database.get_active_tasks(project_id)
+    return {"active_tasks": tasks}
 
 
 @router.get("/projects/{project_id}/logs/{batch_id}")

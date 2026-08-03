@@ -27,7 +27,7 @@ def main() -> None:
     handler = partial(NoCacheRequestHandler, directory=str(frontend_dir))
     server = ThreadingHTTPServer((args.bind, args.port), handler)
     print(f"LogScope RCA 管理端：http://127.0.0.1:{args.port}", flush=True)
-    print("当前界面版本：2026.07.21-r2（已禁用浏览器缓存）", flush=True)
+    print("当前界面版本：2026.08.03-r1（已禁用浏览器缓存）", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

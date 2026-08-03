@@ -2,6 +2,7 @@ import { hasSession, restoreSession, signOut, user } from "./auth.js";
 import { navigate, onRouteChange, route } from "./router.js";
 import { bindShell } from "./shell.js";
 import { loadProject } from "./state.js";
+import { taskManager } from "./taskManager.js";
 import { errorState, loading, toast } from "./ui.js";
 import { renderAuthPage } from "./pages/auth-page.js";
 import { renderProjectsPage } from "./pages/projects-page.js";
@@ -35,6 +36,7 @@ async function render(nextRoute = route()) {
   root.innerHTML = `<div class="state-panel" style="min-height:100vh">${loading("正在进入项目…")}</div>`;
   try {
     const project = await loadProject(nextRoute.params.projectId);
+    taskManager.setProject(project.id);
     if (version !== renderVersion) return;
     if (nextRoute.name === "overview") await renderOverviewPage(root, project);
     else if (nextRoute.name === "architecture") await renderArchitecturePage(root, project);

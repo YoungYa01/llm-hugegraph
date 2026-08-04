@@ -607,10 +607,12 @@ export async function renderArchitecturePage(root, project) {
       <div class="notice">依赖边必须按“调用方 → 被依赖方”录入；根因页面会按相反方向展示故障传播。</div>
       <div style="display:flex;justify-content:flex-end;gap:9px"><button type="button" class="button button-secondary" data-close>取消</button><button class="button button-primary" id="save-edge" type="submit">保存关系</button></div>
     </form>`);
+    const sourceSelect = modal.querySelector('select[name="source"]');
+    const targetSelect = modal.querySelector('select[name="target"]');
     const defaultSource = edge?.source || (selectedNode ? selectedNode.name : graph.nodes[0].name);
     const defaultTarget = edge?.target || (graph.nodes.find(n => n.name !== defaultSource)?.name || graph.nodes[1]?.name);
-    sourceSelect.value = defaultSource;
-    targetSelect.value = defaultTarget;
+    if (sourceSelect) sourceSelect.value = defaultSource;
+    if (targetSelect) targetSelect.value = defaultTarget;
     modal.querySelector("#edge-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const values = Object.fromEntries(new FormData(event.currentTarget));

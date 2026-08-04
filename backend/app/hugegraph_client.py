@@ -323,15 +323,38 @@ class HugeGraphRestClient:
         del_keys.discard(name)
         del_keys.discard(clean_name)
 
+        # PRIMARY_KEY vertex labels reject a second POST for the same name.
+        # Resolve the exact vertex first so manual creation and repeated imports
+        # behave as a real upsert instead of relying on server-specific errors.
+        existing = self.find_node_by_name(name)
+        if existing:
+            return self.update_node_by_id(
+                str(existing.get("id") or ""),
+                name,
+                layer,
+                kind,
+                description,
+                source_file,
+                meta,
+            )
+
         payload = self._node_payload(name, layer, kind, description, source_file, meta)
         try:
             return self._request("POST", "graph/vertices", json_body=payload, expected=(200, 201, 202))
-        except HugeGraphRestError as exc:
-            msg = str(exc).lower()
-            if "exist" in msg or "duplicate" in msg or "already" in msg:
-                existing = self.find_node_by_name(name)
-                if existing:
-                    return self.update_node_by_id(str(existing.get("id") or ""), name, layer, kind, description, source_file, meta)
+        except HugeGraphRestError:
+            # A concurrent writer may have inserted the same primary key after
+            # our pre-check. Re-resolve it before surfacing the create error.
+            existing = self.find_node_by_name(name)
+            if existing:
+                return self.update_node_by_id(
+                    str(existing.get("id") or ""),
+                    name,
+                    layer,
+                    kind,
+                    description,
+                    source_file,
+                    meta,
+                )
             raise
 
     def _encoded_id_candidates(self, vertex_id: str) -> list[str]:
@@ -411,18 +434,25 @@ class HugeGraphRestClient:
     def delete_node_by_name(self, name: str) -> bool:
         self.ensure_schema()
         clean_name = name.split("::")[-1] if "::" in name else name
+        scoped_name = name.startswith("project::")
         existing = self.find_node_by_name(name)
-        if not existing:
+        if not existing and not scoped_name:
             existing = self.find_node_by_name(clean_name)
         
         if not hasattr(HugeGraphRestClient, "_deleted_node_keys"):
             HugeGraphRestClient._deleted_node_keys = set()
         HugeGraphRestClient._deleted_node_keys.add(name)
-        HugeGraphRestClient._deleted_node_keys.add(clean_name)
+        if not scoped_name:
+            HugeGraphRestClient._deleted_node_keys.add(clean_name)
 
         if not existing:
             if hasattr(self, "_memory_nodes"):
-                self._memory_nodes = [n for n in self._memory_nodes if n.get("name") not in (name, clean_name) and n.get("id") not in (name, clean_name)]
+                keys = {name} if scoped_name else {name, clean_name}
+                self._memory_nodes = [
+                    n
+                    for n in self._memory_nodes
+                    if n.get("name") not in keys and n.get("id") not in keys
+                ]
             return True
 
         vertex_id = str(existing.get("id") or "")
@@ -437,7 +467,12 @@ class HugeGraphRestClient:
                     pass
 
         if hasattr(self, "_memory_nodes"):
-            self._memory_nodes = [n for n in self._memory_nodes if n.get("name") not in (name, clean_name) and n.get("id") not in (name, clean_name)]
+            keys = {name, vertex_id} if scoped_name else {name, clean_name, vertex_id}
+            self._memory_nodes = [
+                n
+                for n in self._memory_nodes
+                if n.get("name") not in keys and n.get("id") not in keys
+            ]
 
         for encoded in self._encoded_id_candidates(vertex_id):
             try:
@@ -447,15 +482,24 @@ class HugeGraphRestClient:
         return True
 
     def find_node_by_name(self, name: str) -> dict[str, Any] | None:
-        clean_name = name.split("::")[-1] if "::" in name else name
-        for vertex in self.list_vertices(limit=10000):
+        vertices = self.list_vertices(limit=10000)
+        # A scoped name such as project::p1::order must never fall back to the
+        # display name "order", otherwise it can resolve project::p2::order.
+        scoped_name = name.startswith("project::")
+        for vertex in vertices:
             v_id = str(vertex.get("id") or "")
             props = vertex.get("properties") or {}
             v_name = str(props.get(self.pk_name) or "")
+            if name in (v_name, v_id):
+                return vertex
+        if scoped_name:
+            return None
+
+        for vertex in vertices:
+            props = vertex.get("properties") or {}
             meta = _json_dict(props.get(self.pk_meta))
             display_name = str(meta.get("display_name") or "")
-
-            if name in (v_name, v_id, display_name) or clean_name in (v_name, v_id, display_name):
+            if name and name == display_name:
                 return vertex
         return None
 
@@ -577,11 +621,7 @@ class HugeGraphRestClient:
             props = v.get("properties", {}) or {}
             node_id = str(v.get("id"))
             name = str(props.get(self.pk_name) or node_id)
-            meta = _json_dict(props.get(self.pk_meta))
-            display = str(meta.get("display_name") or "")
-            clean = name.split("::")[-1] if "::" in name else name
-
-            if name in del_keys or node_id in del_keys or display in del_keys or clean in del_keys:
+            if name in del_keys or node_id in del_keys:
                 continue
 
             id_to_name[node_id] = name

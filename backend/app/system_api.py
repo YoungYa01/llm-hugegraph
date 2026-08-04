@@ -159,11 +159,15 @@ def register(payload: RegisterRequest) -> dict[str, Any]:
     database = get_system_db()
     if not settings.allow_registration and database.user_count() > 0:
         raise HTTPException(status_code=403, detail="系统已关闭自助注册")
+    employee_id = payload.employee_id.strip()
+    if not employee_id:
+        raise HTTPException(status_code=422, detail="工号不能为空")
     try:
         user = database.create_user(
             payload.username.strip(),
             hash_password(payload.password),
             payload.display_name.strip(),
+            employee_id,
         )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="用户名已存在") from exc
@@ -223,6 +227,7 @@ def list_users(
 
 class ProfileUpdateRequest(BaseModel):
     display_name: str = Field("", max_length=120)
+    employee_id: str | None = Field(None, max_length=64)
     old_password: str = Field("", max_length=120)
     new_password: str = Field("", max_length=120)
 
@@ -246,10 +251,14 @@ def update_own_profile(
         new_hash = hash_password(payload.new_password.strip())
 
     display_name = payload.display_name.strip() if payload.display_name.strip() else None
+    employee_id = payload.employee_id.strip() if payload.employee_id is not None else None
+    if payload.employee_id is not None and not employee_id:
+        raise HTTPException(status_code=400, detail="工号不能为空")
 
     updated = database.update_user_profile(
         user_id,
         display_name=display_name,
+        employee_id=employee_id,
         password_hash=new_hash,
     )
     return {"user": public_user(updated or user)}
@@ -257,6 +266,7 @@ def update_own_profile(
 
 class AdminUserUpdateRequest(BaseModel):
     display_name: str = Field("", max_length=120)
+    employee_id: str | None = Field(None, max_length=64)
     role: str = Field("user", max_length=20)
     is_active: int = Field(1)
     new_password: str = Field("", max_length=120)
@@ -290,10 +300,14 @@ def update_user(
         new_hash = hash_password(payload.new_password.strip())
 
     display_name = payload.display_name.strip() if payload.display_name.strip() else None
+    employee_id = payload.employee_id.strip() if payload.employee_id is not None else None
+    if payload.employee_id is not None and not employee_id:
+        raise HTTPException(status_code=400, detail="工号不能为空")
 
     updated = database.update_user_profile(
         user_id,
         display_name=display_name,
+        employee_id=employee_id,
         role=payload.role,
         is_active=payload.is_active,
         password_hash=new_hash,
@@ -392,7 +406,13 @@ def list_architectures(
     }
 
 
-async def _run_architecture_import_task(item_id: str, project_id: str, text: str, filename: str) -> None:
+async def _run_architecture_import_task(
+    item_id: str,
+    project_id: str,
+    text: str,
+    filename: str,
+    employee_id: str,
+) -> None:
     database = get_system_db()
     scoped = ProjectScopedGraphClient(project_id)
     if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
@@ -403,7 +423,7 @@ async def _run_architecture_import_task(item_id: str, project_id: str, text: str
 
     try:
         _on_progress(10, "启动 LLM 大模型抽取引擎...")
-        builder = GraphBuilderService(scoped)
+        builder = GraphBuilderService(scoped, employee_id=employee_id)
         extracted, logs = await run_in_threadpool(
             builder.build_ontology_graph,
             text,
@@ -433,6 +453,9 @@ async def import_architecture(
 ) -> dict[str, Any]:
     database = get_system_db()
     _project_for_user(project_id, user, database)
+    employee_id = str(user.get("employee_id") or "").strip()
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="当前账号未设置工号，请先在个人账号设置中补充")
     raw = await _read_upload(file)
     filename = _clean_name(file.filename, "architecture.md")
     text = raw.decode("utf-8", errors="replace").strip()
@@ -445,7 +468,15 @@ async def import_architecture(
         text,
         str(user["id"]),
     )
-    asyncio.create_task(_run_architecture_import_task(str(item["id"]), project_id, text, filename))
+    asyncio.create_task(
+        _run_architecture_import_task(
+            str(item["id"]),
+            project_id,
+            text,
+            filename,
+            employee_id,
+        )
+    )
     return {
         "message": "architecture_import_started",
         "task_id": str(item["id"]),
@@ -780,6 +811,7 @@ async def _run_log_analysis_task(
     batch_id: str,
     project_id: str,
     user_id: str,
+    employee_id: str,
     input_path: Path,
     output_dir: Path,
     train_path: Path | None,
@@ -794,7 +826,7 @@ async def _run_log_analysis_task(
         database.update_log_batch_progress(batch_id, 65, "正在结合 HugeGraph 拓扑做图谱 RCA 根因推理...")
         scoped = ProjectScopedGraphClient(project_id)
         imported = await run_in_threadpool(
-            IncidentGraphIntegrator(scoped).import_path,
+            IncidentGraphIntegrator(scoped, employee_id=employee_id).import_path,
             output_dir,
             input_path.name,
             batch_id[:12],
@@ -837,6 +869,9 @@ async def analyze_project_logs(
     total_t0 = time.perf_counter()
     database = get_system_db()
     _project_for_user(project_id, user, database)
+    employee_id = str(user.get("employee_id") or "").strip()
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="当前账号未设置工号，请先在个人账号设置中补充")
     raw = await _read_upload(file)
     train_raw = await _read_upload(train_file) if train_file is not None else None
 
@@ -860,7 +895,18 @@ async def analyze_project_logs(
         str(user["id"]),
         batch_id=batch_id,
     )
-    asyncio.create_task(_run_log_analysis_task(batch_id, project_id, str(user["id"]), input_path, output_dir, train_path, total_t0))
+    asyncio.create_task(
+        _run_log_analysis_task(
+            batch_id,
+            project_id,
+            str(user["id"]),
+            employee_id,
+            input_path,
+            output_dir,
+            train_path,
+            total_t0,
+        )
+    )
     return {
         "message": "log_analysis_started",
         "task_id": batch_id,

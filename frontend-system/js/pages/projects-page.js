@@ -307,7 +307,7 @@ export async function renderProjectsPage(root, { onLogout }) {
               <table class="table">
                 <thead>
                   <tr>
-                    <th>用户名 / 显示名</th>
+                    <th>用户名 / 显示名 / 工号</th>
                     <th>账号角色</th>
                     <th>账号状态</th>
                     <th>注册时间</th>
@@ -323,6 +323,7 @@ export async function renderProjectsPage(root, { onLogout }) {
                           <div>
                             <strong style="display:block;font-size:13px">${escapeHtml(u.username)}</strong>
                             <span style="font-size:11px;color:var(--ink-500)">${escapeHtml(u.display_name || u.username)}</span>
+                            <span style="display:block;font-size:11px;color:var(--ink-500)">工号：${escapeHtml(u.employee_id || "未设置")}</span>
                           </div>
                         </div>
                       </td>
@@ -443,6 +444,11 @@ function showProfileModal(root) {
             <label for="profile-display-name">显示姓名 / 团队称呼</label>
             <input class="input" id="profile-display-name" name="display_name" value="${escapeHtml(account.display_name || account.username)}" required maxlength="120" />
           </div>
+          <div class="field">
+            <label for="profile-employee-id">工号</label>
+            <input class="input" id="profile-employee-id" name="employee_id" value="${escapeHtml(account.employee_id || "")}" required maxlength="64" />
+            <span class="field-hint">远程大模型请求将使用该工号作为 X-Ai-Coding-Key</span>
+          </div>
           <hr style="border:none;border-top:1px solid var(--border);margin:14px 0" />
           <span style="font-size:12px;font-weight:700;color:var(--ink-800);display:block;margin-bottom:8px">修改密码 (不填写则保持原密码不变)</span>
           <div class="field">
@@ -502,6 +508,10 @@ function showAdminEditUserModal(root, targetUser, onUpdated) {
           <div class="field">
             <label for="admin-user-display">显示姓名 / 团队称呼</label>
             <input class="input" id="admin-user-display" name="display_name" value="${escapeHtml(targetUser.display_name || targetUser.username)}" required />
+          </div>
+          <div class="field">
+            <label for="admin-user-employee-id">工号</label>
+            <input class="input" id="admin-user-employee-id" name="employee_id" value="${escapeHtml(targetUser.employee_id || "")}" required maxlength="64" />
           </div>
           <div class="field">
             <label for="admin-user-role">账号角色</label>

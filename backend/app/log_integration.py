@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import copy
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import csv
 import importlib
 import json
@@ -70,7 +66,7 @@ class IncidentGraphIntegrator:
     - a directory containing those result files
     """
 
-    def __init__(self, db: HugeGraphRestClient | None = None) -> None:
+    def __init__(self, db: HugeGraphRestClient | None = None, employee_id: str = "") -> None:
         self.settings = get_settings()
         self.db = db or HugeGraphRestClient()
         self.logs: list[str] = []
@@ -83,7 +79,6 @@ class IncidentGraphIntegrator:
         self._buffer_graph_writes = False
         self._pending_nodes: dict[str, PendingGraphNode] = {}
         self._pending_edges: dict[tuple[str, str, str], PendingGraphEdge] = {}
-        self._decision_local = threading.local()
         self._unresolved_services: set[str] = set()
         self.pruning_stats: dict[str, int] = {
             "timeline_events_total": 0,
@@ -95,7 +90,9 @@ class IncidentGraphIntegrator:
             "orphan_nodes_skipped": 0,
             "invalid_edges_skipped": 0,
         }
-        self.decision_service = RcaDecisionService()
+        # One service instance belongs to one uploaded log batch. Its first
+        # request creates a conversation and every later incident reuses it.
+        self.decision_service = RcaDecisionService(employee_id=employee_id)
 
     def import_path(
         self,
@@ -289,35 +286,12 @@ class IncidentGraphIntegrator:
                 }
             )
 
-        workers = min(
-            max(1, int(getattr(self.settings, "rca_decision_max_workers", 3))),
-            max(1, len(prepared)),
-        )
         decisions: dict[int, dict[str, Any]] = {}
-        if workers <= 1 or len(prepared) <= 1:
-            for item in prepared:
-                decisions[item["index"]] = self.decision_service.enrich(item["detail"], item["data"])
-                self._begin_graph_buffer()
-                self._import_one(item["detail"], source_name, item["rca"])
-                self._flush_graph_buffer()
-        else:
-            self.logs.append(f"RCA LLM 决策启用有限并发: incidents={len(prepared)}, workers={workers}")
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rca-decision") as executor:
-                future_map = {
-                    executor.submit(self._run_decision, item["detail"], item["data"]): item["index"]
-                    for item in prepared
-                }
-                # Keep HugeGraph writes single-threaded while LLM requests overlap.
-                for item in prepared:
-                    self._begin_graph_buffer()
-                    self._import_one(item["detail"], source_name, item["rca"])
-                    self._flush_graph_buffer()
-                for future in as_completed(future_map):
-                    index = future_map[future]
-                    try:
-                        decisions[index] = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        decisions[index] = self._decision_failure_fallback(prepared[index]["data"], exc)
+        for item in prepared:
+            decisions[item["index"]] = self.decision_service.enrich(item["detail"], item["data"])
+            self._begin_graph_buffer()
+            self._import_one(item["detail"], source_name, item["rca"])
+            self._flush_graph_buffer()
 
         for item in prepared:
             item["data"]["llm_decision"] = decisions.get(
@@ -331,19 +305,6 @@ class IncidentGraphIntegrator:
             + ", ".join(f"{key}={value}" for key, value in self.pruning_stats.items())
             + f", unresolved_services_skipped={len(self._unresolved_services)}"
         )
-
-    def _run_decision(self, detail: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
-        service = getattr(self._decision_local, "service", None)
-        if service is None:
-            worker_settings = copy.copy(self.settings)
-            if bool(getattr(self.settings, "rca_decision_isolate_conversations", True)):
-                try:
-                    worker_settings.rca_decision_conversation_id = ""
-                except Exception:
-                    pass
-            service = RcaDecisionService(settings=worker_settings)
-            self._decision_local.service = service
-        return service.enrich(detail, analysis)
 
     def _decision_failure_fallback(self, analysis: dict[str, Any], exc: Exception) -> dict[str, Any]:
         hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
@@ -895,7 +856,7 @@ class LogFaultRunner:
                     [
                         f"- 最可能原因：{decision.get('selected_candidate') or '未选择'}",
                         f"- 原因摘要：{decision.get('most_likely_reason') or ''}",
-                        f"- 排查方法：",
+                        "- 排查方法：",
                     ]
                 )
                 for item in decision.get("troubleshooting_methods") or []:

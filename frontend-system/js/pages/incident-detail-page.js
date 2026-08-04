@@ -1,5 +1,6 @@
 import { api } from "../api.js";
 import { graphLegend, renderGraph } from "../graph-view.js";
+import { filterIncidentGraph } from "../graph-semantics.js";
 import { projectShell } from "../shell.js";
 import { badge, errorState, escapeHtml, formatConfidence, formatDate, loading, setBusy, toast } from "../ui.js";
 
@@ -35,6 +36,8 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
   }
 
   function paint() {
+    graphController?.destroy();
+    graphController = null;
     const analysis = incident.analysis || {};
     const detail = incident.detail || {};
     const llmDecision = analysis.llm_decision || {};
@@ -55,6 +58,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       ? llmDecision.troubleshooting_methods
       : (top.validation_suggestions || []).map((item) => item.title || item.reason || item.check_id).filter(Boolean);
     const llmConfidence = llmDecision.confidence || top.confidence;
+    const displayGraph = filterIncidentGraph(fusionGraph, includeEvents);
     content.innerHTML = `
       <div class="page-header">
         <div><a class="link" href="#/projects/${project.id}/incidents">← 返回故障列表</a><h1 style="margin-top:12px">${escapeHtml(incident.title)}</h1><p>${escapeHtml(incident.external_incident_id)} · 发现于 ${formatDate(incident.created_at)}</p></div>
@@ -87,7 +91,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
         <div class="card-body">
           ${fusionError ? `<div class="notice notice-warning" style="margin-bottom:12px">融合图暂不可用：${escapeHtml(fusionError)}。下方持久化 RCA 结论仍可正常查看。</div>` : ""}
           ${fusionGraph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(fusionGraph.warnings.join("；"))}</div>` : ""}
-          ${fusionGraph.nodes.length ? `<div class="graph-shell graph-shell-fusion"><div id="fusion-graph-canvas"></div><div class="graph-toolbar"><button class="button button-ghost button-small" id="fusion-zoom-out">−</button><button class="button button-ghost button-small" id="fusion-zoom-reset">复位</button><button class="button button-ghost button-small" id="fusion-zoom-in">＋</button></div><div class="graph-legend">${graphLegend(true)}</div></div><div class="notice" id="fusion-selection" style="margin-top:10px">点击图中的节点或连线查看它在本次根因定位中的属性。</div>` : `<div class="empty-state"><div class="empty-icon">◇</div><h3>尚未读取到融合子图</h3><p>请确认 HugeGraph 中仍保留该日志批次的动态节点。</p></div>`}
+          ${displayGraph.nodes.length ? `<div class="notice notice-warning graph-semantic-warning" id="fusion-semantic-warning" hidden></div><div class="graph-shell graph-shell-fusion"><div id="fusion-graph-canvas"></div><div class="graph-toolbar"><button class="button button-ghost button-small graph-icon-button" id="fusion-zoom-out" title="缩小" aria-label="缩小">−</button><button class="button button-ghost button-small" id="fusion-fit" title="适应画布">适应</button><button class="button button-ghost button-small graph-icon-button" id="fusion-zoom-in" title="放大" aria-label="放大">＋</button><button class="button button-ghost button-small" id="fusion-relayout" title="清除固定位置并重新布局">重排</button><button class="button button-secondary button-small" id="toggle-event-nodes">${includeEvents ? "收起证据" : "展开证据"}</button></div><div class="graph-legend">${graphLegend(true, true)}</div></div><div class="notice" id="fusion-selection" style="margin-top:10px">点击图中的节点或连线查看它在本次根因定位中的属性。</div>` : `<div class="empty-state"><div class="empty-icon">◇</div><h3>尚未读取到融合子图</h3><p>请确认 HugeGraph 中仍保留该日志批次的动态节点。</p></div>`}
         </div>
       </section>
 
@@ -119,12 +123,15 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
         </aside>
       </div>`;
     bind();
-    renderFusionGraph();
+    renderFusionGraph(displayGraph, analysis);
   }
-  function renderFusionGraph() {
+  function renderFusionGraph(displayGraph, analysis) {
     const canvas = content.querySelector("#fusion-graph-canvas");
-    if (!canvas || !fusionGraph.nodes.length) return;
-    graphController = renderGraph(canvas, fusionGraph, {
+    if (!canvas || !displayGraph.nodes.length) return;
+    graphController = renderGraph(canvas, displayGraph, {
+      mode: "incident",
+      hypotheses: analysis.hypotheses || [],
+      llmDecision: analysis.llm_decision || {},
       onSelect: (node, edges) => {
         const panel = content.querySelector("#fusion-selection");
         panel.innerHTML = `<strong>${escapeHtml(node.name)}</strong> · ${escapeHtml(node.kind)}<br>${escapeHtml(node.description || "暂无描述")}<br><small>相邻关系：${edges.length}</small>`;
@@ -134,12 +141,19 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
         panel.innerHTML = `<strong>${escapeHtml(edge.source)} —[${escapeHtml(edge.type)}]→ ${escapeHtml(edge.target)}</strong><br>${escapeHtml(edge.description || "暂无关系说明")}`;
       },
     });
+    const semanticWarnings = graphController?.semantics?.warnings || [];
+    const warningPanel = content.querySelector("#fusion-semantic-warning");
+    if (warningPanel && semanticWarnings.length) {
+      warningPanel.hidden = false;
+      warningPanel.innerHTML = semanticWarnings.map((warning) => `<div>${escapeHtml(warning)}</div>`).join("");
+    }
   }
 
   function bind() {
     content.querySelector("#fusion-zoom-in")?.addEventListener("click", () => graphController?.zoomIn());
     content.querySelector("#fusion-zoom-out")?.addEventListener("click", () => graphController?.zoomOut());
-    content.querySelector("#fusion-zoom-reset")?.addEventListener("click", () => graphController?.reset());
+    content.querySelector("#fusion-fit")?.addEventListener("click", () => graphController?.fit());
+    content.querySelector("#fusion-relayout")?.addEventListener("click", () => graphController?.relayout());
     content.querySelector("#toggle-event-nodes")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       setBusy(button, true, includeEvents ? "正在收起…" : "正在加载事件…");

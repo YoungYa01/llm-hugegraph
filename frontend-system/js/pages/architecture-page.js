@@ -13,6 +13,8 @@ export async function renderArchitecturePage(root, project) {
   let controller = null;
 
   async function load() {
+    controller?.destroy();
+    controller = null;
     content.innerHTML = loading("正在读取架构图谱…");
     try {
       const [graphData, importData] = await Promise.all([
@@ -29,6 +31,8 @@ export async function renderArchitecturePage(root, project) {
   }
 
   function paint() {
+    controller?.destroy();
+    controller = null;
     selectedNode = null;
     selectedEdge = null;
     content.innerHTML = `
@@ -52,7 +56,7 @@ export async function renderArchitecturePage(root, project) {
         <div class="card-body">
           ${graph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(graph.warnings.join("；"))}</div>` : ""}
           ${graph.nodes.length ? `<div class="architecture-canvas-layout">
-            <div class="graph-shell graph-shell-primary"><div id="graph-canvas"></div><div class="graph-quick-actions" id="graph-quick-actions"><strong>点选节点或关系</strong><span>选中后可在这里直接编辑、删除</span></div><div class="graph-toolbar"><button class="button button-ghost button-small" id="zoom-out">−</button><button class="button button-ghost button-small" id="zoom-reset">复位</button><button class="button button-ghost button-small" id="zoom-in">＋</button></div><div class="graph-legend">${graphLegend(false)}</div></div>
+            <div class="graph-shell graph-shell-primary"><div id="graph-canvas"></div><div class="graph-quick-actions" id="graph-quick-actions"><strong>点选节点或关系</strong><span>拖动节点调整位置，拖动画布浏览图谱</span></div><div class="graph-toolbar"><button class="button button-ghost button-small graph-icon-button" id="zoom-out" title="缩小" aria-label="缩小">−</button><button class="button button-ghost button-small" id="fit-graph" title="适应画布">适应</button><button class="button button-ghost button-small graph-icon-button" id="zoom-in" title="放大" aria-label="放大">＋</button><button class="button button-ghost button-small" id="relayout-graph" title="清除固定位置并重新布局">重排</button></div><div class="graph-legend">${graphLegend(false)}</div></div>
             <aside class="graph-selection-panel"><div id="selection-inspector">${selectionHtml()}</div></aside>
           </div>` : emptyState("架构图谱还是空的", "导入架构描述，或手工新增第一个架构节点。", '<button class="button button-primary" id="empty-add-node">新增节点</button>')}
         </div>
@@ -68,6 +72,7 @@ export async function renderArchitecturePage(root, project) {
     bind();
     if (graph.nodes.length) {
       controller = renderGraph(content.querySelector("#graph-canvas"), graph, {
+        mode: "architecture",
         onSelect: (node, edges) => {
           selectedNode = node;
           selectedEdge = null;
@@ -108,7 +113,8 @@ export async function renderArchitecturePage(root, project) {
   function bind() {
     content.querySelector("#zoom-in")?.addEventListener("click", () => controller?.zoomIn());
     content.querySelector("#zoom-out")?.addEventListener("click", () => controller?.zoomOut());
-    content.querySelector("#zoom-reset")?.addEventListener("click", () => controller?.reset());
+    content.querySelector("#fit-graph")?.addEventListener("click", () => controller?.fit());
+    content.querySelector("#relayout-graph")?.addEventListener("click", () => controller?.relayout());
     content.querySelector("#refresh-graph")?.addEventListener("click", load);
     content.querySelectorAll("#add-node, #table-add-node, #empty-add-node").forEach((button) => button.addEventListener("click", () => showNodeModal()));
     content.querySelectorAll("#add-edge, #table-add-edge").forEach((button) => button.addEventListener("click", () => showEdgeModal()));

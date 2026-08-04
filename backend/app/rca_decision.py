@@ -237,12 +237,13 @@ class RcaDecisionService:
         if not steps:
             steps = list(fallback["troubleshooting_methods"])
 
-        reason = str(
+        reason = self._normalize_reason_analysis(
             parsed.get("most_likely_reason")
             or parsed.get("reason")
             or parsed.get("summary")
-            or fallback["most_likely_reason"]
-        ).strip()
+        )
+        if not reason:
+            reason = list(fallback["most_likely_reason"])
         fault_mode = str(
             parsed.get("selected_fault_mode")
             or self._fault_mode_by_rank(hypotheses, rank)
@@ -271,7 +272,7 @@ class RcaDecisionService:
             "selected_candidate": str(top.get("candidate") or ""),
             "selected_candidate_rank": self._safe_int(top.get("rank")) or 0,
             "selected_fault_mode": str(top.get("fault_mode") or ""),
-            "most_likely_reason": str(top.get("summary") or analysis.get("decision") or ""),
+            "most_likely_reason": self._fallback_reason_analysis(top, analysis),
             "troubleshooting_methods": steps,
             "confidence": top.get("confidence"),
             "source": source,
@@ -293,6 +294,41 @@ class RcaDecisionService:
             elif str(item).strip():
                 steps.append(str(item).strip())
         return steps[:8]
+
+    def _normalize_reason_analysis(self, value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            items: list[dict[str, Any]] = []
+            for item in value:
+                normalized = self._normalize_reason_item(item)
+                if normalized:
+                    items.append(normalized)
+            return items
+        normalized = self._normalize_reason_item(value)
+        return [normalized] if normalized else []
+
+    def _normalize_reason_item(self, value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            title = str(value.get("title") or value.get("summary") or value.get("reason") or "").strip()
+            evidence = self._normalize_steps(value.get("evidence"))
+            if title:
+                return {"title": title, "evidence": evidence[:5]}
+            return None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return {"title": text, "evidence": []}
+
+    def _fallback_reason_analysis(
+        self,
+        top: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        title = str(top.get("summary") or analysis.get("decision") or "暂无可展示的最可能原因").strip()
+        evidence = self._normalize_steps(top.get("evidence"))
+        evidence.extend(self._normalize_steps(top.get("reasons")))
+        return [{"title": title, "evidence": list(dict.fromkeys(evidence))[:5]}]
 
     def _normalize_steps(self, value: Any) -> list[str]:
         if value is None:
@@ -381,7 +417,7 @@ class RcaDecisionService:
             "\"selected_candidate\":\"候选名称\","
             "\"selected_candidate_rank\":1,"
             "\"selected_fault_mode\":\"故障模式\","
-            "\"most_likely_reason\":\"为什么它最可能\","
+            "\"most_likely_reason\":[{\"title\":\"Redis 主节点不可用\",\"evidence\":[\"连接被拒绝日志集中在 10.0.1.5:6379\",\"Sentinel 日志显示主节点标记为 down\",\"上游服务超时时间窗口与 Redis 故障时间吻合\"]}],"
             "\"troubleshooting_methods\":[\"排查步骤1\",\"排查步骤2\"],"
             "\"confidence\":0.0,"
             "\"notes\":[\"需要补充的证据或注意点\"]"

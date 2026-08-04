@@ -852,10 +852,11 @@ class LogFaultRunner:
             )
             decision = analysis.get("llm_decision") or {}
             if decision:
+                reason_summary = self._format_reason_analysis(decision.get("most_likely_reason"))
                 lines.extend(
                     [
                         f"- 最可能原因：{decision.get('selected_candidate') or '未选择'}",
-                        f"- 原因摘要：{decision.get('most_likely_reason') or ''}",
+                        f"- 原因摘要：{reason_summary}",
                         f"- 排查方法：",
                     ]
                 )
@@ -880,3 +881,22 @@ class LogFaultRunner:
                     lines.extend(f"- {item}" for item in missing)
                     lines.append("")
         (output_dir / "kg_rca_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+    def _format_reason_analysis(self, value: Any) -> str:
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    title = str(item.get("title") or "").strip()
+                    evidence = item.get("evidence") or []
+                    evidence_text = "；".join(str(part).strip() for part in evidence if str(part).strip())
+                    if title and evidence_text:
+                        parts.append(f"{title}（{evidence_text}）")
+                    elif title:
+                        parts.append(title)
+                elif str(item).strip():
+                    parts.append(str(item).strip())
+            return "；".join(parts)
+        if isinstance(value, dict):
+            return self._format_reason_analysis([value])
+        return str(value or "").strip()

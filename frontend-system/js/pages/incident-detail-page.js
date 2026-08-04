@@ -53,7 +53,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
     };
     const chain = top.chain || incident.chain || [];
     const llmCandidate = llmDecision.selected_candidate || top.candidate || "尚未形成判断";
-    const llmReason = llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因";
+    const llmReasons = normalizeReasonAnalysis(llmDecision.most_likely_reason || top.summary || analysis.decision);
     const llmSteps = llmDecision.troubleshooting_methods?.length
       ? llmDecision.troubleshooting_methods
       : (top.validation_suggestions || []).map((item) => item.title || item.reason || item.check_id).filter(Boolean);
@@ -70,7 +70,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           <div class="llm-decision-panel">
             <span class="stat-label">最可能原因</span>
             <h3>${escapeHtml(llmCandidate)}</h3>
-            <p>${escapeHtml(llmReason)}</p>
+            ${reasonAnalysisHtml(llmReasons)}
             <div class="llm-decision-meta">
               <span class="badge">${escapeHtml(llmDecision.source || "fallback")}</span>
               <span class="badge">候选排行：${escapeHtml(llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : `Top-${top.rank || 1}`)}</span>
@@ -210,6 +210,36 @@ function stepsHtml(steps) {
 function listHtml(items, fallback) {
   const values = items?.length ? items : [fallback];
   return `<ul class="evidence-list">${values.map((item) => `<li class="evidence-item">${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function normalizeReasonAnalysis(value) {
+  if (Array.isArray(value)) {
+    const items = value.map(normalizeReasonItem).filter(Boolean);
+    return items.length ? items : [{ title: "暂无可展示的最可能原因", evidence: [] }];
+  }
+  const item = normalizeReasonItem(value);
+  return item ? [item] : [{ title: "暂无可展示的最可能原因", evidence: [] }];
+}
+
+function normalizeReasonItem(value) {
+  if (!value) return null;
+  if (typeof value === "object") {
+    const title = String(value.title || value.summary || value.reason || "").trim();
+    const evidence = Array.isArray(value.evidence)
+      ? value.evidence.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    return title ? { title, evidence } : null;
+  }
+  const title = String(value).trim();
+  return title ? { title, evidence: [] } : null;
+}
+
+function reasonAnalysisHtml(items) {
+  return `<div class="timeline reason-analysis">${items.map((item) => `
+    <div class="timeline-item">
+      <p><strong>${escapeHtml(item.title)}</strong></p>
+      ${item.evidence?.length ? `<ul class="evidence-list">${item.evidence.map((evidence) => `<li class="evidence-item">${escapeHtml(evidence)}</li>`).join("")}</ul>` : ""}
+    </div>`).join("")}</div>`;
 }
 
 function validationSuggestionsHtml(items) {

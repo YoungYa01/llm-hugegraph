@@ -170,6 +170,45 @@ def test_architecture_requests_never_send_conversation_id() -> None:
     assert all("conversation_id" not in call["json"] for call in session.calls)
 
 
+def test_rca_decision_keeps_friendly_graph_on_selected_real_chain() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    analysis = {
+        "hypotheses": [
+            {"rank": 1, "candidate": "gateway", "chain": ["gateway"], "summary": "gateway failed"},
+            {
+                "rank": 2,
+                "candidate": "redis-2",
+                "chain": ["redis-2", "login-service", "gateway"],
+                "summary": "redis timeout propagated upstream",
+            },
+        ]
+    }
+    fallback = service._fallback_decision(analysis, source="fallback")
+    result = service._normalize_model_result(
+        {
+            "selected_candidate": "redis-2",
+            "most_likely_reasons": ["Redis 连接超时", "登录服务随后失败"],
+            "display_chain": [
+                {"node": "redis-2", "label": "Redis 实例不可用", "explanation": "连接被拒绝"},
+                {"node": "invented-node", "label": "虚构节点"},
+                {"node": "gateway", "label": "用户请求失败"},
+            ],
+        },
+        analysis,
+        fallback,
+    )
+
+    assert result["selected_candidate_rank"] == 2
+    assert result["most_likely_reasons"] == ["Redis 连接超时", "登录服务随后失败"]
+    assert [item["node"] for item in result["display_chain"]] == [
+        "redis-2",
+        "login-service",
+        "gateway",
+    ]
+    assert result["display_chain"][0]["label"] == "Redis 实例不可用"
+    assert "invented-node" not in str(result["display_chain"])
+
+
 def test_resolved_incident_requires_note(tmp_path, monkeypatch) -> None:
     database = SystemDatabase(tmp_path / "api.db")
     monkeypatch.setattr(system_api, "get_system_db", lambda: database)

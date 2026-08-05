@@ -38,8 +38,6 @@ def _json_dict(value: Any) -> dict[str, Any]:
 
 
 class HugeGraphRestClient:
-    _deleted_node_keys: set[str] = set()
-
     """HugeGraph REST API client used by the KG UI.
 
     The class stays REST-only, because the referenced project already uses a
@@ -317,12 +315,6 @@ class HugeGraphRestClient:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.ensure_schema()
-        # 只要该节点被重新创建/大模型重新抽取写入，立刻从物理删除黑名单中解封！
-        del_keys = getattr(HugeGraphRestClient, "_deleted_node_keys", set())
-        clean_name = name.split("::")[-1] if "::" in name else name
-        del_keys.discard(name)
-        del_keys.discard(clean_name)
-
         # PRIMARY_KEY vertex labels reject a second POST for the same name.
         # Resolve the exact vertex first so manual creation and repeated imports
         # behave as a real upsert instead of relying on server-specific errors.
@@ -438,25 +430,13 @@ class HugeGraphRestClient:
         existing = self.find_node_by_name(name)
         if not existing and not scoped_name:
             existing = self.find_node_by_name(clean_name)
-        
-        if not hasattr(HugeGraphRestClient, "_deleted_node_keys"):
-            HugeGraphRestClient._deleted_node_keys = set()
-        HugeGraphRestClient._deleted_node_keys.add(name)
-        if not scoped_name:
-            HugeGraphRestClient._deleted_node_keys.add(clean_name)
 
         if not existing:
-            if hasattr(self, "_memory_nodes"):
-                keys = {name} if scoped_name else {name, clean_name}
-                self._memory_nodes = [
-                    n
-                    for n in self._memory_nodes
-                    if n.get("name") not in keys and n.get("id") not in keys
-                ]
-            return True
+            return False
 
         vertex_id = str(existing.get("id") or "")
-        HugeGraphRestClient._deleted_node_keys.add(vertex_id)
+        if not vertex_id:
+            return False
 
         # 清理与该节点相连的所有依赖边
         for edge in self.list_edges(limit=10000):
@@ -466,20 +446,13 @@ class HugeGraphRestClient:
                 except Exception:
                     pass
 
-        if hasattr(self, "_memory_nodes"):
-            keys = {name, vertex_id} if scoped_name else {name, clean_name, vertex_id}
-            self._memory_nodes = [
-                n
-                for n in self._memory_nodes
-                if n.get("name") not in keys and n.get("id") not in keys
-            ]
-
         for encoded in self._encoded_id_candidates(vertex_id):
             try:
                 self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
-            except Exception:
+                return True
+            except HugeGraphRestError:
                 continue
-        return True
+        return False
 
     def find_node_by_name(self, name: str) -> dict[str, Any] | None:
         vertices = self.list_vertices(limit=10000)
@@ -616,14 +589,10 @@ class HugeGraphRestClient:
         edges = self.list_edges(limit=limit * 2)
         id_to_name: dict[str, str] = {}
         nodes: list[GraphNode] = []
-        del_keys = getattr(HugeGraphRestClient, "_deleted_node_keys", set())
         for v in vertices:
             props = v.get("properties", {}) or {}
             node_id = str(v.get("id"))
             name = str(props.get(self.pk_name) or node_id)
-            if name in del_keys or node_id in del_keys:
-                continue
-
             id_to_name[node_id] = name
             nodes.append(
                 GraphNode(

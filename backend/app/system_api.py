@@ -26,7 +26,6 @@ from .auth import (
 )
 from pydantic import BaseModel, Field
 from .config import get_settings
-from .hugegraph_client import HugeGraphRestClient
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
     EdgeDeleteRequest,
@@ -415,8 +414,6 @@ async def _run_architecture_import_task(
 ) -> None:
     database = get_system_db()
     scoped = ProjectScopedGraphClient(project_id)
-    if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
-        HugeGraphRestClient._deleted_node_keys.clear()
 
     def _on_progress(pct: int, msg: str) -> None:
         database.update_architecture_progress(item_id, pct, msg)
@@ -649,9 +646,7 @@ def import_architecture_graph_data(
 ) -> dict[str, Any]:
     _project_for_user(project_id, user)
     client = ProjectScopedGraphClient(project_id)
-    if hasattr(HugeGraphRestClient, "_deleted_node_keys"):
-        HugeGraphRestClient._deleted_node_keys.clear()
-    
+
     # 直接保存节点与依赖边，跳过大模型抽出步
     raw_nodes = payload.get("nodes") or []
     raw_edges = payload.get("edges") or []

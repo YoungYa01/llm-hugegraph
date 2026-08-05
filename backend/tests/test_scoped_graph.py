@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.hugegraph_client import HugeGraphRestClient
+from app.hugegraph_client import HugeGraphRestClient, HugeGraphRestError
 from app.models import GraphEdge, GraphNode, GraphResponse
 from app.scoped_graph import ProjectScopedGraphClient
 from app.service import GraphBuilderService
@@ -174,12 +174,12 @@ def test_upsert_updates_existing_primary_key_without_second_post() -> None:
     assert updates[0][0] == "existing-id"
 
 
-def test_unscoped_delete_marker_does_not_hide_scoped_same_name_node() -> None:
+def test_deleted_primary_key_can_be_recreated_and_read_again() -> None:
     client = HugeGraphRestClient()
     client.ensure_schema = lambda: []  # type: ignore[method-assign]
-    client.list_vertices = lambda limit=800: [  # type: ignore[method-assign]
+    vertices = [
         {
-            "id": "p1-id",
+            "id": "stable-primary-key-id",
             "properties": {
                 client.pk_name: "project::p1::order",
                 client.pk_kind: "Service",
@@ -187,13 +187,45 @@ def test_unscoped_delete_marker_does_not_hide_scoped_same_name_node() -> None:
             },
         }
     ]
+    client.list_vertices = lambda limit=800: list(vertices)  # type: ignore[method-assign]
     client.list_edges = lambda limit=1600: []  # type: ignore[method-assign]
-    HugeGraphRestClient._deleted_node_keys = {"order"}
 
+    def request(method: str, path: str, **kwargs) -> dict | None:
+        if method == "DELETE":
+            vertices.clear()
+            return None
+        if method == "POST" and path == "graph/vertices":
+            payload = kwargs["json_body"]
+            recreated = {
+                "id": "stable-primary-key-id",
+                "properties": dict(payload["properties"]),
+            }
+            vertices.append(recreated)
+            return recreated
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client._request = request  # type: ignore[method-assign]
+
+    assert client.delete_node_by_name("project::p1::order") is True
+    assert client.read_graph().nodes == []
+
+    recreated = client.upsert_node("project::p1::order", kind="Service")
     graph = client.read_graph()
 
+    assert recreated["id"] == "stable-primary-key-id"
     assert [node.name for node in graph.nodes] == ["project::p1::order"]
-    HugeGraphRestClient._deleted_node_keys.clear()
+
+
+def test_node_delete_reports_failure_when_hugegraph_rejects_every_id() -> None:
+    client = HugeGraphRestClient()
+    client.ensure_schema = lambda: []  # type: ignore[method-assign]
+    client.find_node_by_name = lambda name: {"id": "vertex-id"}  # type: ignore[method-assign]
+    client.list_edges = lambda limit=10000: []  # type: ignore[method-assign]
+    client._request = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        HugeGraphRestError("delete rejected")
+    )
+
+    assert client.delete_node_by_name("project::p1::order") is False
 
 
 def test_graph_builder_creates_edges_by_name_when_node_update_has_no_id() -> None:

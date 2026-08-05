@@ -141,6 +141,8 @@ export async function renderArchitecturePage(root, project) {
   }
 
   function paint() {
+    controller?.destroy();
+    controller = null;
     selectedNode = null;
     selectedEdge = null;
     content.innerHTML = `
@@ -205,6 +207,7 @@ export async function renderArchitecturePage(root, project) {
     bind();
     if (graph.nodes.length) {
       controller = renderGraph(content.querySelector("#graph-canvas"), graph, {
+        mode: "architecture",
         onSelect: (node, edges) => {
           selectedNode = node;
           selectedEdge = null;

@@ -35,11 +35,13 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
   }
 
   function paint() {
+    graphController?.destroy();
+    graphController = null;
     const analysis = incident.analysis || {};
     const detail = incident.detail || {};
     const llmDecision = analysis.llm_decision || {};
     const hypotheses = analysis.hypotheses || [];
-    const top = hypotheses[0] || {
+    const algorithmTop = hypotheses[0] || {
       candidate: incident.root_candidate,
       confidence: incident.root_confidence,
       fault_mode: incident.fault_mode,
@@ -48,9 +50,14 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       evidence: [],
       missing_evidence: [],
     };
-    const chain = top.chain || incident.chain || [];
-    const llmCandidate = llmDecision.selected_candidate || top.candidate || "尚未形成判断";
-    const llmReason = llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因";
+    const top = selectedHypothesis(hypotheses, llmDecision) || algorithmTop;
+    const displayChain = normalizedDisplayChain(llmDecision.display_chain, top.chain || incident.chain || []);
+    const chain = displayChain.length ? displayChain : (top.chain || incident.chain || []);
+    const llmCandidate = top.candidate || llmDecision.selected_candidate || "尚未形成判断";
+    const llmReasons = normalizedReasonItems(
+      llmDecision.most_likely_reasons,
+      llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因",
+    );
     const llmSteps = llmDecision.troubleshooting_methods?.length
       ? llmDecision.troubleshooting_methods
       : (top.validation_suggestions || []).map((item) => item.title || item.reason || item.check_id).filter(Boolean);
@@ -95,14 +102,15 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
             </div>
             <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
               <h2 style="margin:0;font-size:22px;color:var(--danger);font-weight:700">${escapeHtml(llmCandidate)}</h2>
-              <span class="badge" style="background:rgba(220,38,38,0.1);color:#dc2626;border:1px solid rgba(220,38,38,0.2)">${escapeHtml(llmDecision.selected_fault_mode || top.fault_mode || "故障未知")}</span>
+              <span class="badge" style="background:rgba(220,38,38,0.1);color:#dc2626;border:1px solid rgba(220,38,38,0.2)">${escapeHtml(top.fault_mode || llmDecision.selected_fault_mode || "故障未知")}</span>
             </div>
-            <p style="color:var(--ink-700);font-size:14px;line-height:1.6;margin-bottom:14px;background:var(--surface-soft);padding:12px;border-radius:8px;border-left:4px solid var(--brand)">
-              ${escapeHtml(llmReason)}
-            </p>
+            <div style="color:var(--ink-700);font-size:14px;line-height:1.6;margin-bottom:14px;background:var(--surface-soft);padding:12px 14px;border-radius:8px;border-left:4px solid var(--brand)">
+              <strong style="display:block;margin-bottom:6px;color:var(--ink-800)">根因判断依据</strong>
+              ${reasonItemsHtml(llmReasons)}
+            </div>
             <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px">
               <span class="badge">来源: ${escapeHtml(llmDecision.source || "RCA 推理引擎")}</span>
-              <span class="badge">候选排名: ${escapeHtml(llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : `Top-${top.rank || 1}`)}</span>
+              <span class="badge">候选排名: ${escapeHtml(top.rank ? `Top-${top.rank}` : (llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : "Top-1"))}</span>
               <span class="badge">日志侧定位: ${escapeHtml(analysis.resolved_root_service || detail.root_service_candidate || "未知服务")}</span>
             </div>
           </div>
@@ -132,18 +140,20 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           ${fusionGraph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(fusionGraph.warnings.join("；"))}</div>` : ""}
           ${fusionGraph.nodes.length ? `
             <div style="display:grid;grid-template-columns: 1fr 340px;gap:20px" class="graph-grid-responsive">
-              <!-- 左侧：5列平铺舒展的拓扑画布 (高度提升至 420px) -->
+              <!-- 左侧：可缩放、可拖拽的故障定位拓扑 -->
               <div class="graph-shell graph-shell-fusion">
-                <div id="fusion-graph-canvas" style="height:420px;min-height:360px;max-height:480px"></div>
+                <div id="fusion-semantic-warning" class="notice notice-warning graph-semantic-warning" hidden></div>
+                <div id="fusion-graph-canvas"></div>
                 <div class="graph-toolbar">
                   <button class="button button-ghost button-small" id="fusion-zoom-out" title="缩小">−</button>
                   <button class="button button-ghost button-small" id="fusion-zoom-reset" title="复位画布">复位</button>
                   <button class="button button-ghost button-small" id="fusion-zoom-in" title="放大">＋</button>
+                  <button class="button button-ghost button-small" id="fusion-relayout" title="清除节点固定位置并重新布局">重排</button>
                 </div>
-                <div class="graph-legend">${graphLegend(true)}</div>
+                <div class="graph-legend">${graphLegend(true, true)}</div>
               </div>
-              <!-- 右侧：拆分为三大独立边框卡片部分 (高度 420px，给卡片3分配 190px 充裕展示视口) -->
-              <div class="graph-side-panel" style="display:flex;flex-direction:column;gap:10px;background:var(--surface-soft);padding:10px;border-radius:8px;border:1px solid var(--border);height:420px;overflow:hidden">
+              <!-- 右侧：传播链、路径依据和选中元素说明 -->
+              <div class="graph-side-panel" style="display:flex;flex-direction:column;gap:10px;background:var(--surface-soft);padding:10px;border-radius:8px;border:1px solid var(--border);height:600px;overflow:hidden">
                 <!-- 卡片 1: 故障传播链 (带独立边框与内部滚动) -->
                 <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;flex-shrink:0">
                   <h3 style="font-size:12px;font-weight:700;margin-bottom:4px;color:var(--ink-800)">
@@ -301,15 +311,25 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
   function renderFusionGraph() {
     const canvas = content.querySelector("#fusion-graph-canvas");
     if (!canvas || !fusionGraph.nodes.length) return;
+    const decision = incident.analysis?.llm_decision || {};
+    const hypothesis = selectedHypothesis(incident.analysis?.hypotheses || [], decision);
+    const friendlyChain = normalizedDisplayChain(decision.display_chain, hypothesis?.chain || []);
+    const friendlyByNode = new Map(friendlyChain.map((item) => [item.node, item]));
     graphController = renderGraph(canvas, fusionGraph, {
+      mode: "incident",
+      hypotheses: incident.analysis?.hypotheses || [],
+      llmDecision: incident.analysis?.llm_decision || {},
       onSelect: (node, edges) => {
         const panel = content.querySelector("#fusion-selection");
+        const friendly = friendlyByNode.get(node.name);
         panel.innerHTML = `
           <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px">
-              <code style="font-weight:700;color:var(--brand);font-size:12px;word-break:break-all">${escapeHtml(node.name)}</code>
-              <span class="badge" style="font-size:10px;background:var(--surface-soft);color:var(--ink-700);flex-shrink:0">${escapeHtml(node.kind || "Node")}</span>
+              <code style="font-weight:700;color:var(--brand);font-size:12px;word-break:break-all">${escapeHtml(friendly?.label || node.name)}</code>
+              <span class="badge" style="font-size:10px;background:var(--surface-soft);color:var(--ink-700);flex-shrink:0">${escapeHtml(friendly?.stage || node.kind || "Node")}</span>
             </div>
+            ${friendly?.label && friendly.label !== node.name ? `<div style="color:var(--ink-500);font-size:11px">真实节点：${escapeHtml(node.name)}</div>` : ""}
+            ${friendly?.explanation ? `<div style="margin:5px 0;color:var(--ink-800);line-height:1.4">${escapeHtml(friendly.explanation)}</div>` : ""}
             ${node.description ? `<div style="margin:4px 0;color:var(--ink-700);line-height:1.4;word-break:break-all">${escapeHtml(node.description)}</div>` : ""}
             <div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px;padding-top:4px;border-top:1px dashed var(--border);color:var(--ink-500);font-size:11px">
               <span>相邻关联实体:</span>
@@ -330,12 +350,19 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           </div>`;
       },
     });
+    const semanticWarning = content.querySelector("#fusion-semantic-warning");
+    const warnings = graphController?.semantics?.warnings || [];
+    if (semanticWarning && warnings.length) {
+      semanticWarning.hidden = false;
+      semanticWarning.textContent = warnings.join("；");
+    }
   }
 
   function bind() {
     content.querySelector("#fusion-zoom-in")?.addEventListener("click", () => graphController?.zoomIn());
     content.querySelector("#fusion-zoom-out")?.addEventListener("click", () => graphController?.zoomOut());
     content.querySelector("#fusion-zoom-reset")?.addEventListener("click", () => graphController?.reset());
+    content.querySelector("#fusion-relayout")?.addEventListener("click", () => graphController?.relayout());
     content.querySelector("#toggle-event-nodes")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       setBusy(button, true, includeEvents ? "正在收起…" : "正在加载事件…");
@@ -372,9 +399,9 @@ function chainHtml(chain, expanded) {
     ? [chain[0], chain[1], `__fold__${chain.length - 4}`, chain.at(-2), chain.at(-1)]
     : chain;
 
-  const nodes = visible.map((node, index) => {
-    if (String(node).startsWith("__fold__")) {
-      const count = String(node).replace("__fold__", "");
+  const nodes = visible.map((entry, index) => {
+    if (String(entry).startsWith("__fold__")) {
+      const count = String(entry).replace("__fold__", "");
       return `
         <div style="text-align:center;padding:2px 0;color:var(--ink-400);font-weight:bold;font-size:14px">↓</div>
         <div style="text-align:center">
@@ -382,13 +409,20 @@ function chainHtml(chain, expanded) {
         </div>
         <div style="text-align:center;padding:2px 0;color:var(--ink-400);font-weight:bold;font-size:14px">↓</div>`;
     }
+    const item = typeof entry === "object" && entry !== null
+      ? entry
+      : { node: String(entry), label: String(entry), explanation: "", stage: "" };
     const isRoot = index === 0;
     const isLast = index === visible.length - 1;
     const arrow = !isLast ? `<div style="text-align:center;padding:3px 0;color:var(--ink-400);font-weight:bold;font-size:14px">↓</div>` : "";
 
     return `
-      <div style="background:#fff;border:1.5px solid ${isRoot ? '#dc2626' : '#cbd5e1'};padding:8px 12px;border-radius:6px;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:space-between;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
-        <span style="color:${isRoot ? '#dc2626' : 'var(--ink-800)'}">${escapeHtml(node)}</span>
+      <div style="background:#fff;border:1.5px solid ${isRoot ? '#dc2626' : '#cbd5e1'};padding:8px 12px;border-radius:6px;font-size:12px;font-weight:600;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
+        <span style="min-width:0;color:${isRoot ? '#dc2626' : 'var(--ink-800)'};word-break:break-word;line-height:1.35">
+          <strong style="display:block">${escapeHtml(item.label || item.node)}</strong>
+          ${item.explanation ? `<small style="display:block;margin-top:3px;color:var(--ink-500);font-weight:400">${escapeHtml(item.explanation)}</small>` : ""}
+          ${item.label && item.label !== item.node ? `<small style="display:block;margin-top:2px;color:var(--ink-400);font-weight:400">节点：${escapeHtml(item.node)}</small>` : ""}
+        </span>
         ${isRoot ? `<span class="badge" style="background:rgba(220,38,38,0.1);color:#dc2626;font-size:10px;padding:1px 5px;border:1px solid rgba(220,38,38,0.2)">根因候选</span>` : ""}
       </div>
       ${arrow}`;
@@ -397,6 +431,50 @@ function chainHtml(chain, expanded) {
   const collapse = chain.length > 6 && expanded ? '<button class="button button-secondary button-small" id="toggle-chain" style="margin-top:6px;font-size:11px;width:100%">折叠中间节点</button>' : "";
 
   return `<div class="chain-vertical" style="display:flex;flex-direction:column;max-height:220px;overflow-y:auto;padding-right:4px;gap:0">${nodes}</div>${collapse}`;
+}
+
+function selectedHypothesis(hypotheses, decision) {
+  if (!Array.isArray(hypotheses) || !hypotheses.length) return null;
+  const candidate = String(decision?.selected_candidate || "").trim().toLocaleLowerCase();
+  if (candidate) {
+    const selected = hypotheses.find((item) => String(item?.candidate || "").trim().toLocaleLowerCase() === candidate);
+    if (selected) return selected;
+  }
+  const rank = Number(decision?.selected_candidate_rank || 0);
+  return hypotheses.find((item) => Number(item?.rank || 0) === rank) || null;
+}
+
+function normalizedDisplayChain(value, algorithmChain) {
+  if (!Array.isArray(value) || !value.length || !Array.isArray(algorithmChain)) return [];
+  const byNode = new Map(
+    value
+      .filter((item) => item && typeof item === "object")
+      .map((item) => [String(item.node || ""), item]),
+  );
+  if (!algorithmChain.every((node) => byNode.has(String(node)))) return [];
+  return algorithmChain.map((node, index) => {
+    const item = byNode.get(String(node));
+    return {
+      node: String(node),
+      label: String(item.label || node),
+      explanation: String(item.explanation || ""),
+      stage: String(item.stage || (index === 0 ? "根因" : index === algorithmChain.length - 1 ? "受影响入口" : "故障传播")),
+    };
+  });
+}
+
+function normalizedReasonItems(value, fallback) {
+  const values = Array.isArray(value) && value.length
+    ? value
+    : String(fallback || "").split(/(?:\r?\n|[；;])/);
+  return [...new Set(values
+    .map((item) => String(item || "").replace(/^\s*(?:[-*•]|\d+[.)、])\s*/, "").trim())
+    .filter(Boolean))].slice(0, 8);
+}
+
+function reasonItemsHtml(items) {
+  if (!items.length) return `<p style="margin:0;color:var(--ink-500)">暂无可展示的最可能原因。</p>`;
+  return `<ol style="margin:0;padding-left:20px;display:grid;gap:5px">${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>`;
 }
 
 function stepsHtml(steps) {

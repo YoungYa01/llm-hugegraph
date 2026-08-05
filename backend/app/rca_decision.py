@@ -228,6 +228,16 @@ class RcaDecisionService:
             selected = self._candidate_by_rank(hypotheses, rank)
         if selected and not rank:
             rank = self._rank_by_candidate(hypotheses, selected)
+        selected_hypothesis = self._selected_hypothesis(hypotheses, selected, rank)
+        if selected_hypothesis is None:
+            selected_hypothesis = self._selected_hypothesis(
+                hypotheses,
+                str(fallback.get("selected_candidate") or ""),
+                int(fallback.get("selected_candidate_rank") or 0),
+            )
+        if selected_hypothesis is not None:
+            selected = str(selected_hypothesis.get("candidate") or selected)
+            rank = self._safe_int(selected_hypothesis.get("rank")) or rank
         if not selected:
             selected = fallback["selected_candidate"]
         if not rank:
@@ -247,6 +257,15 @@ class RcaDecisionService:
             or parsed.get("summary")
             or fallback["most_likely_reason"]
         ).strip()
+        reason_items = self._normalize_reason_items(
+            parsed.get("most_likely_reasons")
+            or parsed.get("reason_points")
+            or reason
+        )
+        if not reason_items:
+            reason_items = list(fallback.get("most_likely_reasons") or [])
+        if not reason_items and reason:
+            reason_items = [reason]
         fault_mode = str(
             parsed.get("selected_fault_mode")
             or self._fault_mode_by_rank(hypotheses, rank)
@@ -257,8 +276,13 @@ class RcaDecisionService:
             "selected_candidate": selected,
             "selected_candidate_rank": rank,
             "selected_fault_mode": fault_mode,
-            "most_likely_reason": reason,
+            "most_likely_reason": "；".join(reason_items) or reason,
+            "most_likely_reasons": reason_items,
             "troubleshooting_methods": steps,
+            "display_chain": self._normalize_display_chain(
+                parsed.get("display_chain"),
+                selected_hypothesis,
+            ),
             "confidence": parsed.get("confidence", fallback.get("confidence")),
             "notes": self._normalize_steps(parsed.get("notes")),
         }
@@ -271,12 +295,15 @@ class RcaDecisionService:
             steps = self._normalize_steps(top.get("missing_evidence") or [])
         if not steps:
             steps = ["补充日志、监控和组件健康状态，核对候选根因与故障时间窗口是否一致。"]
+        reason = str(top.get("summary") or analysis.get("decision") or "").strip()
         return {
             "selected_candidate": str(top.get("candidate") or ""),
             "selected_candidate_rank": self._safe_int(top.get("rank")) or 0,
             "selected_fault_mode": str(top.get("fault_mode") or ""),
-            "most_likely_reason": str(top.get("summary") or analysis.get("decision") or ""),
+            "most_likely_reason": reason,
+            "most_likely_reasons": [reason] if reason else [],
             "troubleshooting_methods": steps,
+            "display_chain": self._normalize_display_chain(None, top),
             "confidence": top.get("confidence"),
             "source": source,
             "model_config_id": str(getattr(self.settings, "rca_decision_model_config_id", "") or ""),
@@ -381,7 +408,7 @@ class RcaDecisionService:
             "incident.log_context 已经过确定性日志压缩：key_events 是按严重度、异常信号、稀有度、"
             "服务/trace 多样性和故障邻域筛选的关键事件；repeated_patterns 汇总被折叠的重复日志。\n"
             "决策规则（按优先级）：\n"
-            "1. chain 中最后一个节点（最下游依赖）通常是根因，第一个节点通常是受害服务；优先选造成传播的最下游组件。\n"
+            "1. chain 已按‘根因 → 故障传播节点 → 受影响入口’排序，第一个节点通常是根因；优先选造成传播的底层组件。\n"
             "2. architecture_node=false 的候选缺乏图谱支撑，仅在其他候选置信度均极低时才选。\n"
             "3. fault_mode 属于 JVM_OOM/DISK_IO_FAILURE/CPU_OVERLOAD/NETWORK_FAILURE 时，优先选 candidate_kind 为 Host/Instance/Pod 的候选。\n"
             "4. 多个候选均指向同一基础设施节点（如数据库、宿主机）时，选该节点而非其上层服务。\n"
@@ -391,11 +418,14 @@ class RcaDecisionService:
             '"selected_candidate":"候选名称",'
             '"selected_candidate_rank":1,'
             '"selected_fault_mode":"故障模式",'
-            '"most_likely_reason":"为什么它最可能",'
+            '"most_likely_reasons":["根因依据1","根因依据2","根因依据3"],'
             '"troubleshooting_methods":["排查步骤1","排查步骤2"],'
+            '"display_chain":[{"node":"必须与所选候选 chain 中的真实节点名完全一致","label":"面向用户的简短节点名称","stage":"根因/故障传播/受影响入口","explanation":"该节点在传播链中的作用"}],'
             '"confidence":0.0,'
             '"notes":["需要补充的证据或注意点"]'
             "}\n"
+            "display_chain 必须覆盖所选候选 chain 的全部节点、保持原顺序，不得新增、删除或改名；"
+            "label 和 explanation 应使用业务人员容易理解的中文，并与根因依据和排查步骤保持一致。\n"
             f"输入数据：\n{json.dumps(prompt_data, ensure_ascii=False, indent=2)}"
         )
         return prompt, dict(log_context.get("summary") or {})
@@ -444,6 +474,73 @@ class RcaDecisionService:
             return int(value)
         except Exception:
             return 0
+
+    def _selected_hypothesis(
+        self,
+        hypotheses: list[Any],
+        candidate: str,
+        rank: int,
+    ) -> dict[str, Any] | None:
+        normalized_candidate = str(candidate or "").strip().casefold()
+        if normalized_candidate:
+            for item in hypotheses:
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("candidate") or "").strip().casefold() == normalized_candidate
+                ):
+                    return item
+        if rank:
+            for item in hypotheses:
+                if isinstance(item, dict) and self._safe_int(item.get("rank")) == rank:
+                    return item
+        return None
+
+    def _normalize_reason_items(self, value: Any) -> list[str]:
+        if isinstance(value, list):
+            raw_items = value
+        else:
+            text = str(value or "").strip()
+            raw_items = re.split(r"(?:\r?\n|[；;])", text) if text else []
+        items: list[str] = []
+        for item in raw_items:
+            text = str(item or "").strip()
+            text = re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", text).strip()
+            if text and text not in items:
+                items.append(text[:500])
+        return items[:8]
+
+    def _normalize_display_chain(
+        self,
+        value: Any,
+        hypothesis: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        chain = hypothesis.get("chain") if isinstance(hypothesis, dict) else []
+        node_names = [str(item).strip() for item in chain or [] if str(item).strip()]
+        proposed: dict[str, dict[str, str]] = {}
+        if isinstance(value, list):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                node = str(item.get("node") or item.get("name") or "").strip()
+                if node and node in node_names:
+                    proposed[node] = {
+                        "label": str(item.get("label") or item.get("title") or node).strip()[:80],
+                        "explanation": str(item.get("explanation") or item.get("reason") or "").strip()[:500],
+                        "stage": str(item.get("stage") or "").strip()[:40],
+                    }
+        result: list[dict[str, str]] = []
+        for index, node in enumerate(node_names):
+            item = proposed.get(node, {})
+            default_stage = "根因" if index == 0 else "受影响入口" if index == len(node_names) - 1 else "故障传播"
+            result.append(
+                {
+                    "node": node,
+                    "label": item.get("label") or node,
+                    "explanation": item.get("explanation") or "",
+                    "stage": item.get("stage") or default_stage,
+                }
+            )
+        return result
 
     def _candidate_by_rank(self, hypotheses: list[Any], rank: int) -> str:
         for item in hypotheses:

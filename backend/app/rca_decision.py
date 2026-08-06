@@ -54,17 +54,22 @@ class RcaDecisionService:
             )
         )
 
-    def enrich(self, detail: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
+    def enrich(
+        self,
+        detail: dict[str, Any],
+        analysis: dict[str, Any],
+        architecture: Any | None = None,
+    ) -> dict[str, Any]:
         fallback = self._fallback_decision(analysis, source="fallback")
         if not bool(getattr(self.settings, "rca_decision_enabled", True)):
             return {**fallback, "error": "RCA decision model is disabled"}
 
         compression_summary: dict[str, Any] = {}
         try:
-            prompt, compression_summary = self._build_prompt_with_meta(detail, analysis)
+            prompt, compression_summary = self._build_prompt_with_meta(detail, analysis, architecture)
             raw_content, meta = self._post_conversation(prompt)
             parsed = self._parse_model_json(raw_content)
-            result = self._normalize_model_result(parsed, analysis, fallback)
+            result = self._normalize_model_result(parsed, analysis, fallback, architecture)
             return {
                 **result,
                 "source": "llm",
@@ -220,27 +225,51 @@ class RcaDecisionService:
         parsed: dict[str, Any],
         analysis: dict[str, Any],
         fallback: dict[str, Any],
+        architecture: Any | None = None,
     ) -> dict[str, Any]:
         hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
-        selected = str(parsed.get("selected_candidate") or parsed.get("candidate") or "").strip()
+        catalog = self._architecture_catalog(architecture)
+        selected_node_id = self._resolve_catalog_node_id(
+            parsed.get("selected_node_id") or parsed.get("root_cause_node_id"),
+            catalog,
+        )
+        if not selected_node_id:
+            selected_node_id = self._resolve_catalog_node_id(
+                parsed.get("selected_candidate") or parsed.get("candidate"),
+                catalog,
+            )
+        path, path_warnings = self._normalize_architecture_path(
+            parsed.get("propagation_path") or parsed.get("display_chain"),
+            selected_node_id,
+            catalog,
+        )
+        if path:
+            selected_node_id = path[0]["node_id"]
+        selected_node = catalog["by_id"].get(selected_node_id, {})
+        selected = str(
+            selected_node.get("name")
+            or parsed.get("selected_candidate")
+            or parsed.get("candidate")
+            or ""
+        ).strip()
         rank = self._safe_int(parsed.get("selected_candidate_rank") or parsed.get("selected_rank"))
         if not selected and rank:
             selected = self._candidate_by_rank(hypotheses, rank)
         if selected and not rank:
             rank = self._rank_by_candidate(hypotheses, selected)
         selected_hypothesis = self._selected_hypothesis(hypotheses, selected, rank)
-        if selected_hypothesis is None:
+        if selected_hypothesis is None and not selected_node_id:
             selected_hypothesis = self._selected_hypothesis(
                 hypotheses,
                 str(fallback.get("selected_candidate") or ""),
                 int(fallback.get("selected_candidate_rank") or 0),
             )
-        if selected_hypothesis is not None:
+        if selected_hypothesis is not None and not selected_node_id:
             selected = str(selected_hypothesis.get("candidate") or selected)
             rank = self._safe_int(selected_hypothesis.get("rank")) or rank
         if not selected:
             selected = fallback["selected_candidate"]
-        if not rank:
+        if not rank and not selected_node_id:
             rank = int(fallback.get("selected_candidate_rank") or 0)
 
         steps = self._normalize_steps(
@@ -249,13 +278,17 @@ class RcaDecisionService:
             or parsed.get("check_methods")
         )
         if not steps:
-            steps = list(fallback["troubleshooting_methods"])
+            steps = (
+                [f"检查架构节点“{selected}”的健康状态、依赖连通性及故障时段日志。"]
+                if selected_node_id and selected
+                else list(fallback["troubleshooting_methods"])
+            )
 
         reason = str(
             parsed.get("most_likely_reason")
             or parsed.get("reason")
             or parsed.get("summary")
-            or fallback["most_likely_reason"]
+            or (f"日志证据与架构传播路径共同指向“{selected}”。" if selected_node_id and selected else fallback["most_likely_reason"])
         ).strip()
         reason_items = self._normalize_reason_items(
             parsed.get("most_likely_reasons")
@@ -268,23 +301,28 @@ class RcaDecisionService:
             reason_items = [reason]
         fault_mode = str(
             parsed.get("selected_fault_mode")
-            or self._fault_mode_by_rank(hypotheses, rank)
-            or fallback.get("selected_fault_mode")
+            or (self._fault_mode_by_rank(hypotheses, rank) if not selected_node_id else "")
+            or (fallback.get("selected_fault_mode") if not selected_node_id else "")
             or ""
         ).strip()
+        display_chain = (
+            path
+            if path
+            else self._normalize_display_chain(parsed.get("display_chain"), selected_hypothesis)
+        )
         return {
             "selected_candidate": selected,
+            "selected_node_id": selected_node_id,
             "selected_candidate_rank": rank,
             "selected_fault_mode": fault_mode,
             "most_likely_reason": "；".join(reason_items) or reason,
             "most_likely_reasons": reason_items,
             "troubleshooting_methods": steps,
-            "display_chain": self._normalize_display_chain(
-                parsed.get("display_chain"),
-                selected_hypothesis,
-            ),
+            "propagation_path": display_chain,
+            "display_chain": display_chain,
             "confidence": parsed.get("confidence", fallback.get("confidence")),
             "notes": self._normalize_steps(parsed.get("notes")),
+            "path_validation_warnings": path_warnings,
         }
 
     def _fallback_decision(self, analysis: dict[str, Any], source: str) -> dict[str, Any]:
@@ -362,6 +400,7 @@ class RcaDecisionService:
         self,
         detail: dict[str, Any],
         analysis: dict[str, Any],
+        architecture: Any | None = None,
     ) -> tuple[str, dict[str, Any]]:
         timeline = detail.get("timeline") if isinstance(detail.get("timeline"), list) else []
         evidence = {
@@ -386,16 +425,19 @@ class RcaDecisionService:
             }
 
         prompt_data = {
+            "architecture_graph": self._architecture_prompt_data(architecture),
             "incident": {
                 "incident_id": detail.get("incident_id") or analysis.get("incident_id"),
                 "root_service_candidate": detail.get("root_service_candidate"),
                 "root_cause_candidate": detail.get("root_cause_candidate"),
                 "root_evidence": self._compact_value(detail.get("root_evidence")),
+                "candidate_reason_logs": self._compact_value(detail.get("root_candidates") or []),
+                "upstream_effect_logs": self._compact_value(detail.get("upstream_effects") or []),
                 "fault_start": detail.get("fault_start"),
                 "fault_end": detail.get("fault_end"),
                 "log_context": log_context,
             },
-            "deterministic_rca": {
+            "algorithm_candidates": {
                 "decision": analysis.get("decision"),
                 "resolved_root_service": analysis.get("resolved_root_service"),
                 "hypotheses": self._compact_hypotheses(analysis.get("hypotheses")),
@@ -403,32 +445,188 @@ class RcaDecisionService:
             },
         }
         prompt = (
-            "你是生产故障 RCA 决策助手。请只基于输入的候选根因、证据和限制信息，"
-            "选出一个最可能原因，并给出可执行的排查方法。不要编造候选根因或不存在的证据。\n"
+            "你是生产故障 RCA 决策助手。architecture_graph 是本项目系统架构的唯一实体和关系来源。"
+            "请结合候选原因日志、完整架构节点及边，判断根因并组织传播路径。不要编造节点、节点 ID、关系或日志证据。\n"
             "incident.log_context 已经过确定性日志压缩：key_events 是按严重度、异常信号、稀有度、"
             "服务/trace 多样性和故障邻域筛选的关键事件；repeated_patterns 汇总被折叠的重复日志。\n"
-            "决策规则（按优先级）：\n"
-            "1. chain 已按‘根因 → 故障传播节点 → 受影响入口’排序，第一个节点通常是根因；优先选造成传播的底层组件。\n"
-            "2. architecture_node=false 的候选缺乏图谱支撑，仅在其他候选置信度均极低时才选。\n"
-            "3. fault_mode 属于 JVM_OOM/DISK_IO_FAILURE/CPU_OVERLOAD/NETWORK_FAILURE 时，优先选 candidate_kind 为 Host/Instance/Pod 的候选。\n"
-            "4. 多个候选均指向同一基础设施节点（如数据库、宿主机）时，选该节点而非其上层服务。\n"
-            "5. 上游网关报 5xx 通常是传播结果而非根因；confidence 较低的网关候选不应被选择。\n"
+            "决策约束（按优先级）：\n"
+            "1. selected_node_id 必须来自 architecture_graph.nodes[].node_id；节点显示名称只能取对应 name。\n"
+            "2. propagation_path 按‘根因 → 故障传播节点 → 受影响入口’排序，每个 node_id 必须真实存在。\n"
+            "3. 路径中相邻节点必须由 architecture_graph.edges 中的边直接连接；边方向表示系统依赖，传播方向可与依赖方向相反。\n"
+            "4. algorithm_candidates 只是辅助证据，可以纠正其候选名称和链路，但结论必须落在架构节点上。\n"
+            "5. 根因依据、排查步骤、selected_node_id 和 propagation_path 必须指向同一个根因，不得互相矛盾。\n"
             "请严格返回 JSON 对象，不要 Markdown，不要解释，不要代码块。JSON 格式：\n"
             "{"
-            '"selected_candidate":"候选名称",'
+            '"selected_node_id":"architecture_graph 中真实 node_id",'
+            '"selected_candidate":"该 node_id 对应的真实 name",'
             '"selected_candidate_rank":1,'
             '"selected_fault_mode":"故障模式",'
             '"most_likely_reasons":["根因依据1","根因依据2","根因依据3"],'
             '"troubleshooting_methods":["排查步骤1","排查步骤2"],'
-            '"display_chain":[{"node":"必须与所选候选 chain 中的真实节点名完全一致","label":"面向用户的简短节点名称","stage":"根因/故障传播/受影响入口","explanation":"该节点在传播链中的作用"}],'
+            '"propagation_path":[{"node_id":"真实 node_id","label":"面向用户的简短名称","stage":"根因/故障传播/受影响入口","explanation":"该节点在传播链中的作用"}],'
             '"confidence":0.0,'
             '"notes":["需要补充的证据或注意点"]'
             "}\n"
-            "display_chain 必须覆盖所选候选 chain 的全部节点、保持原顺序，不得新增、删除或改名；"
-            "label 和 explanation 应使用业务人员容易理解的中文，并与根因依据和排查步骤保持一致。\n"
+            "propagation_path 的第一个节点必须等于 selected_node_id；label 和 explanation 应使用业务人员容易理解的中文，"
+            "并与根因依据和排查步骤保持一致。若架构图中不存在日志提到的组件，不得编造该组件；请在 notes 中说明缺失。\n"
             f"输入数据：\n{json.dumps(prompt_data, ensure_ascii=False, indent=2)}"
         )
         return prompt, dict(log_context.get("summary") or {})
+
+    def _architecture_prompt_data(self, architecture: Any | None) -> dict[str, Any]:
+        catalog = self._architecture_catalog(architecture)
+        return {
+            "nodes": list(catalog["nodes"]),
+            "edges": list(catalog["edges"]),
+        }
+
+    def _architecture_catalog(self, architecture: Any | None) -> dict[str, Any]:
+        raw_nodes = getattr(architecture, "nodes", None)
+        raw_edges = getattr(architecture, "edges", None)
+        if isinstance(architecture, dict):
+            raw_nodes = architecture.get("nodes")
+            raw_edges = architecture.get("edges")
+        nodes: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
+        name_to_id: dict[str, str] = {}
+        alias_to_id: dict[str, str] = {}
+        for raw in raw_nodes or []:
+            data = raw if isinstance(raw, dict) else getattr(raw, "model_dump", lambda: {})()
+            name = str(data.get("name") or "").strip()
+            node_id = str(data.get("id") or name).strip()
+            if not name or not node_id or node_id in by_id:
+                continue
+            meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+            aliases: list[str] = []
+            for key in ("aliases", "alias", "service_name", "serviceName", "application_name"):
+                value = meta.get(key)
+                values = value if isinstance(value, list) else [value]
+                aliases.extend(str(item).strip() for item in values if str(item or "").strip())
+            aliases = list(dict.fromkeys(aliases))
+            node = {
+                "node_id": node_id,
+                "name": name,
+                "aliases": aliases,
+                "kind": str(data.get("kind") or "Component"),
+                "layer": str(data.get("layer") or ""),
+                "description": str(data.get("description") or "")[:500],
+            }
+            nodes.append(node)
+            by_id[node_id] = node
+            name_to_id[name] = node_id
+            for identifier in [node_id, name, *aliases]:
+                alias_to_id.setdefault(str(identifier).strip().casefold(), node_id)
+
+        edges: list[dict[str, str]] = []
+        adjacency: dict[str, set[str]] = {node_id: set() for node_id in by_id}
+        for raw in raw_edges or []:
+            data = raw if isinstance(raw, dict) else getattr(raw, "model_dump", lambda: {})()
+            source = name_to_id.get(str(data.get("source") or ""), str(data.get("source") or ""))
+            target = name_to_id.get(str(data.get("target") or ""), str(data.get("target") or ""))
+            if source not in by_id or target not in by_id or source == target:
+                continue
+            edges.append({
+                "source_node_id": source,
+                "target_node_id": target,
+                "type": str(data.get("type") or "CALLS"),
+                "description": str(data.get("description") or "")[:300],
+            })
+            adjacency[source].add(target)
+            adjacency[target].add(source)
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "by_id": by_id,
+            "alias_to_id": alias_to_id,
+            "adjacency": adjacency,
+        }
+
+    def _resolve_catalog_node_id(self, value: Any, catalog: dict[str, Any]) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text in catalog["by_id"]:
+            return text
+        return str(catalog["alias_to_id"].get(text.casefold()) or "")
+
+    def _normalize_architecture_path(
+        self,
+        value: Any,
+        selected_node_id: str,
+        catalog: dict[str, Any],
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        if not catalog["by_id"]:
+            return [], []
+        proposed: dict[str, dict[str, str]] = {}
+        requested: list[str] = []
+        warnings: list[str] = []
+        for raw in value if isinstance(value, list) else []:
+            item = raw if isinstance(raw, dict) else {"node_id": raw}
+            node_id = self._resolve_catalog_node_id(
+                item.get("node_id") or item.get("node") or item.get("name"),
+                catalog,
+            )
+            if not node_id:
+                warnings.append(f"忽略不存在的架构节点：{item.get('node_id') or item.get('node') or item.get('name')}")
+                continue
+            if not requested or requested[-1] != node_id:
+                requested.append(node_id)
+            proposed[node_id] = {
+                "label": str(item.get("label") or item.get("title") or "").strip()[:80],
+                "explanation": str(item.get("explanation") or item.get("reason") or "").strip()[:500],
+                "stage": str(item.get("stage") or "").strip()[:40],
+            }
+        if selected_node_id:
+            if not requested or requested[0] != selected_node_id:
+                requested.insert(0, selected_node_id)
+        elif requested:
+            selected_node_id = requested[0]
+        if not requested:
+            return [], warnings
+
+        connected = [requested[0]]
+        for target in requested[1:]:
+            bridge = self._shortest_path(connected[-1], target, catalog["adjacency"])
+            if not bridge:
+                warnings.append(
+                    f"架构图中不存在 {catalog['by_id'][connected[-1]]['name']} 到 {catalog['by_id'][target]['name']} 的连通路径"
+                )
+                continue
+            if len(bridge) > 2:
+                warnings.append("大模型路径跳过了架构中间节点，系统已按真实拓扑补全")
+            connected.extend(bridge[1:])
+
+        result: list[dict[str, str]] = []
+        for index, node_id in enumerate(connected):
+            node = catalog["by_id"][node_id]
+            item = proposed.get(node_id, {})
+            default_stage = "根因" if index == 0 else "受影响入口" if index == len(connected) - 1 else "故障传播"
+            result.append({
+                "node_id": node_id,
+                "node": node["name"],
+                "label": item.get("label") or node["name"],
+                "explanation": item.get("explanation") or "",
+                "stage": item.get("stage") or default_stage,
+            })
+        return result, list(dict.fromkeys(warnings))
+
+    def _shortest_path(self, source: str, target: str, adjacency: dict[str, set[str]]) -> list[str]:
+        if source == target:
+            return [source]
+        parents = {source: ""}
+        queue = [source]
+        for current in queue:
+            for neighbor in sorted(adjacency.get(current, set())):
+                if neighbor in parents:
+                    continue
+                parents[neighbor] = current
+                if neighbor == target:
+                    path = [target]
+                    while parents[path[-1]]:
+                        path.append(parents[path[-1]])
+                    return list(reversed(path))
+                queue.append(neighbor)
+        return []
 
     def _compact_hypotheses(self, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):

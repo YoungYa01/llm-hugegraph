@@ -23,6 +23,12 @@ export function buildIncidentSemantics(hypotheses = [], llmDecision = {}, visibl
   const candidates = hypotheses.filter(validHypothesis);
   const modelSource = normalize(llmDecision.source);
   const isModelDecision = Boolean(modelSource && modelSource !== "fallback");
+  const displayItems = Array.isArray(llmDecision.propagation_path)
+    ? llmDecision.propagation_path
+    : Array.isArray(llmDecision.display_chain) ? llmDecision.display_chain : [];
+  const modelChain = displayItems
+    .filter((item) => item && typeof item === "object" && String(item.node || "").trim())
+    .map((item) => String(item.node));
   let selected = null;
 
   if (isModelDecision) {
@@ -34,12 +40,21 @@ export function buildIncidentSemantics(hypotheses = [], llmDecision = {}, visibl
   }
 
   const fallback = [...candidates].sort((left, right) => Number(left.rank || 0) - Number(right.rank || 0))[0] || null;
-  const primaryCandidate = selected || fallback;
+  const modelPrimary = isModelDecision && llmDecision.selected_node_id && modelChain.length
+    ? {
+      candidate: String(llmDecision.selected_candidate || modelChain[0]),
+      chain: modelChain,
+      confidence: llmDecision.confidence,
+      fault_mode: llmDecision.selected_fault_mode,
+      rank: 0,
+      source: "llm",
+    }
+    : null;
+  const primaryCandidate = modelPrimary || selected || fallback;
   const primary = primaryCandidate
-    ? { ...primaryCandidate, source: selected ? "llm" : "algorithm" }
+    ? { ...primaryCandidate, source: modelPrimary || selected ? "llm" : "algorithm" }
     : null;
   const chain = primary?.chain || [];
-  const displayItems = Array.isArray(llmDecision.display_chain) ? llmDecision.display_chain : [];
   const proposedDisplay = new Map(
     displayItems
       .filter((item) => item && typeof item === "object")
@@ -56,7 +71,7 @@ export function buildIncidentSemantics(hypotheses = [], llmDecision = {}, visibl
       }];
     }),
   );
-  const alternatives = candidates.filter((item) => item !== primaryCandidate);
+  const alternatives = candidates.filter((item) => item !== selected && item !== primaryCandidate);
   const warnings = [];
   const overlays = [];
   const seenEdges = new Set();

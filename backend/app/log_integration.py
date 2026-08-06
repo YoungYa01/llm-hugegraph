@@ -16,6 +16,7 @@ from fastapi import UploadFile
 
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
+from .models import GraphResponse
 from .rca_decision import RcaDecisionService
 from .rca_optimization import prune_pending_graph, select_relevant_timeline, should_write_edge
 from .rca_engine import RootCauseAnalysis, RootCauseEngine
@@ -260,7 +261,29 @@ class IncidentGraphIntegrator:
 
     def _import_details(self, details: list[dict[str, Any]], source_name: str) -> None:
         self.db.ensure_schema()
-        architecture = self.db.read_graph(limit=5000)
+        architecture_reader = getattr(self.db, "read_architecture_graph", None)
+        if callable(architecture_reader):
+            architecture = architecture_reader(limit=5000)
+        else:
+            raw_architecture = self.db.read_graph(limit=5000)
+            dynamic_kinds = {
+                "Incident", "Trace", "LogEvent", "Exception", "Window",
+                "Metric", "RCAHypothesis", "UnresolvedDependency",
+            }
+            nodes = [
+                node for node in raw_architecture.nodes
+                if node.kind not in dynamic_kinds
+                and not bool((node.meta or {}).get("dynamic_observation"))
+            ]
+            names = {node.name for node in nodes}
+            architecture = GraphResponse(
+                nodes=nodes,
+                edges=[
+                    edge for edge in raw_architecture.edges
+                    if edge.source in names and edge.target in names
+                ],
+                warnings=raw_architecture.warnings,
+            )
         self._known_nodes = {
             node.name: {
                 "kind": node.kind,
@@ -288,9 +311,18 @@ class IncidentGraphIntegrator:
 
         decisions: dict[int, dict[str, Any]] = {}
         for item in prepared:
-            decisions[item["index"]] = self.decision_service.enrich(item["detail"], item["data"])
+            decisions[item["index"]] = self.decision_service.enrich(
+                item["detail"],
+                item["data"],
+                architecture,
+            )
             self._begin_graph_buffer()
-            self._import_one(item["detail"], source_name, item["rca"])
+            self._import_one(
+                item["detail"],
+                source_name,
+                item["rca"],
+                decisions[item["index"]],
+            )
             self._flush_graph_buffer()
 
         for item in prepared:
@@ -352,10 +384,13 @@ class IncidentGraphIntegrator:
                 self._vertex_id_cache[node.name] = vertex_id
 
         for edge in result.edges:
-            source_id = self._resolve_vertex_id(edge.source)
-            target_id = self._resolve_vertex_id(edge.target)
-            if source_id and target_id and hasattr(self.db, "add_edge"):
-                self.db.add_edge(source_id, target_id, edge.type, edge.description, edge.meta)
+            if hasattr(self.db, "add_edge"):
+                source_id = self._resolve_vertex_id(edge.source)
+                target_id = self._resolve_vertex_id(edge.target)
+                if source_id and target_id:
+                    self.db.add_edge(source_id, target_id, edge.type, edge.description, edge.meta)
+                else:
+                    self.db.add_edge_by_names(edge.source, edge.target, edge.type, edge.description, edge.meta)
             else:
                 self.db.add_edge_by_names(edge.source, edge.target, edge.type, edge.description, edge.meta)
             self.edges_written += 1
@@ -368,6 +403,8 @@ class IncidentGraphIntegrator:
         cached = self._vertex_id_cache.get(name)
         if cached:
             return cached
+        if not hasattr(self.db, "find_node_by_name"):
+            return ""
         found = self.db.find_node_by_name(name)
         vertex_id = str(found.get("id") or "") if isinstance(found, dict) else ""
         if vertex_id:
@@ -443,15 +480,24 @@ class IncidentGraphIntegrator:
                 meta=edge_meta,
             )
         else:
-            source_id = self._resolve_vertex_id(source)
-            target_id = self._resolve_vertex_id(target)
-            if source_id and target_id and hasattr(self.db, "add_edge"):
-                self.db.add_edge(source_id, target_id, rel_type, description, edge_meta)
+            if hasattr(self.db, "add_edge"):
+                source_id = self._resolve_vertex_id(source)
+                target_id = self._resolve_vertex_id(target)
+                if source_id and target_id:
+                    self.db.add_edge(source_id, target_id, rel_type, description, edge_meta)
+                else:
+                    self.db.add_edge_by_names(source, target, rel_type, description, edge_meta)
             else:
                 self.db.add_edge_by_names(source, target, rel_type, description, edge_meta)
             self.edges_written += 1
 
-    def _import_one(self, detail: dict[str, Any], source_name: str, rca: RootCauseAnalysis) -> None:
+    def _import_one(
+        self,
+        detail: dict[str, Any],
+        source_name: str,
+        rca: RootCauseAnalysis,
+        decision: dict[str, Any] | None = None,
+    ) -> None:
         incident_id = str(detail.get("incident_id") or "I00000")
         incident_node = f"Incident:{incident_id}"
         root_service_raw = str(detail.get("root_service_candidate") or "")
@@ -657,7 +703,7 @@ class IncidentGraphIntegrator:
                 )
                 self._write_edge(cand_service, cand_node, "EMITS", "候选根因服务产生该日志", {"rank": idx})
 
-        self._write_rca(incident_node, incident_id, rca, source_name)
+        self._write_rca(incident_node, incident_id, rca, source_name, decision)
 
         top = rca.hypotheses[0] if rca.hypotheses else None
         top_text = f", rca={top.candidate}/{top.fault_mode}/{top.confidence:.2f}" if top else ""
@@ -672,7 +718,21 @@ class IncidentGraphIntegrator:
         incident_id: str,
         rca: RootCauseAnalysis,
         source_name: str,
+        decision: dict[str, Any] | None = None,
     ) -> None:
+        decision = decision if isinstance(decision, dict) else {}
+        model_grounded = bool(
+            str(decision.get("source") or "").lower() == "llm"
+            and decision.get("selected_node_id")
+        )
+        decision_path = [
+            str(item.get("node") or "").strip()
+            for item in (decision.get("propagation_path") or decision.get("display_chain") or [])
+            if model_grounded
+            and isinstance(item, dict)
+            and str(item.get("node") or "").strip() in self._architecture_nodes
+        ]
+        model_root = decision_path[0] if decision_path else ""
         for hypothesis in rca.hypotheses[: max(1, int(getattr(self.settings, "rca_graph_max_hypotheses", 3)))]:
             data = hypothesis.model_dump()
             node_name = f"RCAHypothesis:{incident_id}:{hypothesis.rank:02d}"
@@ -700,7 +760,7 @@ class IncidentGraphIntegrator:
                     hypothesis.fault_mode,
                     {"rank": hypothesis.rank, "confidence": hypothesis.confidence},
                 )
-                if hypothesis.rank == 1:
+                if hypothesis.rank == 1 and not model_root:
                     self._write_edge(
                         incident_node,
                         hypothesis.candidate,
@@ -732,6 +792,65 @@ class IncidentGraphIntegrator:
                     "最高分日志根因证据",
                     {"rank": hypothesis.rank},
                 )
+
+        if not model_root:
+            return
+        decision_node = f"RCAHypothesis:{incident_id}:LLM"
+        decision_meta = {
+            "rank": 0,
+            "candidate": model_root,
+            "candidate_node_id": decision.get("selected_node_id"),
+            "candidate_kind": self._architecture_nodes.get(model_root, {}).get("kind"),
+            "architecture_node": True,
+            "fault_mode": decision.get("selected_fault_mode"),
+            "confidence": decision.get("confidence"),
+            "status": "llm_grounded",
+            "summary": decision.get("most_likely_reason"),
+            "chain": decision_path,
+            "display_chain": decision.get("display_chain") or [],
+            "model_decision": True,
+        }
+        self._write_node(
+            decision_node,
+            "根因推理层",
+            "RCAHypothesis",
+            str(decision.get("most_likely_reason") or "大模型架构约束根因结论"),
+            source_name,
+            decision_meta,
+        )
+        self._write_edge(
+            incident_node,
+            decision_node,
+            "HAS_HYPOTHESIS",
+            "大模型基于完整架构图谱形成的根因结论",
+            {"rank": 0, "source": "llm", "confidence": decision.get("confidence")},
+        )
+        self._write_edge(
+            decision_node,
+            model_root,
+            "CANDIDATE_CAUSE",
+            str(decision.get("selected_fault_mode") or "LLM_GROUNDED_RCA"),
+            {"rank": 0, "source": "llm", "confidence": decision.get("confidence")},
+        )
+        self._write_edge(
+            incident_node,
+            model_root,
+            "SUSPECTED_ROOT_CAUSE",
+            "大模型基于完整架构图谱选择的根因实体",
+            {
+                "source": "llm",
+                "confidence": decision.get("confidence"),
+                "fault_mode": decision.get("selected_fault_mode"),
+            },
+        )
+        for affected in decision_path[1:]:
+            self._write_edge(
+                decision_node,
+                affected,
+                "AFFECTS",
+                "大模型传播路径上的受影响架构节点",
+                {"rank": 0, "source": "llm"},
+            )
 
     def _exception_node_name(self, root_cause: str) -> str:
         text = root_cause.strip() or "UnknownException"

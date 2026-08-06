@@ -51,9 +51,12 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       missing_evidence: [],
     };
     const top = selectedHypothesis(hypotheses, llmDecision) || algorithmTop;
-    const displayChain = normalizedDisplayChain(llmDecision.display_chain, top.chain || incident.chain || []);
+    const displayChain = normalizedDisplayChain(
+      llmDecision.propagation_path || llmDecision.display_chain,
+      top.chain || incident.chain || [],
+    );
     const chain = displayChain.length ? displayChain : (top.chain || incident.chain || []);
-    const llmCandidate = top.candidate || llmDecision.selected_candidate || "尚未形成判断";
+    const llmCandidate = llmDecision.selected_candidate || top.candidate || "尚未形成判断";
     const llmReasons = normalizedReasonItems(
       llmDecision.most_likely_reasons,
       llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因",
@@ -110,7 +113,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
             </div>
             <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px">
               <span class="badge">来源: ${escapeHtml(llmDecision.source || "RCA 推理引擎")}</span>
-              <span class="badge">候选排名: ${escapeHtml(top.rank ? `Top-${top.rank}` : (llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : "Top-1"))}</span>
+              <span class="badge">${top.source === "llm" ? "架构约束模型结论" : `候选排名: ${escapeHtml(top.rank ? `Top-${top.rank}` : (llmDecision.selected_candidate_rank ? `Top-${llmDecision.selected_candidate_rank}` : "Top-1"))}`}</span>
               <span class="badge">日志侧定位: ${escapeHtml(analysis.resolved_root_service || detail.root_service_candidate || "未知服务")}</span>
             </div>
           </div>
@@ -313,7 +316,10 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
     if (!canvas || !fusionGraph.nodes.length) return;
     const decision = incident.analysis?.llm_decision || {};
     const hypothesis = selectedHypothesis(incident.analysis?.hypotheses || [], decision);
-    const friendlyChain = normalizedDisplayChain(decision.display_chain, hypothesis?.chain || []);
+    const friendlyChain = normalizedDisplayChain(
+      decision.propagation_path || decision.display_chain,
+      hypothesis?.chain || [],
+    );
     const friendlyByNode = new Map(friendlyChain.map((item) => [item.node, item]));
     graphController = renderGraph(canvas, fusionGraph, {
       mode: "incident",
@@ -351,7 +357,10 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       },
     });
     const semanticWarning = content.querySelector("#fusion-semantic-warning");
-    const warnings = graphController?.semantics?.warnings || [];
+    const warnings = [
+      ...(graphController?.semantics?.warnings || []),
+      ...(Array.isArray(decision.path_validation_warnings) ? decision.path_validation_warnings : []),
+    ];
     if (semanticWarning && warnings.length) {
       semanticWarning.hidden = false;
       semanticWarning.textContent = warnings.join("；");
@@ -434,6 +443,26 @@ function chainHtml(chain, expanded) {
 }
 
 function selectedHypothesis(hypotheses, decision) {
+  const modelPath = Array.isArray(decision?.propagation_path)
+    ? decision.propagation_path
+    : Array.isArray(decision?.display_chain) ? decision.display_chain : [];
+  const modelChain = modelPath
+    .filter((item) => item && typeof item === "object" && String(item.node || "").trim())
+    .map((item) => String(item.node));
+  if (String(decision?.source || "").toLocaleLowerCase() === "llm" && decision?.selected_node_id && modelChain.length) {
+    return {
+      candidate: String(decision.selected_candidate || modelChain[0]),
+      confidence: decision.confidence,
+      fault_mode: decision.selected_fault_mode,
+      chain: modelChain,
+      rank: 0,
+      source: "llm",
+      path_steps: modelPath.map((item) => ({
+        title: item.stage || "传播节点",
+        reason: item.explanation || item.label || item.node,
+      })),
+    };
+  }
   if (!Array.isArray(hypotheses) || !hypotheses.length) return null;
   const candidate = String(decision?.selected_candidate || "").trim().toLocaleLowerCase();
   if (candidate) {

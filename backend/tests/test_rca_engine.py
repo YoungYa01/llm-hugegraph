@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.analyzer import RuleBasedArchitectureExtractor
 from app.log_integration import IncidentGraphIntegrator, LogFaultRunner
@@ -133,6 +134,52 @@ def test_incident_import_does_not_overwrite_curated_architecture_nodes() -> None
     assert "Redis生产集群" not in updated_names
     assert "RCAHypothesis:I00001:01" in updated_names
     assert ("Incident:I00001", "Redis生产集群", "SUSPECTED_ROOT_CAUSE") in db.edges
+
+
+def test_grounded_model_path_is_persisted_into_incident_fusion_graph() -> None:
+    db = FakeGraphDb(architecture_graph())
+    integrator = IncidentGraphIntegrator(db=db)  # type: ignore[arg-type]
+    integrator.decision_service = SimpleNamespace(
+        enrich=lambda detail, analysis, architecture: {
+            "source": "llm",
+            "selected_node_id": "redis-2",
+            "selected_candidate": "redis-2",
+            "selected_fault_mode": "REDIS_UNREACHABLE",
+            "confidence": 0.96,
+            "most_likely_reason": "redis-2 不可用并向上游传播",
+            "most_likely_reasons": ["redis-2 连接失败"],
+            "troubleshooting_methods": ["检查 redis-2"],
+            "propagation_path": [
+                {"node_id": "redis-2", "node": "redis-2"},
+                {"node_id": "redis-prod", "node": "Redis生产集群"},
+                {"node_id": "security-service", "node": "security-service"},
+                {"node_id": "api-gateway", "node": "api-gateway"},
+            ],
+        }
+    )
+
+    integrator._import_details([redis_timeout_detail()], "test.json")
+
+    updated_names = {item["name"] for item in db.upserts}
+    assert "RCAHypothesis:I00001:LLM" in updated_names
+    assert ("Incident:I00001", "redis-2", "SUSPECTED_ROOT_CAUSE") in db.edges
+    assert ("RCAHypothesis:I00001:LLM", "api-gateway", "AFFECTS") in db.edges
+    assert integrator.rca_results[0]["llm_decision"]["selected_node_id"] == "redis-2"
+
+
+def test_edge_write_resolves_native_hugegraph_id_instead_of_model_entity_id() -> None:
+    db = SimpleNamespace(
+        find_node_by_name=lambda name: {"id": f'native:"{name}"'},
+    )
+    integrator = IncidentGraphIntegrator(db=db)  # type: ignore[arg-type]
+    integrator._known_nodes = {
+        "security-service": {"id": "project::p1::security-service"},
+    }
+
+    vertex_id = integrator._resolve_vertex_id("security-service")
+
+    assert vertex_id == 'native:"security-service"'
+    assert vertex_id != "project::p1::security-service"
 
 
 def test_rule_fallback_extracts_aliases_and_redis_member_topology() -> None:

@@ -776,7 +776,21 @@ def _persist_incidents(
         analysis = by_external.get(external, {})
         hypotheses = analysis.get("hypotheses") or []
         top = hypotheses[0] if hypotheses else {}
-        confidence = float(top.get("confidence") or 0)
+        decision = analysis.get("llm_decision") if isinstance(analysis.get("llm_decision"), dict) else {}
+        model_path = [
+            str(item.get("node") or "").strip()
+            for item in (decision.get("propagation_path") or decision.get("display_chain") or [])
+            if isinstance(item, dict) and str(item.get("node") or "").strip()
+        ]
+        model_grounded = bool(
+            str(decision.get("source") or "").lower() == "llm"
+            and decision.get("selected_node_id")
+            and model_path
+        )
+        confidence = float(
+            decision.get("confidence") if model_grounded and decision.get("confidence") is not None
+            else top.get("confidence") or 0
+        )
         severity = "critical" if confidence >= 0.9 else "high" if confidence >= 0.75 else "medium" if confidence >= 0.5 else "low"
         root_service = str(detail.get("root_service_candidate") or "未知服务")
         root_cause = str(detail.get("root_cause_candidate") or "未提取到明确异常")
@@ -789,10 +803,16 @@ def _persist_incidents(
                 "graph_incident_id": graph_id,
                 "title": f"{root_service}：{root_cause[:100]}",
                 "severity": severity,
-                "root_candidate": str(top.get("candidate") or root_service),
+                "root_candidate": str(
+                    decision.get("selected_candidate") if model_grounded
+                    else top.get("candidate") or root_service
+                ),
                 "root_confidence": confidence,
-                "fault_mode": str(top.get("fault_mode") or ""),
-                "chain_json": json.dumps(top.get("chain") or [], ensure_ascii=False),
+                "fault_mode": str(
+                    decision.get("selected_fault_mode") if model_grounded
+                    else top.get("fault_mode") or ""
+                ),
+                "chain_json": json.dumps(model_path if model_grounded else top.get("chain") or [], ensure_ascii=False),
                 "analysis_json": json.dumps(analysis, ensure_ascii=False),
                 "detail_json": json.dumps(detail, ensure_ascii=False),
             }

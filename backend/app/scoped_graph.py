@@ -255,6 +255,9 @@ class ProjectScopedGraphClient:
             allowed.add(node.name)
             nodes.append(
                 GraphNode(
+                    # This is a model-facing project-local entity id, not the
+                    # native HugeGraph vertex id. Native ids are resolved by
+                    # name immediately before an edge is written.
                     id=display,
                     name=display,
                     layer=node.layer,

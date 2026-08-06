@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app import auth, system_api
+from app.models import GraphEdge, GraphNode, GraphResponse
 from app.rca_decision import RcaDecisionService
 from app.system_db import SystemDatabase
 
@@ -207,6 +209,131 @@ def test_rca_decision_keeps_friendly_graph_on_selected_real_chain() -> None:
     ]
     assert result["display_chain"][0]["label"] == "Redis 实例不可用"
     assert "invented-node" not in str(result["display_chain"])
+
+
+def test_rca_decision_is_grounded_by_architecture_node_ids_and_repairs_path() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    architecture = GraphResponse(
+        nodes=[
+            GraphNode(id="redis-id", name="Redis 集群", kind="Cache"),
+            GraphNode(id="uaa-id", name="认证服务", kind="Service"),
+            GraphNode(
+                id="gateway-id",
+                name="API 网关",
+                kind="Service",
+                meta={"aliases": ["api-gateway"]},
+            ),
+        ],
+        edges=[
+            GraphEdge(source="认证服务", target="Redis 集群", type="DEPENDS_ON"),
+            GraphEdge(source="API 网关", target="认证服务", type="CALLS"),
+        ],
+    )
+    analysis = {
+        "hypotheses": [
+            {"rank": 1, "candidate": "api-gateway", "chain": ["api-gateway"], "summary": "gateway failed"},
+        ]
+    }
+    fallback = service._fallback_decision(analysis, source="fallback")
+
+    result = service._normalize_model_result(
+        {
+            "selected_node_id": "redis-id",
+            "selected_fault_mode": "REDIS_CLUSTER_DOWN",
+            "most_likely_reasons": ["Redis 集群返回 CLUSTERDOWN"],
+            "troubleshooting_methods": ["检查 Redis 集群状态"],
+            # The model skipped uaa-id; validation must fill it from real graph edges.
+            "propagation_path": [
+                {"node_id": "redis-id", "label": "Redis 集群故障"},
+                {"node_id": "gateway-id", "label": "API 网关请求失败"},
+                {"node_id": "invented-id", "label": "虚构节点"},
+            ],
+        },
+        analysis,
+        fallback,
+        architecture,
+    )
+
+    assert result["selected_node_id"] == "redis-id"
+    assert result["selected_candidate"] == "Redis 集群"
+    assert result["selected_candidate_rank"] == 0
+    assert [item["node_id"] for item in result["propagation_path"]] == [
+        "redis-id",
+        "uaa-id",
+        "gateway-id",
+    ]
+    assert [item["node"] for item in result["display_chain"]] == [
+        "Redis 集群",
+        "认证服务",
+        "API 网关",
+    ]
+    assert "invented-id" not in str(result["display_chain"])
+    assert result["path_validation_warnings"]
+
+
+def test_rca_prompt_contains_every_architecture_node_and_edge() -> None:
+    service = RcaDecisionService(
+        settings=SimpleNamespace(
+            llm_disable_env_proxy=True,
+            log_compression_enabled=False,
+            log_compression_max_events=20,
+        )
+    )
+    architecture = GraphResponse(
+        nodes=[
+            GraphNode(id="n1", name="API 网关", kind="Service", meta={"aliases": ["api-gateway"]}),
+            GraphNode(id="n2", name="Redis 集群", kind="Cache"),
+        ],
+        edges=[GraphEdge(source="API 网关", target="Redis 集群", type="DEPENDS_ON")],
+    )
+
+    prompt, _ = service._build_prompt_with_meta({"timeline": []}, {"hypotheses": []}, architecture)
+
+    assert '"node_id": "n1"' in prompt
+    assert '"node_id": "n2"' in prompt
+    assert '"api-gateway"' in prompt
+    assert '"source_node_id": "n1"' in prompt
+    assert '"target_node_id": "n2"' in prompt
+
+
+def test_incident_persistence_prefers_grounded_model_root_and_chain(tmp_path) -> None:
+    database = SystemDatabase(tmp_path / "grounded.db")
+    user = database.create_user("operator", "hash", "Operator", "EMP-001")
+    project = database.create_project(str(user["id"]), "Order", "")
+    batch = database.create_log_batch(
+        str(project["id"]), "logs.zip", "/tmp/logs.zip", "", "", "/tmp/output", str(user["id"]),
+    )
+    analysis = {
+        "incident_id": "batch:I00001",
+        "hypotheses": [
+            {"rank": 1, "candidate": "API 网关", "confidence": 0.75, "fault_mode": "APPLICATION_ERROR", "chain": ["API 网关"]},
+        ],
+        "llm_decision": {
+            "source": "llm",
+            "selected_node_id": "redis-id",
+            "selected_candidate": "Redis 集群",
+            "selected_fault_mode": "REDIS_CLUSTER_DOWN",
+            "confidence": 0.93,
+            "propagation_path": [
+                {"node_id": "redis-id", "node": "Redis 集群"},
+                {"node_id": "gateway-id", "node": "API 网关"},
+            ],
+        },
+    }
+
+    saved = system_api._persist_incidents(
+        database,
+        str(project["id"]),
+        str(batch["id"]),
+        str(user["id"]),
+        [{"incident_id": "I00001", "root_service_candidate": "api-gateway"}],
+        [analysis],
+    )
+    incident = database.get_incident(str(saved[0]["id"]))
+
+    assert incident["root_candidate"] == "Redis 集群"
+    assert incident["fault_mode"] == "REDIS_CLUSTER_DOWN"
+    assert json.loads(incident["chain_json"]) == ["Redis 集群", "API 网关"]
 
 
 def test_resolved_incident_requires_note(tmp_path, monkeypatch) -> None:

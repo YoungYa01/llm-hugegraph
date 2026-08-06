@@ -14,6 +14,7 @@ export const STATUS_LABELS = {
   processing: "处理中",
   completed: "已完成",
   failed: "失败",
+  deleting: "删除中",
 };
 
 export const SEVERITY_LABELS = {

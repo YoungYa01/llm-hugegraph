@@ -50,6 +50,7 @@ def public_user(user: dict[str, Any]) -> dict[str, Any]:
         "id": user.get("id"),
         "username": user.get("username"),
         "display_name": user.get("display_name"),
+        "employee_id": user.get("employee_id"),
         "role": user.get("role"),
         "created_at": user.get("created_at"),
     }

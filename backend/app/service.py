@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .analyzer import LLMAnalyzer, split_text
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
@@ -9,12 +11,12 @@ from .models import ExtractedGraph, ExtractedNode, ExtractedCall
 class GraphBuilderService:
     """Business service: LLM extraction -> HugeGraph REST write -> graph read model."""
 
-    def __init__(self, db: HugeGraphRestClient | None = None) -> None:
+    def __init__(self, db: HugeGraphRestClient | None = None, employee_id: str = "") -> None:
         self.settings = get_settings()
         # ProjectScopedGraphClient implements this same small client surface.
         # Injection keeps extraction independent from project isolation rules.
         self.db = db or HugeGraphRestClient()
-        self.analyzer = LLMAnalyzer()
+        self.analyzer = LLMAnalyzer(employee_id=employee_id)
 
     def initialize_system(self) -> list[str]:
         return self.db.ensure_schema()
@@ -57,7 +59,6 @@ class GraphBuilderService:
         merged = self._complete_missing_nodes(merged)
 
         _report(75, f"向 HugeGraph 写入 {len(merged.services)} 个架构节点...")
-        real_id_map: dict[str, str] = {}
         for node in merged.services:
             res = self.db.upsert_node(
                 name=node.name,
@@ -69,10 +70,9 @@ class GraphBuilderService:
             )
             real_id = str(res.get("id") or "")
             if real_id:
-                real_id_map[node.name] = real_id
                 execution_logs.append(f"写入/获取节点: {node.name} -> {real_id}")
             else:
-                execution_logs.append(f"警告：节点 {node.name} 写入后未返回 id。返回={res}")
+                execution_logs.append(f"写入/更新节点: {node.name}（接口未返回 id）")
 
         _report(85, f"向 HugeGraph 写入 {len(merged.calls)} 条依赖关系...")
         seen_edges: set[tuple[str, str, str]] = set()
@@ -81,12 +81,16 @@ class GraphBuilderService:
             if key in seen_edges:
                 continue
             seen_edges.add(key)
-            out_id = real_id_map.get(call.source)
-            in_id = real_id_map.get(call.target)
-            if not out_id or not in_id:
-                execution_logs.append(f"跳过关系，未找到端点真实 ID: {call.source} -[{call.type}]-> {call.target}")
-                continue
-            res = self.db.add_edge(out_id, in_id, call.type, call.description, call.meta)
+            # Resolve endpoints by their primary-key names after all nodes have
+            # been upserted. Existing-node updates do not consistently return an
+            # id across HugeGraph versions; relying on that response lost edges.
+            res = self.db.add_edge_by_names(
+                call.source,
+                call.target,
+                call.type,
+                call.description,
+                call.meta,
+            )
             execution_logs.append(f"写入关系: {call.source} -[{call.type}]-> {call.target} -> {res.get('id', '')}")
 
         _report(95, "生成图谱快照并保存...")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,6 +39,7 @@ class SystemDatabase:
                     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     password_hash TEXT NOT NULL,
                     display_name TEXT NOT NULL,
+                    employee_id TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'user',
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -134,6 +136,9 @@ class SystemDatabase:
                 CREATE INDEX IF NOT EXISTS idx_actions_incident ON incident_actions(incident_id, created_at);
                 """
             )
+            user_cols = [row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()]
+            if "employee_id" not in user_cols:
+                connection.execute("ALTER TABLE users ADD COLUMN employee_id TEXT NOT NULL DEFAULT ''")
             # 兼容性表结构升级：确保长任务具备进度列与阶段描述列
             for table in ("architecture_imports", "log_batches"):
                 cols = [row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -162,13 +167,19 @@ class SystemDatabase:
         row = self.query_one("SELECT COUNT(*) AS value FROM users")
         return int((row or {}).get("value") or 0)
 
-    def create_user(self, username: str, password_hash: str, display_name: str) -> dict[str, Any]:
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        display_name: str,
+        employee_id: str,
+    ) -> dict[str, Any]:
         user_id = str(uuid.uuid4())
         now = utc_now()
         role = "admin" if self.user_count() == 0 else "user"
         self.execute(
-            "INSERT INTO users(id, username, password_hash, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, username, password_hash, display_name, role, now, now),
+            "INSERT INTO users(id, username, password_hash, display_name, employee_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, username, password_hash, display_name, employee_id, role, now, now),
         )
         return self.get_user(user_id) or {}
 
@@ -249,7 +260,7 @@ class SystemDatabase:
 
     def list_all_users(self) -> list[dict[str, Any]]:
         return self.query_all(
-            "SELECT id, username, display_name, role, is_active, created_at FROM users ORDER BY created_at ASC"
+            "SELECT id, username, display_name, employee_id, role, is_active, created_at FROM users ORDER BY created_at ASC"
         )
 
     def update_user_role_and_status(self, user_id: str, role: str, is_active: int) -> dict[str, Any] | None:
@@ -263,6 +274,7 @@ class SystemDatabase:
         self,
         user_id: str,
         display_name: str | None = None,
+        employee_id: str | None = None,
         role: str | None = None,
         is_active: int | None = None,
         password_hash: str | None = None,
@@ -272,6 +284,9 @@ class SystemDatabase:
         if display_name is not None:
             updates.append("display_name = ?")
             params.append(display_name)
+        if employee_id is not None:
+            updates.append("employee_id = ?")
+            params.append(employee_id)
         if role is not None:
             updates.append("role = ?")
             params.append(role)
@@ -492,6 +507,35 @@ class SystemDatabase:
         self.execute(
             "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, completed_at = ? WHERE id = ?",
             (summary_json, rca_json, utc_now(), batch_id),
+        )
+
+    def update_log_batch_progress(
+        self,
+        batch_id: str,
+        *,
+        status: str = "processing",
+        percent: int = 0,
+        stage: str = "",
+        message: str = "",
+    ) -> None:
+        item = self.get_log_batch(batch_id)
+        summary: dict[str, Any] = {}
+        if item:
+            try:
+                data = json.loads(str(item.get("summary_json") or "{}"))
+                summary = data if isinstance(data, dict) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                summary = {}
+        summary.update(
+            {
+                "progress_percent": max(0, min(100, int(percent))),
+                "progress_stage": stage,
+                "progress_message": message,
+            }
+        )
+        self.execute(
+            "UPDATE log_batches SET status = ?, summary_json = ? WHERE id = ?",
+            (status, json.dumps(summary, ensure_ascii=False), batch_id),
         )
 
     def fail_log_batch(self, batch_id: str, error_message: str) -> None:

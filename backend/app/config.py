@@ -96,10 +96,6 @@ class Settings:
     rca_graph_write_cooccurrence_edges: bool = _bool_env("RCA_GRAPH_WRITE_COOCCURRENCE_EDGES", False)
     rca_graph_write_temporal_edges: bool = _bool_env("RCA_GRAPH_WRITE_TEMPORAL_EDGES", True)
 
-    # LLM decision calls are I/O-bound. Use a small, bounded worker pool.
-    rca_decision_max_workers: int = _int_env("RCA_DECISION_MAX_WORKERS", 3)
-    rca_decision_isolate_conversations: bool = _bool_env("RCA_DECISION_ISOLATE_CONVERSATIONS", True)
-
     # Deterministic log compression before the final RCA decision LLM call.
     # max_chars is a hard budget for the compressed log-context JSON only.
     log_compression_enabled: bool = _bool_env("LOG_COMPRESSION_ENABLED", True)
@@ -114,7 +110,6 @@ class Settings:
     rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)
     rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation")
     rca_decision_model_config_id: str = _env("RCA_DECISION_MODEL_CONFIG_ID", "")
-    rca_decision_conversation_id: str = _env("RCA_DECISION_CONVERSATION_ID", "")
     rca_decision_assistant_role: str = _env("RCA_DECISION_ASSISTANT_ROLE", "general")
     rca_decision_assistant_name: str = _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant")
     rca_decision_assistant_prompt: str = _env("RCA_DECISION_ASSISTANT_PROMPT", "")

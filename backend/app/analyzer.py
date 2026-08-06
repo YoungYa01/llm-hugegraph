@@ -99,8 +99,9 @@ class LLMAnalyzer:
     LangChain, then llama.cpp /completion, and finally a deterministic extractor.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, employee_id: str = "") -> None:
         self.settings = get_settings()
+        self.employee_id = employee_id.strip()
         self.api_key = (self.settings.llm_api_key or "not-needed").strip() or "not-needed"
         self.last_logs: list[str] = []
         self.last_mode = "unknown"
@@ -221,7 +222,12 @@ class LLMAnalyzer:
             f"{self._build_user_prompt(user_text)}\n"
             "严格返回 services/calls JSON，不要 Markdown，不要代码块。"
         )
-        content, _meta = RcaDecisionService(settings=self.settings, session=self.session)._post_conversation(prompt)
+        content, _meta = RcaDecisionService(
+            settings=self.settings,
+            session=self.session,
+            employee_id=self.employee_id,
+            continue_conversation=False,
+        )._post_conversation(prompt)
         parsed = self._parse_json_lenient(content)
         return self._normalize_graph(parsed).model_dump()
 
@@ -255,6 +261,7 @@ class LLMAnalyzer:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            "X-Ai-Coding-Key": self.employee_id,
         }
         for url in chat_urls:
             for payload in self._chat_payloads(user_text):
@@ -304,6 +311,7 @@ class LLMAnalyzer:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            "X-Ai-Coding-Key": self.employee_id,
         }
         prompt = f"{SYSTEM_PROMPT}\n\n{self._build_user_prompt(user_text)}"
         payloads = []
@@ -351,6 +359,7 @@ class LLMAnalyzer:
             "max_tokens": self.settings.llm_max_tokens,
             "timeout": self.settings.llm_timeout_seconds,
             "max_retries": 0,
+            "default_headers": {"X-Ai-Coding-Key": self.employee_id},
         }
         if self.settings.llm_disable_env_proxy:
             try:

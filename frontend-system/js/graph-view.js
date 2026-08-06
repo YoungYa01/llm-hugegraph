@@ -1,774 +1,637 @@
+import { createForceLayout } from "./graph-layout.js";
+import { buildIncidentSemantics } from "./graph-semantics.js";
+
 const SVG_NS = "http://www.w3.org/2000/svg";
+const NODE_RADIUS = 32;
+const MIN_SCALE = 0.18;
+const MAX_SCALE = 2.4;
+
+let graphSequence = 0;
 
 const palette = {
-  UIControl: "#e83e8c",
-  UIFunction: "#fd7e14",
-  Service: "#4568dc",
-  API: "#5d7ce3",
-  Component: "#6679aa",
-  System: "#394a78",
-  Database: "#11938f",
-  Cache: "#13a5a0",
-  Queue: "#7a62c8",
-  Middleware: "#6975bd",
-  Cluster: "#16817e",
-  Instance: "#e68a35",
-  Host: "#d1772d",
-  Pod: "#de7d45",
-  VM: "#b87333",
-  NetworkSwitch: "#20c997",
-  Incident: "#ce4052",
-  RCAHypothesis: "#a848a8",
-  LogEvent: "#c85c72",
-  Exception: "#b93645",
-  Trace: "#8b5baa",
+  UIControl: "#c44578",
+  UIFunction: "#c06b2b",
+  Service: "#3f6fba",
+  API: "#5179bd",
+  Component: "#61769b",
+  Function: "#6d7f9d",
+  System: "#334b72",
+  Database: "#178a80",
+  Cache: "#179b91",
+  Queue: "#7460ad",
+  Middleware: "#6874a7",
+  Cluster: "#117b74",
+  Instance: "#c8722f",
+  Host: "#b8662b",
+  Pod: "#ca7044",
+  VM: "#a96332",
+  NetworkSwitch: "#258b82",
+  Incident: "#c43d4d",
+  RCAHypothesis: "#95509a",
+  LogEvent: "#ba596d",
+  Exception: "#a93040",
+  Trace: "#765795",
 };
-
-const kindIcons = {
-  UIControl: "🖱️",
-  UIFunction: "⚙️",
-  Service: "🔌",
-  API: "🌐",
-  Database: "🗄️",
-  Cache: "⚡",
-  Queue: "📥",
-  Host: "🖥️",
-  Pod: "📦",
-  VM: "💻",
-  NetworkSwitch: "🔀",
-  Incident: "🚨",
-  RCAHypothesis: "🧠",
-  Exception: "💥",
-};
-
-const edgeColors = {
-  BELONGS_TO: "#d946ef",
-  TRIGGERS: "#f97316",
-  CALLS: "#3b82f6",
-  PROVIDED_BY: "#0284c7",
-  DEPENDS_ON: "#10b981",
-  USES_DB: "#059669",
-  RUNS_ON: "#f59e0b",
-  HOSTED_ON: "#d97706",
-  CONNECTS_TO: "#84cc16",
-  AFFECTS: "#f43f5e",
-  SUSPECTED_ROOT_CAUSE: "#a855f7",
-};
-
-const archColumnTitles = [
-  "🖱️ UI交互与页面功能",
-  "⚡ 接口网关与业务服务",
-  "🗄️ 数据存储与中间件",
-  "☁️ 容器实例与宿主机",
-];
-
-const fullColumnTitles = [
-  "🖱️ UI交互与页面功能",
-  "⚡ 接口网关与业务服务",
-  "🗄️ 数据存储与中间件",
-  "☁️ 容器实例与宿主机",
-  "🚨 故障判定与根因假说",
-];
 
 function svgElement(name, attributes = {}) {
   const element = document.createElementNS(SVG_NS, name);
-  Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
+  Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, String(value)));
   return element;
 }
 
-function groupFor(node) {
-  if (["Incident", "RCAHypothesis", "LogEvent", "Exception", "Trace", "Window", "Metric"].includes(node.kind)) return 4;
-  if (["Instance", "Host", "Pod", "VM", "NetworkSwitch"].includes(node.kind)) return 3;
-  if (["Database", "Cache", "Queue", "Middleware", "Cluster"].includes(node.kind)) return 2;
-  if (["Service", "Component", "Function", "API"].includes(node.kind)) return 1;
-  if (["UIControl", "UIFunction"].includes(node.kind)) return 0;
-  return 0;
-}
-
-function layout(nodes, hasDynamic) {
-  const numCols = hasDynamic ? 5 : 4;
-  const groups = Array.from({ length: numCols }, () => []);
-  nodes.forEach((node) => {
-    const idx = Math.min(groupFor(node), numCols - 1);
-    groups[idx].push(node);
-  });
-  groups.forEach((items) => items.sort((a, b) => a.name.localeCompare(b.name, "zh-CN")));
-  
-  const positions = new Map();
-  const laneWidths = [];
-  let maxLaneRows = 1;
-
-  const startX = 25;
-  const startY = 126;
-  const rowHeight = 74;
-  const subColGap = 192;
-
-  let currentLaneX = startX;
-
-  groups.forEach((items, colIdx) => {
-    const numSubCols = items.length > 5 ? 2 : 1;
-    const laneWidth = items.length === 0 ? 140 : (numSubCols === 2 ? 380 : 210);
-    laneWidths.push(laneWidth);
-
-    items.forEach((node, idx) => {
-      const subCol = idx % numSubCols;
-      const subRow = Math.floor(idx / numSubCols);
-      const posX = currentLaneX + subCol * subColGap;
-      const posY = startY + subRow * rowHeight;
-      positions.set(node.name, { x: posX, y: posY });
-    });
-
-    const numRows = Math.ceil(items.length / numSubCols);
-    if (numRows > maxLaneRows) maxLaneRows = numRows;
-
-    currentLaneX += laneWidth + 16;
-  });
-
-  const totalWidth = currentLaneX + 15;
-  const totalHeight = Math.max(420, startY + maxLaneRows * rowHeight + 40);
-
-  return {
-    positions,
-    numCols,
-    width: totalWidth,
-    height: totalHeight,
-    laneWidths,
-    startX,
-    startY,
-  };
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function short(value, length = 20) {
-  if (!value) return "";
-  return value.length > length ? `${value.slice(0, length - 1)}…` : value;
+  const text = String(value || "");
+  return text.length > length ? `${text.slice(0, length - 1)}...` : text;
 }
 
-export function renderGraph(container, graph, options = {}) {
-  const onSelect = options.onSelect || options.onSelectNode || (() => {});
-  const onSelectEdge = options.onSelectEdge || (() => {});
+function nodeLines(value) {
+  const text = String(value || "未命名节点");
+  if (text.length <= 11) return [text];
+  if (text.length <= 20) {
+    const splitAt = Math.ceil(text.length / 2);
+    return [text.slice(0, splitAt), text.slice(splitAt)];
+  }
+  return [text.slice(0, 10), `${text.slice(10, 19)}...`];
+}
 
-  container.innerHTML = "";
+export function calculateFitTransform(bounds, viewportWidth, viewportHeight, options = {}) {
+  const padding = Number(options.padding) || 0;
+  const minScale = Number(options.minScale) || MIN_SCALE;
+  const maxScale = Number(options.maxScale) || MAX_SCALE;
+  const graphWidth = Math.max(1, bounds.maxX - bounds.minX);
+  const graphHeight = Math.max(1, bounds.maxY - bounds.minY);
+  const availableWidth = Math.max(1, viewportWidth - padding * 2);
+  const availableHeight = Math.max(1, viewportHeight - padding * 2);
+  const scale = clamp(Math.min(availableWidth / graphWidth, availableHeight / graphHeight), minScale, maxScale);
+  const centerX = (bounds.minX + bounds.maxX) / 2;
+  const centerY = (bounds.minY + bounds.maxY) / 2;
+  return {
+    scale,
+    panX: viewportWidth / 2 - centerX * scale,
+    panY: viewportHeight / 2 - centerY * scale,
+  };
+}
 
-  const nodes = (graph.nodes || []).slice(0, 500);
-  const nodeNames = new Set(nodes.map((node) => node.name));
-  const edges = (graph.edges || []).filter(
-    (edge) => nodeNames.has(edge.source) && nodeNames.has(edge.target)
-  ).slice(0, 1200);
+export function createViewportState(initial = {}) {
+  let scale = clamp(Number(initial.scale) || 1, MIN_SCALE, MAX_SCALE);
+  let panX = Number(initial.panX) || 0;
+  let panY = Number(initial.panY) || 0;
+  return {
+    value: () => ({ scale, panX, panY }),
+    set(next) {
+      scale = clamp(Number(next.scale) || 1, MIN_SCALE, MAX_SCALE);
+      panX = Number(next.panX) || 0;
+      panY = Number(next.panY) || 0;
+    },
+    panBy(deltaX, deltaY) {
+      panX += Number(deltaX) || 0;
+      panY += Number(deltaY) || 0;
+    },
+    zoomAt(nextScale, screenX, screenY) {
+      const targetScale = clamp(Number(nextScale) || scale, MIN_SCALE, MAX_SCALE);
+      const worldX = (screenX - panX) / scale;
+      const worldY = (screenY - panY) / scale;
+      scale = targetScale;
+      panX = screenX - worldX * scale;
+      panY = screenY - worldY * scale;
+    },
+    toWorld(screenX, screenY) {
+      return { x: (screenX - panX) / scale, y: (screenY - panY) / scale };
+    },
+  };
+}
 
-  if (!nodes.length) return null;
+export function shouldShowEdgeLabels(nodeCount, edgeCount) {
+  return edgeCount <= 12 && edgeCount <= Math.max(6, nodeCount * 0.8);
+}
 
-  const hasDynamic = nodes.some((n) =>
-    ["Incident", "RCAHypothesis", "LogEvent", "Exception"].includes(n.kind)
-  );
-  const columnTitles = hasDynamic ? fullColumnTitles : archColumnTitles;
-
-  const affectedNodes = new Set();
-  const rootCauseNodes = new Set();
-
-  edges.forEach((edge) => {
-    if (edge.type === "AFFECTS" || edge.type === "FAULT_PROPAGATES_TO") {
-      affectedNodes.add(edge.target);
-      affectedNodes.add(edge.source);
-    }
-    if (edge.type === "SUSPECTED_ROOT_CAUSE" || edge.type === "CANDIDATE_CAUSE") {
-      rootCauseNodes.add(edge.target);
-    }
-  });
-
-  const { positions, width, height, laneWidths, startX, startY } = layout(nodes, hasDynamic);
-  const svg = svgElement("svg", {
-    role: "img",
-    "aria-label": "全栈系统与故障知识图谱",
-    viewBox: `0 0 ${width} ${height}`,
-    preserveAspectRatio: "xMinYMin meet",
-  });
-
-  const defs = svgElement("defs");
-
-  const arrowNormal = svgElement("marker", {
-    id: "arrow-normal",
+function marker(defs, id, color) {
+  const element = svgElement("marker", {
+    id,
     viewBox: "0 0 10 10",
     refX: "9",
     refY: "5",
     markerWidth: "6",
     markerHeight: "6",
-    orient: "auto-start-reverse",
+    orient: "auto",
+    markerUnits: "strokeWidth",
   });
-  arrowNormal.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#94a3b8" }));
+  element.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color }));
+  defs.append(element);
+}
 
-  const arrowAffects = svgElement("marker", {
-    id: "arrow-affects",
-    viewBox: "0 0 10 10",
-    refX: "9",
-    refY: "5",
-    markerWidth: "7",
-    markerHeight: "7",
-    orient: "auto-start-reverse",
+function routeMap(edges) {
+  const groups = new Map();
+  edges.forEach((edge) => {
+    const ends = [edge.source, edge.target].sort();
+    const key = `${ends[0]}\u0000${ends[1]}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(edge);
   });
-  arrowAffects.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#f43f5e" }));
-
-  const arrowRoot = svgElement("marker", {
-    id: "arrow-root",
-    viewBox: "0 0 10 10",
-    refX: "9",
-    refY: "5",
-    markerWidth: "8",
-    markerHeight: "8",
-    orient: "auto-start-reverse",
+  const routes = new Map();
+  groups.forEach((items) => {
+    items.forEach((edge, index) => {
+      routes.set(edge, items.length === 1 ? 0 : (index - (items.length - 1) / 2) * 28);
+    });
   });
-  arrowRoot.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#a855f7" }));
+  return routes;
+}
 
-  defs.append(arrowNormal, arrowAffects, arrowRoot);
+function edgeGeometry(source, target, curvature = 0, radius = NODE_RADIUS) {
+  if (source.x === target.x && source.y === target.y) {
+    const loopRadius = radius + 22;
+    return {
+      d: `M ${source.x} ${source.y - radius} C ${source.x + loopRadius} ${source.y - loopRadius * 2}, ${source.x - loopRadius} ${source.y - loopRadius * 2}, ${source.x} ${source.y - radius}`,
+      labelX: source.x,
+      labelY: source.y - loopRadius * 1.7,
+    };
+  }
+  const deltaX = target.x - source.x;
+  const deltaY = target.y - source.y;
+  const distance = Math.max(1, Math.hypot(deltaX, deltaY));
+  const unitX = deltaX / distance;
+  const unitY = deltaY / distance;
+  const perpendicularX = -unitY;
+  const perpendicularY = unitX;
+  const startX = source.x + unitX * radius;
+  const startY = source.y + unitY * radius;
+  const endX = target.x - unitX * (radius + 4);
+  const endY = target.y - unitY * (radius + 4);
+  const controlX = (startX + endX) / 2 + perpendicularX * curvature;
+  const controlY = (startY + endY) / 2 + perpendicularY * curvature;
+  const labelX = (startX + 2 * controlX + endX) / 4;
+  const labelY = (startY + 2 * controlY + endY) / 4 - 7;
+  return {
+    d: `M ${startX} ${startY} Q ${controlX} ${controlY} ${endX} ${endY}`,
+    labelX,
+    labelY,
+  };
+}
+
+export function calculateClientPoint(rect, width, height, clientX, clientY) {
+  const scale = Math.min(
+    Math.max(1, Number(rect.width)) / Math.max(1, width),
+    Math.max(1, Number(rect.height)) / Math.max(1, height),
+  );
+  const offsetX = (Number(rect.width) - width * scale) / 2;
+  const offsetY = (Number(rect.height) - height * scale) / 2;
+  return {
+    x: (clientX - Number(rect.left) - offsetX) / scale,
+    y: (clientY - Number(rect.top) - offsetY) / scale,
+  };
+}
+
+function clientPoint(svg, event, width, height) {
+  return calculateClientPoint(svg.getBoundingClientRect(), width, height, event.clientX, event.clientY);
+}
+
+function appendTextLines(group, lines) {
+  const title = svgElement("text", { class: "graph-node-title", x: "0" });
+  const firstY = lines.length === 1 ? 4 : -2;
+  lines.forEach((line, index) => {
+    const span = svgElement("tspan", { x: "0", y: firstY + index * 12 });
+    span.textContent = line;
+    title.append(span);
+  });
+  group.append(title);
+}
+
+function appendBadge(group, label, className, y, width) {
+  const badge = svgElement("g", { class: `graph-node-badge ${className}`, transform: `translate(${-width / 2} ${y})` });
+  badge.append(svgElement("rect", { width, height: "18", rx: "4" }));
+  const text = svgElement("text", { x: width / 2, y: "12" });
+  text.textContent = label;
+  badge.append(text);
+  group.append(badge);
+}
+
+export function renderGraph(
+  container,
+  graph,
+  {
+    mode = "architecture",
+    hypotheses = [],
+    llmDecision = {},
+    onSelect = () => {},
+    onSelectEdge = () => {},
+  } = {},
+) {
+  container.replaceChildren();
+  const nodes = (graph.nodes || []).slice(0, 500);
+  const nodeNames = new Set(nodes.map((node) => node.name));
+  const edges = (graph.edges || [])
+    .filter((edge) => nodeNames.has(edge.source) && nodeNames.has(edge.target))
+    .slice(0, 1200);
+  if (!nodes.length) return null;
+
+  const sequence = ++graphSequence;
+  const viewportWidth = Math.max(720, container.clientWidth || 960);
+  const viewportHeight = mode === "incident" ? 640 : 720;
+  const density = Math.max(1, Math.sqrt(nodes.length / (mode === "incident" ? 14 : 18)));
+  const width = Math.min(3200, Math.max(viewportWidth, viewportWidth * density));
+  const height = Math.min(2400, Math.max(viewportHeight, viewportHeight * density * 0.82));
+  const semantics = mode === "incident"
+    ? buildIncidentSemantics(hypotheses, llmDecision, nodeNames)
+    : { primary: null, alternatives: [], overlays: [], candidateRanks: {}, start: "", end: "", warnings: [] };
+  const layout = createForceLayout(nodes, edges, {
+    mode,
+    primaryChain: semantics.primary?.chain || [],
+    width,
+    height,
+    nodeRadius: NODE_RADIUS,
+    linkDistance: mode === "incident" ? 182 : 172,
+    collisionSpacing: mode === "incident" ? 34 : 30,
+  });
+  const viewportState = createViewportState();
+  const routes = routeMap(edges);
+  const showEdgeLabels = shouldShowEdgeLabels(nodes.length, edges.length);
+
+  const svg = svgElement("svg", {
+    class: "graph-svg",
+    role: "img",
+    "aria-label": mode === "incident" ? "故障传播知识图谱" : "系统架构知识图谱",
+    viewBox: `0 0 ${viewportWidth} ${viewportHeight}`,
+    tabindex: "0",
+  });
+  const defs = svgElement("defs");
+  const markerIds = {
+    base: `graph-arrow-base-${sequence}`,
+    alternative: `graph-arrow-alternative-${sequence}`,
+    model: `graph-arrow-model-${sequence}`,
+    algorithm: `graph-arrow-algorithm-${sequence}`,
+  };
+  marker(defs, markerIds.base, "#9aa6b8");
+  marker(defs, markerIds.alternative, "#98a4b5");
+  marker(defs, markerIds.model, "#cf3545");
+  marker(defs, markerIds.algorithm, "#c47a20");
   svg.append(defs);
 
-  const viewport = svgElement("g");
+  const viewport = svgElement("g", { class: "graph-viewport" });
+  const baseEdgeLayer = svgElement("g", { class: "graph-layer graph-layer-edges" });
+  const alternativeLayer = svgElement("g", { class: "graph-layer graph-layer-alternatives" });
+  const primaryUnderlayLayer = svgElement("g", { class: "graph-layer graph-layer-primary-underlay" });
+  const primaryLayer = svgElement("g", { class: "graph-layer graph-layer-primary" });
+  const nodeLayer = svgElement("g", { class: "graph-layer graph-layer-nodes" });
+  viewport.append(baseEdgeLayer, alternativeLayer, primaryUnderlayLayer, primaryLayer, nodeLayer);
   svg.append(viewport);
 
-  // 1. 绘制 Swimlane 泳道分栏卡片与顶部标题
-  const swimlaneLayer = svgElement("g", { class: "swimlanes" });
-  let currentLaneX = startX;
-
-  columnTitles.forEach((title, colIdx) => {
-    const laneW = laneWidths[colIdx] || 220;
-    const laneX = currentLaneX - 10;
-    
-    const laneBg = svgElement("rect", {
-      x: laneX,
-      y: "64",
-      width: laneW,
-      height: height - 78,
-      rx: "12",
-      fill: colIdx % 2 === 0 ? "#f8fafc" : "#f1f5f9",
-      stroke: "#e2e8f0",
-      "stroke-width": "1",
-      opacity: "0.65",
-    });
-
-    const headerBox = svgElement("rect", {
-      x: laneX,
-      y: "64",
-      width: laneW,
-      height: "38",
-      rx: "8",
-      fill: "#ffffff",
-      stroke: "#cbd5e1",
-      "stroke-width": "1",
-    });
-
-    const headerText = svgElement("text", {
-      x: laneX + laneW / 2,
-      y: "88",
-      "text-anchor": "middle",
-      fill: "#1e293b",
-      "font-size": "13",
-      "font-weight": "700",
-    });
-    headerText.textContent = title;
-
-    swimlaneLayer.append(laneBg, headerBox, headerText);
-    currentLaneX += laneW + 16;
-  });
-  viewport.append(swimlaneLayer);
-
-  const edgeLayer = svgElement("g", { class: "edges" });
-  const nodeLayer = svgElement("g", { class: "nodes" });
-  viewport.append(edgeLayer, nodeLayer);
-
-  const visibleEdgePaths = () => edgeLayer.querySelectorAll("path[data-edge-visible]");
-  const nodeGroupElements = new Map();
-
-  let selectedEdge = null;
-  let selectedNode = null;
-
-  // 2. 绘制依赖连线 (基于语义边类型的调色与箭头)
-  edges.forEach((edge) => {
-    const source = positions.get(edge.source);
-    const target = positions.get(edge.target);
-    if (!source || !target) return;
-
-    const nodeW = 180;
-    let x1, y1, x2, y2, cp1x, cp2x;
-
-    if (Math.abs(source.x - target.x) < 15) {
-      // 同一泳道列内的上下垂直连线 (如 Incident 与同列 Exception/RCAHypothesis 的连线)
-      const isUpward = source.y > target.y;
-      x1 = source.x;
-      y1 = source.y + (isUpward ? 14 : 38);
-      x2 = target.x;
-      y2 = target.y + (isUpward ? 38 : 14);
-
-      const arcOffset = 26;
-      cp1x = source.x - arcOffset;
-      cp2x = target.x - arcOffset;
-    } else if (source.x < target.x) {
-      // 跨列：从左侧节点指向右侧节点
-      x1 = source.x + nodeW;
-      y1 = source.y + 26;
-      x2 = target.x;
-      y2 = target.y + 26;
-
-      const bend = Math.max(25, Math.abs(x2 - x1) * 0.35);
-      cp1x = x1 + bend;
-      cp2x = x2 - bend;
-    } else {
-      // 跨列：从右侧节点指向左侧节点
-      x1 = source.x;
-      y1 = source.y + 26;
-      x2 = target.x + nodeW;
-      y2 = target.y + 26;
-
-      const bend = Math.max(25, Math.abs(x1 - x2) * 0.35);
-      cp1x = x1 - bend;
-      cp2x = x2 + bend;
-    }
-
-    const pathData = `M ${x1} ${y1} C ${cp1x} ${y1}, ${cp2x} ${y2}, ${x2} ${y2}`;
-
-    const edgeGroup = svgElement("g", {
-      class: "edge-group",
-      "data-source": edge.source,
-      "data-target": edge.target,
-      "data-type": edge.type,
-    });
-    edgeGroup.style.transition = "opacity 0.2s ease";
-
-    const isFaultEdge = edge.type === "AFFECTS" || edge.type === "FAULT_PROPAGATES_TO";
-    const isRootEdge = edge.type === "SUSPECTED_ROOT_CAUSE" || edge.type === "CANDIDATE_CAUSE";
-
-    let strokeColor = edgeColors[edge.type] || "#94a3b8";
-    let strokeWidth = isFaultEdge || isRootEdge ? "2.6" : "1.6";
-    let markerEnd = "url(#arrow-normal)";
-
-    if (isFaultEdge) {
-      strokeColor = "#f43f5e";
-      markerEnd = "url(#arrow-affects)";
-    } else if (isRootEdge) {
-      strokeColor = "#a855f7";
-      markerEnd = "url(#arrow-root)";
-    }
-
-    const hitPath = svgElement("path", {
-      d: pathData,
+  const edgeRecords = [];
+  edges.forEach((edge, index) => {
+    const path = svgElement("path", {
+      class: "graph-edge",
       fill: "none",
-      stroke: "transparent",
-      "stroke-width": "16",
-      "pointer-events": "stroke",
+      "marker-end": `url(#${markerIds.base})`,
+      "data-edge-key": String(index),
+    });
+    const hitPath = svgElement("path", {
+      class: "graph-edge-hit",
+      fill: "none",
       tabindex: "0",
       role: "button",
       "aria-label": `关系：${edge.source} ${edge.type} ${edge.target}`,
     });
-
-    const path = svgElement("path", {
-      d: pathData,
-      fill: "none",
-      stroke: strokeColor,
-      "stroke-width": strokeWidth,
-      "marker-end": markerEnd,
-      "pointer-events": "none",
-      "data-edge-visible": "true",
+    const label = svgElement("text", {
+      class: `graph-edge-label${showEdgeLabels ? "" : " graph-edge-label-on-demand"}`,
+      "text-anchor": "middle",
     });
-
-    [hitPath, path].forEach((candidate) => {
-      candidate.dataset.source = edge.source;
-      candidate.dataset.target = edge.target;
-      candidate.dataset.type = edge.type;
-    });
-
-    hitPath.style.cursor = "pointer";
-
-    const chooseEdge = (event) => {
-      event.stopPropagation();
-      if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
-      selectedNode = null;
-
-      Array.from(svg.querySelectorAll("g.edge-group")).forEach((g) => {
-        g.style.opacity = "0.1";
-      });
-
-      selectedEdge = path;
-      edgeGroup.style.opacity = "1";
-      path.setAttribute("stroke", "#2563eb");
-      path.setAttribute("stroke-width", "3.5");
-      onSelectEdge(edge);
-    };
-
-    hitPath.addEventListener("click", chooseEdge);
-    hitPath.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") chooseEdge(event);
-    });
-
-    edgeGroup.append(hitPath, path);
-
-    if (edges.length <= 65) {
-      const label = svgElement("text", {
-        x: String((x1 + x2) / 2),
-        y: String((y1 + y2) / 2 - 6),
-        "text-anchor": "middle",
-        fill: isFaultEdge ? "#e11d48" : "#475569",
-        "font-size": "9.5",
-        "font-weight": isFaultEdge ? "700" : "600",
-      });
-      label.textContent = short(edge.type, 18);
-      label.style.pointerEvents = "none";
-      edgeGroup.append(label);
-    }
-    
-    edgeLayer.append(edgeGroup);
+    label.textContent = short(edge.type, 18);
+    baseEdgeLayer.append(path, hitPath, label);
+    edgeRecords.push({ edge, path, hitPath, label, curvature: routes.get(edge) || 0, index });
   });
 
-  // 3. 绘制节点 (纯素雅极简 Text Badges + 精致边框)
+  const overlayRecords = [];
+  semantics.overlays.forEach((overlay) => {
+    const layer = overlay.variant === "alternative" ? alternativeLayer : primaryLayer;
+    if (overlay.variant !== "alternative") {
+      const underlay = svgElement("path", { class: "graph-propagation-underlay", fill: "none" });
+      primaryUnderlayLayer.append(underlay);
+      overlayRecords.push({ overlay, path: underlay, underlay: true });
+    }
+    const path = svgElement("path", {
+      class: `graph-propagation-edge graph-propagation-${overlay.variant}`,
+      fill: "none",
+      "marker-end": `url(#${markerIds[overlay.variant]})`,
+    });
+    layer.append(path);
+    overlayRecords.push({ overlay, path, underlay: false });
+  });
+
+  const nodeRecords = new Map();
   nodes.forEach((node) => {
-    const pos = positions.get(node.name);
+    const isStart = node.name === semantics.start;
+    const isEnd = node.name === semantics.end;
+    const semanticClasses = [
+      isStart ? "graph-node-start" : "",
+      isEnd ? "graph-node-end" : "",
+      (isStart || isEnd) && semantics.primary?.source === "llm" ? "graph-node-primary-model" : "",
+      (isStart || isEnd) && semantics.primary?.source === "algorithm" ? "graph-node-primary-algorithm" : "",
+    ].filter(Boolean).join(" ");
     const group = svgElement("g", {
-      transform: `translate(${pos.x} ${pos.y})`,
+      class: `graph-node${semanticClasses ? ` ${semanticClasses}` : ""}`,
       tabindex: "0",
       role: "button",
       "aria-label": `节点：${node.name}，类型：${node.kind || "Component"}`,
       "data-node-name": node.name,
     });
-    group.style.cursor = "pointer";
-    group.style.transition = "opacity 0.2s ease";
+    const display = semantics.displayByNode?.[node.name] || null;
+    group.style.setProperty("--node-color", palette[node.kind] || "#61738f");
+    group.append(svgElement("circle", { class: "graph-node-halo", r: NODE_RADIUS + 7 }));
+    group.append(svgElement("circle", { class: "graph-node-circle", r: NODE_RADIUS }));
+    appendTextLines(group, nodeLines(display?.label || node.name));
+    const kind = svgElement("text", { class: "graph-node-kind", x: "0", y: NODE_RADIUS + 17 });
+    kind.textContent = display?.stage || node.kind || "Component";
+    group.append(kind);
 
-    const color = palette[node.kind] || "#64748b";
-    const groupCol = groupFor(node);
-
-    const isStartNode = groupCol === 0;
-    const isAffected = affectedNodes.has(node.name);
-    const isRootCause = rootCauseNodes.has(node.name);
-
-    let cardBg = "#ffffff";
-    let strokeColor = "#cbd5e1";
-    let strokeWidth = "1.5";
-
-    if (isAffected && (node.kind === "UIControl" || node.kind === "UIFunction")) {
-      cardBg = "#fff1f2";
-      strokeColor = "#f43f5e";
-      strokeWidth = "2.5";
-    } else if (isRootCause) {
-      cardBg = "#faf5ff";
-      strokeColor = "#a855f7";
-      strokeWidth = "3";
-    }
-
-    const rect = svgElement("rect", {
-      width: "172",
-      height: "58",
-      rx: "10",
-      fill: cardBg,
-      stroke: strokeColor,
-      "stroke-width": strokeWidth,
-    });
-    rect.dataset.originalStroke = strokeColor;
-
-    const accent = svgElement("rect", {
-      width: "6",
-      height: "58",
-      rx: "3",
-      fill: color,
-    });
-
-    const title = svgElement("text", {
-      x: "16",
-      y: "25",
-      fill: isAffected ? "#9f1239" : "#0f172a",
-      "font-size": "12.5",
-      "font-weight": "700",
-    });
-    title.textContent = short(node.name, 17);
-
-    const kind = svgElement("text", {
-      x: "16",
-      y: "43",
-      fill: "#64748b",
-      "font-size": "10",
-    });
-    kind.textContent = node.kind || "Component";
-
-    group.append(rect, accent, title, kind);
-
-    if (isRootCause) {
-      group.classList.add("node-root-glow");
-    } else if (isAffected) {
-      group.classList.add("node-fault-glow");
-    }
-
-    const isInfraNode = ["Host", "Pod", "Database", "Cache", "NetworkSwitch"].includes(node.kind);
-
-    // 纯素雅极简徽章 (精细适配 172px 节点卡片宽)
-    if (isStartNode) {
-      const badgeG = svgElement("g", { transform: "translate(130, 6)" });
-      const badgeBg = svgElement("rect", {
-        width: "34",
-        height: "18",
-        rx: "9",
-        fill: isAffected ? "#ffe4e6" : "#f1f5f9",
-        stroke: isAffected ? "#f43f5e" : "#cbd5e1",
-        "stroke-width": "1",
-      });
-      const badgeTxt = svgElement("text", {
-        x: "17",
-        y: "13",
-        "text-anchor": "middle",
-        fill: isAffected ? "#be123c" : "#475569",
-        "font-size": "9",
-        "font-weight": "700",
-      });
-      badgeTxt.textContent = isAffected ? "异常" : "起点";
-      badgeG.append(badgeBg, badgeTxt);
-      group.append(badgeG);
-    } else if (isRootCause) {
-      const badgeG = svgElement("g", { transform: "translate(114, 6)" });
-      const badgeBg = svgElement("rect", {
-        width: "50",
-        height: "18",
-        rx: "9",
-        fill: "#f3e8ff",
-        stroke: "#9333ea",
-        "stroke-width": "1",
-      });
-      const badgeTxt = svgElement("text", {
-        x: "25",
-        y: "13",
-        "text-anchor": "middle",
-        fill: "#7e22ce",
-        "font-size": "9",
-        "font-weight": "700",
-      });
-      badgeTxt.textContent = "根因起点";
-      badgeG.append(badgeBg, badgeTxt);
-      group.append(badgeG);
-    } else if (isAffected) {
-      const badgeG = svgElement("g", { transform: "translate(122, 6)" });
-      const badgeBg = svgElement("rect", {
-        width: "42",
-        height: "18",
-        rx: "9",
-        fill: "#fff1f2",
-        stroke: "#f43f5e",
-        "stroke-width": "1",
-      });
-      const badgeTxt = svgElement("text", {
-        x: "21",
-        y: "13",
-        "text-anchor": "middle",
-        fill: "#be123c",
-        "font-size": "9",
-        "font-weight": "700",
-      });
-      badgeTxt.textContent = "受波及";
-      badgeG.append(badgeBg, badgeTxt);
-      group.append(badgeG);
-    } else if (isInfraNode) {
-      const badgeG = svgElement("g", { transform: "translate(114, 6)" });
-      const badgeBg = svgElement("rect", {
-        width: "50",
-        height: "18",
-        rx: "9",
-        fill: "#f8fafc",
-        stroke: "#cbd5e1",
-        "stroke-width": "1",
-      });
-      const badgeTxt = svgElement("text", {
-        x: "25",
-        y: "13",
-        "text-anchor": "middle",
-        fill: "#64748b",
-        "font-size": "8.5",
-        "font-weight": "700",
-      });
-      badgeTxt.textContent = "基础设施";
-      badgeG.append(badgeBg, badgeTxt);
-      group.append(badgeG);
-    }
+    const rank = semantics.candidateRanks[node.name];
+    if (rank) appendBadge(group, `Top-${rank}`, "graph-rank-badge", NODE_RADIUS + 22, 42);
+    if (isStart && isEnd) appendBadge(group, "起点 / 终点", "graph-endpoint-badge", -NODE_RADIUS - 29, 72);
+    else if (isStart) appendBadge(group, "起点", "graph-start-badge", -NODE_RADIUS - 29, 42);
+    else if (isEnd) appendBadge(group, "终点", "graph-end-badge", -NODE_RADIUS - 29, 42);
 
     const browserTitle = svgElement("title");
-    browserTitle.textContent = `${node.name} · ${node.kind}\n${node.description || ""}`;
+    browserTitle.textContent = `${display?.label || node.name} · ${display?.stage || node.kind || "Component"}${display?.explanation ? `\n${display.explanation}` : ""}${display && display.label !== node.name ? `\n真实节点：${node.name}` : ""}${node.description ? `\n${node.description}` : ""}`;
     group.append(browserTitle);
-
-    nodeGroupElements.set(node.name, group);
-
-    const choose = () => {
-      if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
-      selectedEdge = null;
-      selectedNode = rect;
-      rect.setAttribute("stroke", "#2563eb");
-      rect.setAttribute("stroke-width", "3");
-
-      const allEdgeGroups = Array.from(svg.querySelectorAll("g.edge-group"));
-      const neighborNodes = new Set([node.name]);
-
-      allEdgeGroups.forEach((g) => {
-        const isNeighbor = g.dataset.source === node.name || g.dataset.target === node.name;
-        if (isNeighbor) {
-          neighborNodes.add(g.dataset.source);
-          neighborNodes.add(g.dataset.target);
-          g.style.opacity = "1";
-          const path = g.querySelector("path[data-edge-visible]");
-          if (path) {
-            path.setAttribute("stroke", path.dataset.type === "AFFECTS" ? "#f43f5e" : "#2563eb");
-            path.setAttribute("stroke-width", "3");
-          }
-        } else {
-          g.style.opacity = "0.06";
-          const path = g.querySelector("path[data-edge-visible]");
-          if (path) {
-            path.setAttribute("stroke", "#cbd5e1");
-            path.setAttribute("stroke-width", "1");
-          }
-        }
-      });
-
-      nodeGroupElements.forEach((el, name) => {
-        el.style.opacity = neighborNodes.has(name) ? "1" : "0.2";
-      });
-
-      onSelect(node, edges.filter((edge) => edge.source === node.name || edge.target === node.name));
-    };
-
-    group.addEventListener("mouseenter", () => {
-      if (selectedNode) return;
-      const neighborNodes = new Set([node.name]);
-      const allEdgeGroups = Array.from(svg.querySelectorAll("g.edge-group"));
-
-      allEdgeGroups.forEach((g) => {
-        const isNeighbor = g.dataset.source === node.name || g.dataset.target === node.name;
-        if (isNeighbor) {
-          neighborNodes.add(g.dataset.source);
-          neighborNodes.add(g.dataset.target);
-        }
-        g.style.opacity = isNeighbor ? "1" : "0.06";
-      });
-      nodeGroupElements.forEach((el, name) => {
-        el.style.opacity = neighborNodes.has(name) ? "1" : "0.2";
-      });
-    });
-
-    group.addEventListener("mouseleave", () => {
-      if (selectedNode) return;
-      Array.from(svg.querySelectorAll("g.edge-group")).forEach((g) => {
-        g.style.opacity = "1";
-        const path = g.querySelector("path[data-edge-visible]");
-        if (path) {
-          const isFaultEdge = g.dataset.type === "AFFECTS" || g.dataset.type === "FAULT_PROPAGATES_TO";
-          const isRootEdge = g.dataset.type === "SUSPECTED_ROOT_CAUSE" || g.dataset.type === "CANDIDATE_CAUSE";
-          path.setAttribute("stroke", isFaultEdge ? "#f43f5e" : isRootEdge ? "#a855f7" : (edgeColors[g.dataset.type] || "#94a3b8"));
-          path.setAttribute("stroke-width", isFaultEdge || isRootEdge ? "2.6" : "1.6");
-        }
-      });
-      nodeGroupElements.forEach((el) => {
-        el.style.opacity = "1";
-      });
-    });
-
-    group.addEventListener("click", (event) => {
-      event.stopPropagation();
-      choose();
-    });
-    group.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") choose();
-    });
-
     nodeLayer.append(group);
+    nodeRecords.set(node.name, { node, group });
   });
 
-  let scale = 1;
-  let panX = 0;
-  let panY = 0;
-  let dragging = false;
-  let start = { x: 0, y: 0 };
-
-  const transform = () => viewport.setAttribute("transform", `translate(${panX} ${panY}) scale(${scale})`);
-  const zoom = (factor) => {
-    scale = Math.max(0.35, Math.min(2.4, scale * factor));
-    transform();
-  };
-  const reset = () => {
-    scale = 1;
-    panX = 0;
-    panY = 0;
-    transform();
+  const applyViewport = () => {
+    const { scale, panX, panY } = viewportState.value();
+    viewport.setAttribute("transform", `translate(${panX} ${panY}) scale(${scale})`);
+    svg.classList.toggle("graph-zoomed-out", scale < 0.55);
   };
 
-  svg.addEventListener(
-    "wheel",
-    (event) => {
+  const updatePositions = () => {
+    nodeRecords.forEach(({ group }, name) => {
+      const position = layout.position(name);
+      if (position) group.setAttribute("transform", `translate(${position.x} ${position.y})`);
+    });
+    edgeRecords.forEach((record) => {
+      const source = layout.position(record.edge.source);
+      const target = layout.position(record.edge.target);
+      if (!source || !target) return;
+      const geometry = edgeGeometry(source, target, record.curvature);
+      record.path.setAttribute("d", geometry.d);
+      record.hitPath.setAttribute("d", geometry.d);
+      record.label.setAttribute("x", geometry.labelX);
+      record.label.setAttribute("y", geometry.labelY);
+    });
+    overlayRecords.forEach((record) => {
+      const source = layout.position(record.overlay.source);
+      const target = layout.position(record.overlay.target);
+      if (!source || !target) return;
+      record.path.setAttribute("d", edgeGeometry(source, target, 0, NODE_RADIUS + 2).d);
+    });
+  };
+
+  const clearFocus = () => {
+    nodeRecords.forEach(({ group }) => group.classList.remove("graph-selected", "graph-related", "graph-muted"));
+    edgeRecords.forEach(({ path, label }) => {
+      path.classList.remove("graph-selected", "graph-related", "graph-muted");
+      label.classList.remove("graph-selected", "graph-related", "graph-muted");
+    });
+    overlayRecords.forEach(({ path }) => path.classList.remove("graph-related", "graph-muted"));
+  };
+
+  const chooseNode = (name) => {
+    const record = nodeRecords.get(name);
+    if (!record) return;
+    const relatedNames = new Set([name]);
+    const relatedEdges = edges.filter((edge) => {
+      const related = edge.source === name || edge.target === name;
+      if (related) relatedNames.add(edge.source === name ? edge.target : edge.source);
+      return related;
+    });
+    semantics.overlays.forEach((edge) => {
+      if (edge.source === name || edge.target === name) {
+        relatedNames.add(edge.source === name ? edge.target : edge.source);
+      }
+    });
+    nodeRecords.forEach(({ group }, nodeName) => {
+      group.classList.toggle("graph-selected", nodeName === name);
+      group.classList.toggle("graph-related", nodeName !== name && relatedNames.has(nodeName));
+      group.classList.toggle("graph-muted", !relatedNames.has(nodeName));
+    });
+    edgeRecords.forEach(({ edge, path, label }) => {
+      const related = edge.source === name || edge.target === name;
+      path.classList.toggle("graph-related", related);
+      path.classList.toggle("graph-muted", !related);
+      label.classList.toggle("graph-related", related);
+      label.classList.toggle("graph-muted", !related);
+    });
+    overlayRecords.forEach(({ overlay, path }) => {
+      const related = overlay.source === name || overlay.target === name;
+      path.classList.toggle("graph-related", related);
+      path.classList.toggle("graph-muted", !related);
+    });
+    onSelect(record.node, relatedEdges);
+  };
+
+  const chooseEdge = (record) => {
+    nodeRecords.forEach(({ group }, name) => {
+      const related = name === record.edge.source || name === record.edge.target;
+      group.classList.toggle("graph-related", related);
+      group.classList.toggle("graph-muted", !related);
+      group.classList.remove("graph-selected");
+    });
+    edgeRecords.forEach(({ path, label, index }) => {
+      const selected = index === record.index;
+      path.classList.toggle("graph-selected", selected);
+      path.classList.toggle("graph-muted", !selected);
+      label.classList.toggle("graph-selected", selected);
+      label.classList.toggle("graph-muted", !selected);
+    });
+    overlayRecords.forEach(({ path }) => path.classList.add("graph-muted"));
+    onSelectEdge(record.edge);
+  };
+
+  edgeRecords.forEach((record) => {
+    const choose = (event) => {
+      event.stopPropagation();
+      chooseEdge(record);
+    };
+    record.hitPath.addEventListener("click", choose);
+    record.hitPath.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") choose(event);
+    });
+  });
+
+  let destroyed = false;
+  let animationFrame = 0;
+  let fitWhenSettled = true;
+
+  const graphBounds = () => {
+    const positions = layout.snapshot();
+    const xs = positions.map((point) => point.x);
+    const ys = positions.map((point) => point.y);
+    const margin = NODE_RADIUS + 42;
+    return {
+      minX: Math.min(...xs) - margin,
+      minY: Math.min(...ys) - margin,
+      maxX: Math.max(...xs) + margin,
+      maxY: Math.max(...ys) + margin,
+    };
+  };
+
+  const fit = () => {
+    viewportState.set(calculateFitTransform(graphBounds(), viewportWidth, viewportHeight, { padding: 64 }));
+    applyViewport();
+  };
+
+  const schedule = () => {
+    if (destroyed || animationFrame) return;
+    animationFrame = requestAnimationFrame(() => {
+      animationFrame = 0;
+      if (destroyed || !svg.isConnected) {
+        destroyed = true;
+        return;
+      }
+      const settled = layout.step();
+      updatePositions();
+      if (settled) {
+        if (fitWhenSettled) {
+          fitWhenSettled = false;
+          fit();
+        }
+      } else {
+        schedule();
+      }
+    });
+  };
+
+  nodeRecords.forEach(({ group }, name) => {
+    let pointer = null;
+    group.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
       event.preventDefault();
-      zoom(event.deltaY < 0 ? 1.1 : 0.9);
-    },
-    { passive: false }
-  );
+      event.stopPropagation();
+      const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+      const world = viewportState.toWorld(point.x, point.y);
+      const position = layout.position(name);
+      pointer = {
+        id: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        offsetX: world.x - position.x,
+        offsetY: world.y - position.y,
+        dragging: false,
+      };
+      group.setPointerCapture?.(event.pointerId);
+    });
+    group.addEventListener("pointermove", (event) => {
+      if (!pointer || pointer.id !== event.pointerId) return;
+      if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > 4) {
+        pointer.dragging = true;
+      }
+      if (!pointer.dragging) return;
+      const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+      const world = viewportState.toWorld(point.x, point.y);
+      layout.move(name, world.x - pointer.offsetX, world.y - pointer.offsetY);
+      layout.reheat();
+      updatePositions();
+      schedule();
+    });
+    const finishPointer = (event) => {
+      if (!pointer || pointer.id !== event.pointerId) return;
+      const wasDragging = pointer.dragging;
+      pointer = null;
+      group.releasePointerCapture?.(event.pointerId);
+      if (!wasDragging) chooseNode(name);
+    };
+    group.addEventListener("pointerup", finishPointer);
+    group.addEventListener("pointercancel", () => { pointer = null; });
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        chooseNode(name);
+      }
+    });
+  });
 
-  let lastDownPos = { x: 0, y: 0 };
-
+  let panPointer = null;
   svg.addEventListener("pointerdown", (event) => {
-    lastDownPos = { x: event.clientX, y: event.clientY };
-    if (event.target !== svg && event.target.tagName !== "rect" && !event.target.closest(".swimlanes")) return;
-    dragging = true;
-    start = { x: event.clientX - panX, y: event.clientY - panY };
+    if (event.target !== svg || event.button !== 0) return;
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+    panPointer = { id: event.pointerId, x: point.x, y: point.y, moved: false };
     svg.setPointerCapture?.(event.pointerId);
   });
   svg.addEventListener("pointermove", (event) => {
-    if (!dragging) return;
-    panX = event.clientX - start.x;
-    panY = event.clientY - start.y;
-    transform();
+    if (!panPointer || panPointer.id !== event.pointerId) return;
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+    const deltaX = point.x - panPointer.x;
+    const deltaY = point.y - panPointer.y;
+    if (Math.hypot(deltaX, deltaY) > 1) panPointer.moved = true;
+    viewportState.panBy(deltaX, deltaY);
+    panPointer.x = point.x;
+    panPointer.y = point.y;
+    applyViewport();
   });
-  svg.addEventListener("pointerup", () => {
-    dragging = false;
-  });
-  svg.addEventListener("pointercancel", () => {
-    dragging = false;
-  });
-
-  svg.addEventListener("click", (event) => {
-    // 如果鼠标按下和抬起的物理移动距离 > 5 像素，说明用户是在平移拖动画布 (Drag)，绝对不取消高亮！
-    const moveDist = Math.hypot(event.clientX - lastDownPos.x, event.clientY - lastDownPos.y);
-    if (moveDist > 5) return;
-
-    if (event.target === svg || event.target.tagName === "rect") {
-      selectedEdge = null;
-      if (selectedNode) selectedNode.setAttribute("stroke", selectedNode.dataset.originalStroke);
-      selectedNode = null;
-      Array.from(svg.querySelectorAll("g.edge-group")).forEach((g) => {
-        g.style.opacity = "1";
-        const path = g.querySelector("path[data-edge-visible]");
-        if (path) {
-          const isFaultEdge = g.dataset.type === "AFFECTS" || g.dataset.type === "FAULT_PROPAGATES_TO";
-          const isRootEdge = g.dataset.type === "SUSPECTED_ROOT_CAUSE" || g.dataset.type === "CANDIDATE_CAUSE";
-          path.setAttribute("stroke", isFaultEdge ? "#f43f5e" : isRootEdge ? "#a855f7" : (edgeColors[g.dataset.type] || "#94a3b8"));
-          path.setAttribute("stroke-width", isFaultEdge || isRootEdge ? "2.6" : "1.6");
-        }
-      });
-      nodeGroupElements.forEach((el) => {
-        el.style.opacity = "1";
-      });
-    }
-  });
+  const finishPan = (event) => {
+    if (!panPointer || panPointer.id !== event.pointerId) return;
+    const moved = panPointer.moved;
+    panPointer = null;
+    svg.releasePointerCapture?.(event.pointerId);
+    if (!moved) clearFocus();
+  };
+  svg.addEventListener("pointerup", finishPan);
+  svg.addEventListener("pointercancel", () => { panPointer = null; });
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+    const { scale } = viewportState.value();
+    viewportState.zoomAt(scale * (event.deltaY < 0 ? 1.12 : 0.88), point.x, point.y);
+    applyViewport();
+  }, { passive: false });
 
   container.append(svg);
+  updatePositions();
+  fit();
+  schedule();
+
+  const zoomBy = (factor) => {
+    const current = viewportState.value();
+    viewportState.zoomAt(current.scale * factor, viewportWidth / 2, viewportHeight / 2);
+    applyViewport();
+  };
+
   return {
-    zoomIn: () => zoom(1.18),
-    zoomOut: () => zoom(0.84),
-    reset,
+    zoomIn: () => zoomBy(1.18),
+    zoomOut: () => zoomBy(0.84),
+    fit,
+    reset: fit,
+    relayout() {
+      layout.reset();
+      updatePositions();
+      fitWhenSettled = true;
+      schedule();
+    },
+    destroy() {
+      destroyed = true;
+      if (animationFrame) cancelAnimationFrame(animationFrame);
+      animationFrame = 0;
+    },
     nodeCount: nodes.length,
     edgeCount: edges.length,
+    semantics,
   };
 }
 
-export function graphLegend(includeDynamic = true) {
+export function graphLegend(includeDynamic = true, includePropagation = false) {
   const entries = [
-    ["UIControl", "UI控件 (起点)"],
-    ["UIFunction", "页面功能"],
+    ["UIControl", "界面交互"],
     ["Service", "服务"],
-    ["Database", "数据库/缓存"],
-    ["Host", "宿主机"],
-    ["Pod", "容器"],
+    ["Database", "数据资源"],
+    ["Cluster", "集群"],
+    ["Instance", "实例"],
   ];
-  if (includeDynamic) entries.push(["Incident", "故障"], ["RCAHypothesis", "根因假说"]);
-  return entries
-    .map(
-      ([kind, label]) =>
-        `<span><i class="legend-dot" style="background:${palette[kind]}"></i>${label}</span>`
-    )
+  if (includeDynamic) entries.push(["Incident", "故障"], ["RCAHypothesis", "根因候选"]);
+  const nodeLegend = entries
+    .map(([kind, label]) => `<span><i class="legend-dot" style="background:${palette[kind]}"></i>${label}</span>`)
     .join("");
+  if (!includePropagation) return nodeLegend;
+  return `${nodeLegend}<span><i class="legend-line legend-line-model"></i>模型结论</span><span><i class="legend-line legend-line-algorithm"></i>算法首选</span><span><i class="legend-line legend-line-alternative"></i>其他候选</span>`;
 }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from app.hugegraph_client import HugeGraphRestClient, HugeGraphRestError
 from app.models import GraphEdge, GraphNode, GraphResponse
 from app.scoped_graph import ProjectScopedGraphClient
+from app.service import GraphBuilderService
 
 
 class FakeClient:
@@ -133,3 +135,182 @@ def test_edge_update_deletes_old_tuple_then_creates_new_tuple() -> None:
         "USES_DB",
         "cache access",
     )
+
+
+def test_namespaced_lookup_never_matches_another_projects_display_name() -> None:
+    client = HugeGraphRestClient()
+    client.list_vertices = lambda limit=10000: [  # type: ignore[method-assign]
+        {
+            "id": "p2-id",
+            "properties": {
+                client.pk_name: "project::p2::order",
+                client.pk_meta: '{"project_id":"p2","display_name":"order"}',
+            },
+        },
+        {
+            "id": "p1-id",
+            "properties": {
+                client.pk_name: "project::p1::order",
+                client.pk_meta: '{"project_id":"p1","display_name":"order"}',
+            },
+        },
+    ]
+
+    assert client.find_node_by_name("project::p1::order")["id"] == "p1-id"
+    assert client.find_node_by_name("project::p3::order") is None
+
+
+def test_upsert_updates_existing_primary_key_without_second_post() -> None:
+    client = HugeGraphRestClient()
+    client.ensure_schema = lambda: []  # type: ignore[method-assign]
+    client.find_node_by_name = lambda name: {"id": "existing-id"}  # type: ignore[method-assign]
+    updates: list[tuple] = []
+    client.update_node_by_id = lambda *args: updates.append(args) or {"id": "existing-id"}  # type: ignore[method-assign]
+    client._request = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("POST must not run"))  # type: ignore[method-assign]
+
+    result = client.upsert_node("project::p1::order", kind="Service")
+
+    assert result["id"] == "existing-id"
+    assert updates[0][0] == "existing-id"
+
+
+def test_vertex_id_encoding_quotes_string_once_and_only_protects_slashes() -> None:
+    client = HugeGraphRestClient()
+    vertex_id = "6:project::p1::Exception:访问URI[/bdp-etl/service/v0/flows]"
+
+    candidates = client._encoded_id_candidates(vertex_id)
+
+    assert candidates[0].startswith("%226%3Aproject%3A%3A")
+    assert candidates[0].endswith("%22")
+    assert "%252Fbdp-etl%252Fservice%252Fv0%252Fflows" in candidates[0]
+    assert "%253A" not in candidates[0]
+    assert "%2522" not in candidates[0]
+    assert "%2Fbdp-etl%2Fservice%2Fv0%2Fflows" in candidates[1]
+
+
+def test_vertex_id_encoding_normalizes_prequoted_or_encoded_input() -> None:
+    client = HugeGraphRestClient()
+    raw = "6:project::p1::Exception:failure"
+    quoted = '"6:project::p1::Exception:failure"'
+    encoded = "%226%3Aproject%3A%3Ap1%3A%3AException%3Afailure%22"
+
+    assert client._encoded_id_candidates(raw) == client._encoded_id_candidates(quoted)
+    assert client._encoded_id_candidates(raw) == client._encoded_id_candidates(encoded)
+
+
+def test_update_vertex_with_uri_id_never_double_encodes_the_whole_id() -> None:
+    client = HugeGraphRestClient()
+    paths: list[str] = []
+    client._request = lambda method, path, **kwargs: paths.append(path) or {"id": "ok"}  # type: ignore[method-assign]
+
+    client.update_node_by_id(
+        "6:project::p1::Exception:访问URI[/bdp-etl/service]",
+        "project::p1::Exception:访问URI[/bdp-etl/service]",
+    )
+
+    assert len(paths) == 1
+    assert "%253A" not in paths[0]
+    assert "%2522" not in paths[0]
+    assert "%252Fbdp-etl%252Fservice" in paths[0]
+
+
+def test_deleted_primary_key_can_be_recreated_and_read_again() -> None:
+    client = HugeGraphRestClient()
+    client.ensure_schema = lambda: []  # type: ignore[method-assign]
+    vertices = [
+        {
+            "id": "stable-primary-key-id",
+            "properties": {
+                client.pk_name: "project::p1::order",
+                client.pk_kind: "Service",
+                client.pk_meta: '{"project_id":"p1","display_name":"order"}',
+            },
+        }
+    ]
+    client.list_vertices = lambda limit=800: list(vertices)  # type: ignore[method-assign]
+    client.list_edges = lambda limit=1600: []  # type: ignore[method-assign]
+
+    def request(method: str, path: str, **kwargs) -> dict | None:
+        if method == "DELETE":
+            vertices.clear()
+            return None
+        if method == "POST" and path == "graph/vertices":
+            payload = kwargs["json_body"]
+            recreated = {
+                "id": "stable-primary-key-id",
+                "properties": dict(payload["properties"]),
+            }
+            vertices.append(recreated)
+            return recreated
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client._request = request  # type: ignore[method-assign]
+
+    assert client.delete_node_by_name("project::p1::order") is True
+    assert client.read_graph().nodes == []
+
+    recreated = client.upsert_node("project::p1::order", kind="Service")
+    graph = client.read_graph()
+
+    assert recreated["id"] == "stable-primary-key-id"
+    assert [node.name for node in graph.nodes] == ["project::p1::order"]
+
+
+def test_node_delete_reports_failure_when_hugegraph_rejects_every_id() -> None:
+    client = HugeGraphRestClient()
+    client.ensure_schema = lambda: []  # type: ignore[method-assign]
+    client.find_node_by_name = lambda name: {"id": "vertex-id"}  # type: ignore[method-assign]
+    client.list_edges = lambda limit=10000: []  # type: ignore[method-assign]
+    client._request = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        HugeGraphRestError("delete rejected")
+    )
+
+    assert client.delete_node_by_name("project::p1::order") is False
+
+
+def test_graph_builder_creates_edges_by_name_when_node_update_has_no_id() -> None:
+    class FakeBuilderDb:
+        def __init__(self) -> None:
+            self.edges: list[tuple[str, str, str]] = []
+
+        def ensure_schema(self) -> list[str]:
+            return []
+
+        def upsert_node(self, **kwargs) -> dict:
+            return {}
+
+        def add_edge_by_names(
+            self,
+            source: str,
+            target: str,
+            relation: str,
+            description: str,
+            meta: dict,
+        ) -> dict:
+            del description, meta
+            self.edges.append((source, target, relation))
+            return {"id": "edge-id"}
+
+    class FakeAnalyzer:
+        last_mode = "test"
+        last_logs: list[str] = []
+
+        def analyze_architecture(self, text: str) -> dict:
+            del text
+            return {
+                "services": [
+                    {"name": "order", "kind": "Service"},
+                    {"name": "redis", "kind": "Cache"},
+                ],
+                "calls": [
+                    {"source": "order", "target": "redis", "type": "DEPENDS_ON"},
+                ],
+            }
+
+    db = FakeBuilderDb()
+    builder = GraphBuilderService(db=db)  # type: ignore[arg-type]
+    builder.analyzer = FakeAnalyzer()  # type: ignore[assignment]
+
+    builder.build_ontology_graph("order depends on redis")
+
+    assert db.edges == [("order", "redis", "DEPENDS_ON")]

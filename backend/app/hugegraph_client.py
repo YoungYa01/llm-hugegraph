@@ -352,20 +352,37 @@ class HugeGraphRestClient:
     def _encoded_id_candidates(self, vertex_id: str) -> list[str]:
         if not vertex_id:
             return []
-        single_quoted = urllib.parse.quote(vertex_id, safe="")
-        candidates = [
-            single_quoted,
-            # 对于包含 / 的 vertex_id (如 /api)，服务器在接收路径时会自动解码一级 %2F，
-            # 必须提供双重编码 %252F 才能让底层 HTTP 路由精准识别包含斜杠的节点 ID
-            urllib.parse.quote(single_quoted, safe=""),
-            urllib.parse.quote(json.dumps(vertex_id, ensure_ascii=False), safe=""),
-        ]
-        # HugeGraph primary-key id is often like 1:name. Some versions expect the
-        # quoted URL form exactly for string IDs.
-        if not (vertex_id.startswith('"') and vertex_id.endswith('"')):
-            quoted_str = urllib.parse.quote(f'"{vertex_id}"', safe="")
-            candidates.append(quoted_str)
-            candidates.append(urllib.parse.quote(quoted_str, safe=""))
+        raw_id = str(vertex_id).strip()
+        # Some proxies/logs hand the id back in its JSON-quoted or URL-encoded
+        # representation. Normalize it once before applying HugeGraph's type
+        # syntax; otherwise `%22` becomes `%2522` and the server sees percent
+        # text instead of a String id.
+        for _ in range(2):
+            lowered = raw_id.lower()
+            if not (
+                (lowered.startswith("%22") and lowered.endswith("%22"))
+                or (lowered.startswith("%2522") and lowered.endswith("%2522"))
+            ):
+                break
+            decoded = urllib.parse.unquote(raw_id)
+            if decoded == raw_id:
+                break
+            raw_id = decoded
+        if raw_id.startswith('"') and raw_id.endswith('"'):
+            try:
+                decoded_json = json.loads(raw_id)
+                if isinstance(decoded_json, str):
+                    raw_id = decoded_json
+            except Exception:
+                raw_id = raw_id[1:-1]
+
+        # LogSysNode uses PRIMARY_KEY, therefore its REST id is a JSON String
+        # enclosed in quotes. Encode that typed value exactly once as required
+        # by HugeGraph. For ids containing '/', keep only the slash protected
+        # for one extra routing decode; never double-encode the whole id.
+        canonical = urllib.parse.quote(json.dumps(raw_id, ensure_ascii=False), safe="")
+        slash_protected = canonical.replace("%2F", "%252F").replace("%2f", "%252F")
+        candidates = [slash_protected, canonical]
         deduped: list[str] = []
         for item in candidates:
             if item not in deduped:

@@ -1,4 +1,5 @@
 const EVIDENCE_KINDS = new Set(["LogEvent", "Trace", "Exception", "Window", "Metric"]);
+const INTERNAL_KINDS = new Set(["Incident", "RCAHypothesis", "Trace", "UnresolvedDependency"]);
 
 const normalize = (value) => String(value || "").trim().toLocaleLowerCase();
 
@@ -9,8 +10,12 @@ const validHypothesis = (hypothesis) => (
 );
 
 export function filterIncidentGraph(graph, includeEvidence) {
-  if (includeEvidence) return graph;
-  const nodes = (graph.nodes || []).filter((node) => !EVIDENCE_KINDS.has(node.kind));
+  const nodes = (graph.nodes || []).filter((node) => {
+    const name = String(node?.name || "");
+    if (INTERNAL_KINDS.has(node.kind)) return false;
+    if (/^(?:Incident|RCAHypothesis|RootCandidate|Trace):/i.test(name)) return false;
+    return includeEvidence || !EVIDENCE_KINDS.has(node.kind);
+  });
   const names = new Set(nodes.map((node) => node.name));
   return {
     ...graph,
@@ -71,13 +76,15 @@ export function buildIncidentSemantics(hypotheses = [], llmDecision = {}, visibl
       }];
     }),
   );
-  const alternatives = candidates.filter((item) => item !== selected && item !== primaryCandidate);
+  // The detail view explains one final decision. Alternative hypotheses stay
+  // persisted for audit, but rendering them together obscures the chosen path.
+  const alternatives = [];
   const warnings = [];
   const overlays = [];
   const seenEdges = new Set();
-  const candidateRanks = Object.fromEntries(
-    candidates.map((item) => [String(item.candidate || item.chain[0]), Number(item.rank || 0)]),
-  );
+  const candidateRanks = primary?.source === "algorithm" && primary?.rank
+    ? { [String(primary.candidate || primary.chain[0])]: Number(primary.rank) }
+    : {};
 
   const appendChain = (hypothesis, variant) => {
     const missing = visibleNames

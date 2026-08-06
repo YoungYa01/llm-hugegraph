@@ -174,6 +174,46 @@ def test_upsert_updates_existing_primary_key_without_second_post() -> None:
     assert updates[0][0] == "existing-id"
 
 
+def test_vertex_id_encoding_quotes_string_once_and_only_protects_slashes() -> None:
+    client = HugeGraphRestClient()
+    vertex_id = "6:project::p1::Exception:访问URI[/bdp-etl/service/v0/flows]"
+
+    candidates = client._encoded_id_candidates(vertex_id)
+
+    assert candidates[0].startswith("%226%3Aproject%3A%3A")
+    assert candidates[0].endswith("%22")
+    assert "%252Fbdp-etl%252Fservice%252Fv0%252Fflows" in candidates[0]
+    assert "%253A" not in candidates[0]
+    assert "%2522" not in candidates[0]
+    assert "%2Fbdp-etl%2Fservice%2Fv0%2Fflows" in candidates[1]
+
+
+def test_vertex_id_encoding_normalizes_prequoted_or_encoded_input() -> None:
+    client = HugeGraphRestClient()
+    raw = "6:project::p1::Exception:failure"
+    quoted = '"6:project::p1::Exception:failure"'
+    encoded = "%226%3Aproject%3A%3Ap1%3A%3AException%3Afailure%22"
+
+    assert client._encoded_id_candidates(raw) == client._encoded_id_candidates(quoted)
+    assert client._encoded_id_candidates(raw) == client._encoded_id_candidates(encoded)
+
+
+def test_update_vertex_with_uri_id_never_double_encodes_the_whole_id() -> None:
+    client = HugeGraphRestClient()
+    paths: list[str] = []
+    client._request = lambda method, path, **kwargs: paths.append(path) or {"id": "ok"}  # type: ignore[method-assign]
+
+    client.update_node_by_id(
+        "6:project::p1::Exception:访问URI[/bdp-etl/service]",
+        "project::p1::Exception:访问URI[/bdp-etl/service]",
+    )
+
+    assert len(paths) == 1
+    assert "%253A" not in paths[0]
+    assert "%2522" not in paths[0]
+    assert "%252Fbdp-etl%252Fservice" in paths[0]
+
+
 def test_deleted_primary_key_can_be_recreated_and_read_again() -> None:
     client = HugeGraphRestClient()
     client.ensure_schema = lambda: []  # type: ignore[method-assign]

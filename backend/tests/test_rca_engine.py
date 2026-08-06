@@ -182,6 +182,31 @@ def test_edge_write_resolves_native_hugegraph_id_instead_of_model_entity_id() ->
     assert vertex_id != "project::p1::security-service"
 
 
+def test_existing_shared_exception_is_reused_without_vertex_update() -> None:
+    class ExistingExceptionDb:
+        def find_node_by_name(self, name: str) -> dict:
+            return {"id": f'native:"{name}"'}
+
+        def upsert_node(self, **kwargs):
+            raise AssertionError("existing exception must not be updated")
+
+    integrator = IncidentGraphIntegrator(db=ExistingExceptionDb())  # type: ignore[arg-type]
+    name = "Exception:访问URI[/bdp-etl/service/v0/flows]"
+
+    integrator._write_node(
+        name,
+        "异常分析层",
+        "Exception",
+        "404 NOT_FOUND",
+        "logs.zip",
+        {"root_cause": "404 NOT_FOUND"},
+        preserve_existing=True,
+    )
+
+    assert integrator._vertex_id_cache[name] == f'native:"{name}"'
+    assert name in integrator._known_nodes
+
+
 def test_rule_fallback_extracts_aliases_and_redis_member_topology() -> None:
     document = Path(__file__).resolve().parents[2] / "examples" / "architecture-redis-demo.md"
     extracted = RuleBasedArchitectureExtractor().extract(document.read_text(encoding="utf-8"))

@@ -424,8 +424,22 @@ class IncidentGraphIntegrator:
     ) -> None:
         if not name:
             return
-        if preserve_existing and name in self._known_nodes:
-            return
+        if preserve_existing:
+            if name in self._known_nodes:
+                return
+            if hasattr(self.db, "find_node_by_name"):
+                existing = self.db.find_node_by_name(name)
+                if isinstance(existing, dict):
+                    vertex_id = str(existing.get("id") or "").strip()
+                    if vertex_id:
+                        self._vertex_id_cache[name] = vertex_id
+                    self._known_nodes[name] = {
+                        "kind": kind,
+                        "layer": layer,
+                        "description": description,
+                        "meta": dict(meta or {}),
+                    }
+                    return
         node_meta = dict(meta or {})
         if kind in {"Incident", "Trace", "LogEvent", "Exception", "RCAHypothesis", "UnresolvedDependency"}:
             node_meta.setdefault("dynamic_observation", True)
@@ -542,7 +556,15 @@ class IncidentGraphIntegrator:
             )
             self._write_edge(incident_node, root_service, "OBSERVED_AT", "最底层异常首先定位到该服务", {"raw_service": root_service_raw})
         if exception_name:
-            self._write_node(exception_name, "异常分析层", "Exception", root_cause[:500], source_name, {"root_cause": root_cause})
+            self._write_node(
+                exception_name,
+                "异常分析层",
+                "Exception",
+                root_cause[:500],
+                source_name,
+                {"root_cause": root_cause},
+                preserve_existing=True,
+            )
             self._write_edge(incident_node, exception_name, "HAS_EXCEPTION", "日志中提取到的底层异常特征", {"root_cause": root_cause})
 
         # logfault-incident-clustering-v2: preserve every exception class, not only Top-1.
@@ -582,9 +604,7 @@ class IncidentGraphIntegrator:
             trace_node = ""
 
         timeline = detail.get("timeline") or []
-        if isinstance(timeline, list):
-            timeline = timeline[: max(1, int(self.settings.incident_timeline_limit))]
-        else:
+        if not isinstance(timeline, list):
             timeline = []
         selection = select_relevant_timeline(timeline, detail, self.settings)
         selected_timeline = selection.events

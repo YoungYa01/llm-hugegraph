@@ -84,6 +84,18 @@ class Settings:
     incident_timeline_limit: int = _int_env("INCIDENT_TIMELINE_LIMIT", 120)
     rca_top_k: int = _int_env("RCA_TOP_K", 5)
 
+    # RCA graph pruning: keep only evidence and topology relevant to the incident.
+    rca_graph_pruning_enabled: bool = _bool_env("RCA_GRAPH_PRUNING_ENABLED", True)
+    rca_graph_max_events: int = _int_env("RCA_GRAPH_MAX_EVENTS", 24)
+    rca_graph_context_radius: int = _int_env("RCA_GRAPH_CONTEXT_RADIUS", 1)
+    rca_graph_max_events_per_pattern: int = _int_env("RCA_GRAPH_MAX_EVENTS_PER_PATTERN", 2)
+    rca_graph_max_root_candidates: int = _int_env("RCA_GRAPH_MAX_ROOT_CANDIDATES", 3)
+    rca_graph_max_hypotheses: int = _int_env("RCA_GRAPH_MAX_HYPOTHESES", 3)
+    rca_graph_max_exceptions: int = _int_env("RCA_GRAPH_MAX_EXCEPTIONS", 3)
+    rca_graph_write_unresolved_services: bool = _bool_env("RCA_GRAPH_WRITE_UNRESOLVED_SERVICES", False)
+    rca_graph_write_cooccurrence_edges: bool = _bool_env("RCA_GRAPH_WRITE_COOCCURRENCE_EDGES", False)
+    rca_graph_write_temporal_edges: bool = _bool_env("RCA_GRAPH_WRITE_TEMPORAL_EDGES", True)
+
     # Deterministic log compression before the final RCA decision LLM call.
     # max_chars is a hard budget for the compressed log-context JSON only.
     log_compression_enabled: bool = _bool_env("LOG_COMPRESSION_ENABLED", True)
@@ -98,7 +110,6 @@ class Settings:
     rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)
     rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation")
     rca_decision_model_config_id: str = _env("RCA_DECISION_MODEL_CONFIG_ID", "")
-    rca_decision_conversation_id: str = _env("RCA_DECISION_CONVERSATION_ID", "")
     rca_decision_assistant_role: str = _env("RCA_DECISION_ASSISTANT_ROLE", "general")
     rca_decision_assistant_name: str = _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant")
     rca_decision_assistant_prompt: str = _env("RCA_DECISION_ASSISTANT_PROMPT", "")

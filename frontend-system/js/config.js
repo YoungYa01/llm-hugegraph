@@ -1,7 +1,7 @@
 export const API_BASE = (localStorage.getItem("logscope_api_base") || "http://127.0.0.1:8000/api").replace(/\/$/, "");
 
 export const APP_NAME = "LogScope RCA";
-export const APP_VERSION = "2026.07.21-r2";
+export const APP_VERSION = "2026.08.03-r1";
 
 export const STATUS_LABELS = {
   open: "待处理",

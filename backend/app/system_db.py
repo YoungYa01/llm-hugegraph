@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,6 +39,7 @@ class SystemDatabase:
                     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     password_hash TEXT NOT NULL,
                     display_name TEXT NOT NULL,
+                    employee_id TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'user',
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -134,6 +136,16 @@ class SystemDatabase:
                 CREATE INDEX IF NOT EXISTS idx_actions_incident ON incident_actions(incident_id, created_at);
                 """
             )
+            user_cols = [row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()]
+            if "employee_id" not in user_cols:
+                connection.execute("ALTER TABLE users ADD COLUMN employee_id TEXT NOT NULL DEFAULT ''")
+            # 兼容性表结构升级：确保长任务具备进度列与阶段描述列
+            for table in ("architecture_imports", "log_batches"):
+                cols = [row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()]
+                if "progress" not in cols:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
+                if "progress_message" not in cols:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
 
     def query_one(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -155,13 +167,19 @@ class SystemDatabase:
         row = self.query_one("SELECT COUNT(*) AS value FROM users")
         return int((row or {}).get("value") or 0)
 
-    def create_user(self, username: str, password_hash: str, display_name: str) -> dict[str, Any]:
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        display_name: str,
+        employee_id: str,
+    ) -> dict[str, Any]:
         user_id = str(uuid.uuid4())
         now = utc_now()
         role = "admin" if self.user_count() == 0 else "user"
         self.execute(
-            "INSERT INTO users(id, username, password_hash, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, username, password_hash, display_name, role, now, now),
+            "INSERT INTO users(id, username, password_hash, display_name, employee_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, username, password_hash, display_name, employee_id, role, now, now),
         )
         return self.get_user(user_id) or {}
 
@@ -209,13 +227,82 @@ class SystemDatabase:
     def list_projects(self, owner_id: str, include_archived: bool = False) -> list[dict[str, Any]]:
         if include_archived:
             return self.query_all(
-                "SELECT * FROM projects WHERE owner_id = ? ORDER BY updated_at DESC",
+                "SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name FROM projects p LEFT JOIN users u ON p.owner_id = u.id WHERE p.owner_id = ? ORDER BY p.updated_at DESC",
                 (owner_id,),
             )
         return self.query_all(
-            "SELECT * FROM projects WHERE owner_id = ? AND status != 'archived' ORDER BY updated_at DESC",
+            "SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name FROM projects p LEFT JOIN users u ON p.owner_id = u.id WHERE p.owner_id = ? AND p.status != 'archived' ORDER BY p.updated_at DESC",
             (owner_id,),
         )
+
+    def list_projects_for_user(self, user: dict[str, Any]) -> list[dict[str, Any]]:
+        """管理员查看全系统所有人的项目，普通用户仅查看自己创建的项目。"""
+        if user.get("role") == "admin":
+            return self.query_all(
+                """
+                SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name
+                FROM projects p
+                LEFT JOIN users u ON p.owner_id = u.id
+                WHERE p.status != 'archived'
+                ORDER BY p.updated_at DESC
+                """
+            )
+        return self.query_all(
+            """
+            SELECT p.*, u.username AS owner_name, u.display_name AS owner_display_name
+            FROM projects p
+            LEFT JOIN users u ON p.owner_id = u.id
+            WHERE p.owner_id = ? AND p.status != 'archived'
+            ORDER BY p.updated_at DESC
+            """,
+            (user["id"],),
+        )
+
+    def list_all_users(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT id, username, display_name, employee_id, role, is_active, created_at FROM users ORDER BY created_at ASC"
+        )
+
+    def update_user_role_and_status(self, user_id: str, role: str, is_active: int) -> dict[str, Any] | None:
+        self.execute(
+            "UPDATE users SET role = ?, is_active = ? WHERE id = ?",
+            (role, is_active, user_id),
+        )
+        return self.get_user(user_id)
+
+    def update_user_profile(
+        self,
+        user_id: str,
+        display_name: str | None = None,
+        employee_id: str | None = None,
+        role: str | None = None,
+        is_active: int | None = None,
+        password_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        updates = []
+        params = []
+        if display_name is not None:
+            updates.append("display_name = ?")
+            params.append(display_name)
+        if employee_id is not None:
+            updates.append("employee_id = ?")
+            params.append(employee_id)
+        if role is not None:
+            updates.append("role = ?")
+            params.append(role)
+        if is_active is not None:
+            updates.append("is_active = ?")
+            params.append(is_active)
+        if password_hash is not None:
+            updates.append("password_hash = ?")
+            params.append(password_hash)
+
+        if updates:
+            params.append(user_id)
+            query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+            self.execute(query, tuple(params))
+
+        return self.get_user(user_id)
 
     def update_project(self, project_id: str, name: str, description: str, status: str) -> dict[str, Any]:
         self.execute(
@@ -223,6 +310,13 @@ class SystemDatabase:
             (name, description, status, utc_now(), project_id),
         )
         return self.get_project(project_id) or {}
+
+    def delete_project(self, project_id: str) -> bool:
+        """物理删除项目及其关联的所有架构、日志批次与故障记录（触发级联删除）。"""
+        with self.connect() as connection:
+            cursor = connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            connection.commit()
+            return cursor.rowcount > 0
 
     def dashboard(self, project_id: str) -> dict[str, Any]:
         counts = self.query_one(
@@ -236,11 +330,46 @@ class SystemDatabase:
             """,
             (project_id, project_id, project_id, project_id, project_id),
         ) or {}
+        severity_row = self.query_one(
+            """
+            SELECT
+              SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS cnt_critical,
+              SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) AS cnt_high,
+              SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) AS cnt_medium,
+              SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) AS cnt_low
+            FROM incidents WHERE project_id = ?
+            """,
+            (project_id,),
+        ) or {}
+        status_row = self.query_one(
+            """
+            SELECT
+              SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS cnt_open,
+              SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS cnt_in_progress,
+              SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS cnt_resolved
+            FROM incidents WHERE project_id = ?
+            """,
+            (project_id,),
+        ) or {}
         recent = self.query_all(
             "SELECT id, title, severity, status, root_candidate, root_confidence, created_at FROM incidents WHERE project_id = ? ORDER BY created_at DESC LIMIT 8",
             (project_id,),
         )
-        return {**counts, "recent_incidents": recent}
+        return {
+            **counts,
+            "severity_dist": {
+                "critical": int(severity_row.get("cnt_critical") or 0),
+                "high": int(severity_row.get("cnt_high") or 0),
+                "medium": int(severity_row.get("cnt_medium") or 0),
+                "low": int(severity_row.get("cnt_low") or 0),
+            },
+            "status_dist": {
+                "open": int(status_row.get("cnt_open") or 0),
+                "in_progress": int(status_row.get("cnt_in_progress") or 0),
+                "resolved": int(status_row.get("cnt_resolved") or 0),
+            },
+            "recent_incidents": recent,
+        }
 
     # Architecture imports
     def create_architecture_import(
@@ -254,8 +383,8 @@ class SystemDatabase:
         item_id = str(uuid.uuid4())
         self.execute(
             """
-            INSERT INTO architecture_imports(id, project_id, name, source_file, source_text, status, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, 'processing', ?, ?)
+            INSERT INTO architecture_imports(id, project_id, name, source_file, source_text, status, progress, progress_message, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, 'processing', 5, '文件已接收，准备大模型抽取...', ?, ?)
             """,
             (item_id, project_id, name, source_file, source_text, created_by, utc_now()),
         )
@@ -267,11 +396,17 @@ class SystemDatabase:
     def list_architecture_imports(self, project_id: str) -> list[dict[str, Any]]:
         return self.query_all(
             """
-            SELECT id, project_id, name, source_file, status, extracted_nodes, extracted_edges,
+            SELECT id, project_id, name, source_file, status, progress, progress_message, extracted_nodes, extracted_edges,
                    error_message, created_by, created_at, completed_at
             FROM architecture_imports WHERE project_id = ? ORDER BY created_at DESC
             """,
             (project_id,),
+        )
+
+    def update_architecture_progress(self, item_id: str, progress: int, message: str) -> None:
+        self.execute(
+            "UPDATE architecture_imports SET progress = ?, progress_message = ? WHERE id = ?",
+            (max(0, min(100, progress)), message[:255], item_id),
         )
 
     def complete_architecture_import(
@@ -284,7 +419,7 @@ class SystemDatabase:
     ) -> None:
         self.execute(
             """
-            UPDATE architecture_imports SET status = 'completed', extracted_nodes = ?, extracted_edges = ?,
+            UPDATE architecture_imports SET status = 'completed', progress = 100, progress_message = '抽取与建图完成', extracted_nodes = ?, extracted_edges = ?,
                 execution_logs_json = ?, graph_snapshot_json = ?, completed_at = ? WHERE id = ?
             """,
             (nodes, edges, execution_logs_json, graph_snapshot_json, utc_now(), item_id),
@@ -292,8 +427,8 @@ class SystemDatabase:
 
     def fail_architecture_import(self, item_id: str, error_message: str) -> None:
         self.execute(
-            "UPDATE architecture_imports SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",
-            (error_message[:4000], utc_now(), item_id),
+            "UPDATE architecture_imports SET status = 'failed', progress_message = ?, error_message = ?, completed_at = ? WHERE id = ?",
+            (f"处理失败: {error_message[:150]}", error_message[:4000], utc_now(), item_id),
         )
 
     # Log batches
@@ -312,8 +447,8 @@ class SystemDatabase:
         self.execute(
             """
             INSERT INTO log_batches(id, project_id, filename, input_path, train_filename, train_path,
-                                    output_path, status, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+                                    output_path, status, progress, progress_message, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', 5, '日志包接收完成，准备执行分析...', ?, ?)
             """,
             (batch_id, project_id, filename, input_path, train_filename, train_path, output_path, created_by, utc_now()),
         )
@@ -323,18 +458,54 @@ class SystemDatabase:
         return self.query_one("SELECT * FROM log_batches WHERE id = ?", (batch_id,))
 
     def list_log_batches(self, project_id: str) -> list[dict[str, Any]]:
-        return self.query_all(
+        rows = self.query_all(
             """
-            SELECT id, project_id, filename, train_filename, output_path, status, summary_json,
+            SELECT id, project_id, filename, train_filename, output_path, status, progress, progress_message, summary_json,
                    error_message, created_by, created_at, completed_at
             FROM log_batches WHERE project_id = ? ORDER BY created_at DESC
             """,
             (project_id,),
         )
+        # 为每个批次附加严重度分布和已解决计数（单次查询聚合，避免 N+1）
+        if rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            agg_rows = self.query_all(
+                f"""
+                SELECT log_batch_id,
+                       SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS cnt_critical,
+                       SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) AS cnt_high,
+                       SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) AS cnt_medium,
+                       SUM(CASE WHEN severity='low'      THEN 1 ELSE 0 END) AS cnt_low,
+                       SUM(CASE WHEN status='resolved'   THEN 1 ELSE 0 END) AS cnt_resolved,
+                       COUNT(*) AS cnt_total
+                FROM incidents
+                WHERE log_batch_id IN ({placeholders})
+                GROUP BY log_batch_id
+                """,
+                ids,
+            )
+            agg_map = {r["log_batch_id"]: r for r in agg_rows}
+            for row in rows:
+                agg = agg_map.get(row["id"], {})
+                row["severity_dist"] = {
+                    "critical": int(agg.get("cnt_critical") or 0),
+                    "high":     int(agg.get("cnt_high")     or 0),
+                    "medium":   int(agg.get("cnt_medium")   or 0),
+                    "low":      int(agg.get("cnt_low")      or 0),
+                }
+                row["resolved_count"] = int(agg.get("cnt_resolved") or 0)
+        return rows
+
+    def update_log_batch_progress(self, batch_id: str, progress: int, message: str) -> None:
+        self.execute(
+            "UPDATE log_batches SET progress = ?, progress_message = ? WHERE id = ?",
+            (max(0, min(100, progress)), message[:255], batch_id),
+        )
 
     def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str) -> None:
         self.execute(
-            "UPDATE log_batches SET status = 'completed', summary_json = ?, rca_json = ?, completed_at = ? WHERE id = ?",
+            "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, completed_at = ? WHERE id = ?",
             (summary_json, rca_json, utc_now(), batch_id),
         )
 
@@ -369,9 +540,53 @@ class SystemDatabase:
 
     def fail_log_batch(self, batch_id: str, error_message: str) -> None:
         self.execute(
-            "UPDATE log_batches SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",
-            (error_message[:4000], utc_now(), batch_id),
+            "UPDATE log_batches SET status = 'failed', progress_message = ?, error_message = ?, completed_at = ? WHERE id = ?",
+            (f"分析失败: {error_message[:150]}", error_message[:4000], utc_now(), batch_id),
         )
+
+    def get_active_tasks(self, project_id: str) -> list[dict[str, Any]]:
+        """Query currently active (processing) long tasks for the specified project."""
+        tasks: list[dict[str, Any]] = []
+        arch_rows = self.query_all(
+            """
+            SELECT id, name AS task_name, source_file AS filename, status, progress, progress_message, created_at
+            FROM architecture_imports WHERE project_id = ? AND status = 'processing'
+            ORDER BY created_at DESC
+            """,
+            (project_id,),
+        )
+        for r in arch_rows:
+            tasks.append({
+                "task_id": r["id"],
+                "type": "architecture",
+                "task_name": r["task_name"] or r["filename"] or "架构描述增量抽取",
+                "filename": r["filename"],
+                "status": r["status"],
+                "progress": r["progress"],
+                "progress_message": r["progress_message"] or "正在使用 LLM 抽取架构节点与拓扑...",
+                "created_at": r["created_at"],
+            })
+
+        log_rows = self.query_all(
+            """
+            SELECT id, filename, status, progress, progress_message, created_at
+            FROM log_batches WHERE project_id = ? AND status = 'processing'
+            ORDER BY created_at DESC
+            """,
+            (project_id,),
+        )
+        for r in log_rows:
+            tasks.append({
+                "task_id": r["id"],
+                "type": "logs",
+                "task_name": f"日志分析 ({r['filename']})",
+                "filename": r["filename"],
+                "status": r["status"],
+                "progress": r["progress"],
+                "progress_message": r["progress_message"] or "正在执行日志解析与图谱 RCA 推理...",
+                "created_at": r["created_at"],
+            })
+        return tasks
 
     def delete_log_batch(self, batch_id: str) -> bool:
         """Delete one batch; incident rows/actions cascade through foreign keys."""

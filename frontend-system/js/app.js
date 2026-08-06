@@ -1,7 +1,8 @@
 import { hasSession, restoreSession, signOut, user } from "./auth.js";
 import { navigate, onRouteChange, route } from "./router.js";
 import { bindShell } from "./shell.js";
-import { loadProject, startLogTaskPolling } from "./state.js";
+import { loadProject } from "./state.js";
+import { taskManager } from "./taskManager.js";
 import { errorState, loading, toast } from "./ui.js";
 import { renderAuthPage } from "./pages/auth-page.js";
 import { renderProjectsPage } from "./pages/projects-page.js";
@@ -14,11 +15,6 @@ import { renderIncidentDetailPage } from "./pages/incident-detail-page.js";
 const root = document.querySelector("#app");
 let renderVersion = 0;
 
-function cleanupPage() {
-  root.__pageCleanup?.();
-  root.__pageCleanup = null;
-}
-
 async function logout() {
   await signOut();
   navigate("/projects");
@@ -27,7 +23,6 @@ async function logout() {
 
 async function render(nextRoute = route()) {
   const version = ++renderVersion;
-  cleanupPage();
   if (!user()) {
     renderAuthPage(root, { onAuthenticated: () => { navigate("/projects"); render(); } });
     return;
@@ -41,6 +36,7 @@ async function render(nextRoute = route()) {
   root.innerHTML = `<div class="state-panel" style="min-height:100vh">${loading("正在进入项目…")}</div>`;
   try {
     const project = await loadProject(nextRoute.params.projectId);
+    taskManager.setProject(project.id);
     if (version !== renderVersion) return;
     if (nextRoute.name === "overview") await renderOverviewPage(root, project);
     else if (nextRoute.name === "architecture") await renderArchitecturePage(root, project);
@@ -60,20 +56,11 @@ window.addEventListener("auth:expired", () => {
   render();
 });
 
-window.addEventListener("log-task:finished", (event) => {
-  const task = event.detail?.task || {};
-  if (task.type === "delete") toast("日志批次删除完成");
-  else if (task.status === "failed") toast("日志分析失败，请回到日志页面查看详情", "error");
-  else toast("日志分析完成，页面状态已更新");
-  if (route().name !== "logs") render(route());
-});
-
 onRouteChange(render);
 
 async function boot() {
   root.innerHTML = `<div class="state-panel" style="min-height:100vh"><span class="spinner"></span><p>正在恢复会话…</p></div>`;
   if (hasSession()) await restoreSession();
-  startLogTaskPolling();
   await render();
 }
 

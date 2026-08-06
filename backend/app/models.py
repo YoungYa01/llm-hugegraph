@@ -93,3 +93,17 @@ class EdgeUpdateRequest(BaseModel):
     type: str = "CALLS"
     description: str = ""
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class NodeBatchDeleteRequest(BaseModel):
+    names: list[str] = Field(default_factory=list)
+
+
+class EdgeBatchDeleteRequest(BaseModel):
+    edges: list[EdgeDeleteRequest] = Field(default_factory=list)
+
+
+class GraphImportRequest(BaseModel):
+    nodes: list[NodeUpsertRequest] = Field(default_factory=list)
+    edges: list[EdgeUpsertRequest] = Field(default_factory=list)
+

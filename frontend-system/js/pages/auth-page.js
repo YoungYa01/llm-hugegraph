@@ -8,7 +8,8 @@ export function renderAuthPage(root, { onAuthenticated }) {
 
   function paint() {
     const registerFields = mode === "register" ? `
-      <div class="field"><label for="display-name">显示名称</label><input class="input" id="display-name" name="display_name" required maxlength="80" placeholder="例如：运维工程师" /></div>` : "";
+      <div class="field"><label for="display-name">显示名称</label><input class="input" id="display-name" name="display_name" required maxlength="80" placeholder="例如：运维工程师" /></div>
+      <div class="field"><label for="employee-id">工号</label><input class="input" id="employee-id" name="employee_id" required maxlength="64" autocomplete="off" placeholder="请输入工号" /></div>` : "";
     root.innerHTML = `<div class="auth-shell">
       <section class="auth-story">
         <a class="brand" href="#"><span class="brand-mark">L</span><span>LogScope RCA <small class="brand-version">${escapeHtml(APP_VERSION)}</small></span></a>

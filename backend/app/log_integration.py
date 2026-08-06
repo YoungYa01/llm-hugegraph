@@ -16,7 +16,9 @@ from fastapi import UploadFile
 
 from .config import get_settings
 from .hugegraph_client import HugeGraphRestClient
+from .models import GraphResponse
 from .rca_decision import RcaDecisionService
+from .rca_optimization import prune_pending_graph, select_relevant_timeline, should_write_edge
 from .rca_engine import RootCauseAnalysis, RootCauseEngine
 
 
@@ -37,7 +39,6 @@ class IncidentImportResult:
             "rca": self.rca,
         }
 
-
 @dataclass
 class PendingGraphNode:
     name: str
@@ -57,18 +58,6 @@ class PendingGraphEdge:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-DYNAMIC_GRAPH_KINDS = {
-    "Incident",
-    "Trace",
-    "LogEvent",
-    "Exception",
-    "Window",
-    "Metric",
-    "RCAHypothesis",
-    "UnresolvedDependency",
-}
-
-
 class IncidentGraphIntegrator:
     """Map sliding-window root-cause outputs into the architecture KG.
 
@@ -78,7 +67,7 @@ class IncidentGraphIntegrator:
     - a directory containing those result files
     """
 
-    def __init__(self, db: HugeGraphRestClient | None = None) -> None:
+    def __init__(self, db: HugeGraphRestClient | None = None, employee_id: str = "") -> None:
         self.settings = get_settings()
         self.db = db or HugeGraphRestClient()
         self.logs: list[str] = []
@@ -86,10 +75,25 @@ class IncidentGraphIntegrator:
         self.edges_written = 0
         self.rca_results: list[dict[str, Any]] = []
         self._known_nodes: dict[str, dict[str, Any]] = {}
-        self.decision_service = RcaDecisionService(reuse_conversation=True)
+        self._architecture_nodes: dict[str, dict[str, Any]] = {}
+        self._vertex_id_cache: dict[str, str] = {}
         self._buffer_graph_writes = False
         self._pending_nodes: dict[str, PendingGraphNode] = {}
         self._pending_edges: dict[tuple[str, str, str], PendingGraphEdge] = {}
+        self._unresolved_services: set[str] = set()
+        self.pruning_stats: dict[str, int] = {
+            "timeline_events_total": 0,
+            "timeline_events_selected": 0,
+            "duplicate_events_skipped": 0,
+            "irrelevant_events_skipped": 0,
+            "nodes_before_pruning": 0,
+            "edges_before_pruning": 0,
+            "orphan_nodes_skipped": 0,
+            "invalid_edges_skipped": 0,
+        }
+        # One service instance belongs to one uploaded log batch. Its first
+        # request creates a conversation and every later incident reuses it.
+        self.decision_service = RcaDecisionService(employee_id=employee_id)
 
     def import_path(
         self,
@@ -257,7 +261,29 @@ class IncidentGraphIntegrator:
 
     def _import_details(self, details: list[dict[str, Any]], source_name: str) -> None:
         self.db.ensure_schema()
-        architecture = self.db.read_graph(limit=5000)
+        architecture_reader = getattr(self.db, "read_architecture_graph", None)
+        if callable(architecture_reader):
+            architecture = architecture_reader(limit=5000)
+        else:
+            raw_architecture = self.db.read_graph(limit=5000)
+            dynamic_kinds = {
+                "Incident", "Trace", "LogEvent", "Exception", "Window",
+                "Metric", "RCAHypothesis", "UnresolvedDependency",
+            }
+            nodes = [
+                node for node in raw_architecture.nodes
+                if node.kind not in dynamic_kinds
+                and not bool((node.meta or {}).get("dynamic_observation"))
+            ]
+            names = {node.name for node in nodes}
+            architecture = GraphResponse(
+                nodes=nodes,
+                edges=[
+                    edge for edge in raw_architecture.edges
+                    if edge.source in names and edge.target in names
+                ],
+                warnings=raw_architecture.warnings,
+            )
         self._known_nodes = {
             node.name: {
                 "kind": node.kind,
@@ -267,15 +293,64 @@ class IncidentGraphIntegrator:
             }
             for node in architecture.nodes
         }
+        self._architecture_nodes = dict(self._known_nodes)
+        self._vertex_id_cache = {}
         rca_engine = RootCauseEngine(architecture)
-        for detail in details:
+        prepared: list[dict[str, Any]] = []
+        top_k = max(1, min(self.settings.rca_top_k, 20))
+        for index, detail in enumerate(details):
+            rca = rca_engine.analyze(detail, top_k=top_k)
+            prepared.append(
+                {
+                    "index": index,
+                    "detail": detail,
+                    "rca": rca,
+                    "data": rca.model_dump(),
+                }
+            )
+
+        decisions: dict[int, dict[str, Any]] = {}
+        for item in prepared:
+            decisions[item["index"]] = self.decision_service.enrich(
+                item["detail"],
+                item["data"],
+                architecture,
+            )
             self._begin_graph_buffer()
-            rca = rca_engine.analyze(detail, top_k=max(1, min(self.settings.rca_top_k, 20)))
-            rca_data = rca.model_dump()
-            rca_data["llm_decision"] = self.decision_service.enrich(detail, rca_data)
-            self.rca_results.append(rca_data)
-            self._import_one(detail, source_name, rca)
+            self._import_one(
+                item["detail"],
+                source_name,
+                item["rca"],
+                decisions[item["index"]],
+            )
             self._flush_graph_buffer()
+
+        for item in prepared:
+            item["data"]["llm_decision"] = decisions.get(
+                item["index"],
+                self._decision_failure_fallback(item["data"], RuntimeError("missing LLM decision result")),
+            )
+            self.rca_results.append(item["data"])
+
+        self.logs.append(
+            "图谱剪枝统计: "
+            + ", ".join(f"{key}={value}" for key, value in self.pruning_stats.items())
+            + f", unresolved_services_skipped={len(self._unresolved_services)}"
+        )
+
+    def _decision_failure_fallback(self, analysis: dict[str, Any], exc: Exception) -> dict[str, Any]:
+        hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
+        top = hypotheses[0] if hypotheses and isinstance(hypotheses[0], dict) else {}
+        return {
+            "selected_candidate": str(top.get("candidate") or ""),
+            "selected_candidate_rank": int(top.get("rank") or 0),
+            "selected_fault_mode": str(top.get("fault_mode") or ""),
+            "most_likely_reason": str(top.get("summary") or analysis.get("decision") or ""),
+            "troubleshooting_methods": list(top.get("missing_evidence") or [])[:8],
+            "confidence": top.get("confidence"),
+            "source": "fallback",
+            "error": str(exc),
+        }
 
     def _begin_graph_buffer(self) -> None:
         self._buffer_graph_writes = True
@@ -283,67 +358,58 @@ class IncidentGraphIntegrator:
         self._pending_edges = {}
 
     def _flush_graph_buffer(self) -> None:
-        nodes, edges = self._pruned_pending_graph()
-        if hasattr(self.db, "upsert_nodes_bulk"):
-            self.nodes_written += int(self.db.upsert_nodes_bulk([node.__dict__ for node in nodes]) or 0)
-        else:
-            for node in nodes:
-                self.db.upsert_node(
-                    name=node.name,
-                    layer=node.layer,
-                    kind=node.kind,
-                    description=node.description,
-                    source_file=node.source_file,
-                    meta=node.meta,
-                )
-                self.nodes_written += 1
+        result = prune_pending_graph(
+            self._pending_nodes,
+            self._pending_edges,
+            set(self._architecture_nodes),
+            enabled=bool(getattr(self.settings, "rca_graph_pruning_enabled", True)),
+        )
+        self.pruning_stats["nodes_before_pruning"] += result.nodes_before
+        self.pruning_stats["edges_before_pruning"] += result.edges_before
+        self.pruning_stats["orphan_nodes_skipped"] += result.orphan_nodes_skipped
+        self.pruning_stats["invalid_edges_skipped"] += result.invalid_edges_skipped
 
-        edge_items = [
-            {
-                "source": edge.source,
-                "target": edge.target,
-                "type": edge.type,
-                "description": edge.description,
-                "meta": edge.meta,
-            }
-            for edge in edges
-        ]
-        if hasattr(self.db, "add_edges_by_names_bulk"):
-            self.edges_written += int(self.db.add_edges_by_names_bulk(edge_items) or 0)
-        else:
-            for edge in edges:
+        for node in result.nodes:
+            saved = self.db.upsert_node(
+                name=node.name,
+                layer=node.layer,
+                kind=node.kind,
+                description=node.description,
+                source_file=node.source_file,
+                meta=node.meta,
+            )
+            self.nodes_written += 1
+            vertex_id = str(saved.get("id") or "") if isinstance(saved, dict) else ""
+            if vertex_id:
+                self._vertex_id_cache[node.name] = vertex_id
+
+        for edge in result.edges:
+            if hasattr(self.db, "add_edge"):
+                source_id = self._resolve_vertex_id(edge.source)
+                target_id = self._resolve_vertex_id(edge.target)
+                if source_id and target_id:
+                    self.db.add_edge(source_id, target_id, edge.type, edge.description, edge.meta)
+                else:
+                    self.db.add_edge_by_names(edge.source, edge.target, edge.type, edge.description, edge.meta)
+            else:
                 self.db.add_edge_by_names(edge.source, edge.target, edge.type, edge.description, edge.meta)
-                self.edges_written += 1
-        self._begin_graph_buffer()
+            self.edges_written += 1
+
+        self._pending_nodes = {}
+        self._pending_edges = {}
         self._buffer_graph_writes = False
 
-    def _pruned_pending_graph(self) -> tuple[list[PendingGraphNode], list[PendingGraphEdge]]:
-        known_names = set(self._known_nodes)
-        valid_edges = [
-            edge
-            for edge in self._pending_edges.values()
-            if (edge.source in self._pending_nodes or edge.source in known_names)
-            and (edge.target in self._pending_nodes or edge.target in known_names)
-        ]
-        connected = {
-            endpoint
-            for edge in valid_edges
-            for endpoint in (edge.source, edge.target)
-        }
-        essential_kinds = {"Incident"}
-        kept_names = {
-            name
-            for name, node in self._pending_nodes.items()
-            if name in connected or node.kind in essential_kinds
-        }
-        edges = [
-            edge
-            for edge in valid_edges
-            if (edge.source in kept_names or edge.source in known_names)
-            and (edge.target in kept_names or edge.target in known_names)
-        ]
-        nodes = [node for name, node in self._pending_nodes.items() if name in kept_names]
-        return nodes, edges
+    def _resolve_vertex_id(self, name: str) -> str:
+        cached = self._vertex_id_cache.get(name)
+        if cached:
+            return cached
+        if not hasattr(self.db, "find_node_by_name"):
+            return ""
+        found = self.db.find_node_by_name(name)
+        vertex_id = str(found.get("id") or "") if isinstance(found, dict) else ""
+        if vertex_id:
+            self._vertex_id_cache[name] = vertex_id
+        return vertex_id
 
     def _write_node(
         self,
@@ -358,12 +424,25 @@ class IncidentGraphIntegrator:
     ) -> None:
         if not name:
             return
-        # Architecture nodes are curated by the LLM + human workflow.  Incident
-        # import may link to them, but must never replace their kind, description
-        # or aliases with the generic "异常链路关联到的服务" payload.
-        if preserve_existing and name in self._known_nodes:
-            return
-        node_meta = self._graph_meta(name, kind, meta or {})
+        if preserve_existing:
+            if name in self._known_nodes:
+                return
+            if hasattr(self.db, "find_node_by_name"):
+                existing = self.db.find_node_by_name(name)
+                if isinstance(existing, dict):
+                    vertex_id = str(existing.get("id") or "").strip()
+                    if vertex_id:
+                        self._vertex_id_cache[name] = vertex_id
+                    self._known_nodes[name] = {
+                        "kind": kind,
+                        "layer": layer,
+                        "description": description,
+                        "meta": dict(meta or {}),
+                    }
+                    return
+        node_meta = dict(meta or {})
+        if kind in {"Incident", "Trace", "LogEvent", "Exception", "RCAHypothesis", "UnresolvedDependency"}:
+            node_meta.setdefault("dynamic_observation", True)
         if self._buffer_graph_writes:
             self._pending_nodes[name] = PendingGraphNode(
                 name=name,
@@ -374,8 +453,18 @@ class IncidentGraphIntegrator:
                 meta=node_meta,
             )
         else:
-            self.db.upsert_node(name=name, layer=layer, kind=kind, description=description, source_file=source_file, meta=node_meta)
+            saved = self.db.upsert_node(
+                name=name,
+                layer=layer,
+                kind=kind,
+                description=description,
+                source_file=source_file,
+                meta=node_meta,
+            )
             self.nodes_written += 1
+            vertex_id = str(saved.get("id") or "") if isinstance(saved, dict) else ""
+            if vertex_id:
+                self._vertex_id_cache[name] = vertex_id
         self._known_nodes[name] = {
             "kind": kind,
             "layer": layer,
@@ -383,10 +472,19 @@ class IncidentGraphIntegrator:
             "meta": node_meta,
         }
 
-    def _write_edge(self, source: str, target: str, rel_type: str, description: str = "", meta: dict[str, Any] | None = None) -> None:
+    def _write_edge(
+        self,
+        source: str,
+        target: str,
+        rel_type: str,
+        description: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         if not source or not target or source == target:
             return
-        edge_meta = self._graph_meta(source, "", meta or {})
+        if not should_write_edge(rel_type, self.settings):
+            return
+        edge_meta = dict(meta or {})
         if self._buffer_graph_writes:
             self._pending_edges[(source, target, rel_type)] = PendingGraphEdge(
                 source=source,
@@ -396,74 +494,24 @@ class IncidentGraphIntegrator:
                 meta=edge_meta,
             )
         else:
-            self.db.add_edge_by_names(source, target, rel_type, description, edge_meta)
+            if hasattr(self.db, "add_edge"):
+                source_id = self._resolve_vertex_id(source)
+                target_id = self._resolve_vertex_id(target)
+                if source_id and target_id:
+                    self.db.add_edge(source_id, target_id, rel_type, description, edge_meta)
+                else:
+                    self.db.add_edge_by_names(source, target, rel_type, description, edge_meta)
+            else:
+                self.db.add_edge_by_names(source, target, rel_type, description, edge_meta)
             self.edges_written += 1
 
-    def _graph_meta(self, name: str, kind: str, meta: dict[str, Any]) -> dict[str, Any]:
-        result = dict(meta)
-        if kind in DYNAMIC_GRAPH_KINDS or name.startswith(("Incident:", "LogEvent:", "RootCandidate:", "RCAHypothesis:")):
-            prefix = self._batch_prefix_from_name(name)
-            if prefix:
-                result.setdefault("log_batch_prefix", prefix)
-            result.setdefault("dynamic_observation", True)
-        return result
-
-    def _batch_prefix_from_name(self, name: str) -> str:
-        parts = str(name or "").split(":")
-        if len(parts) >= 3 and parts[1]:
-            return parts[1]
-        return ""
-
-    def _select_relevant_timeline(
+    def _import_one(
         self,
-        timeline: list[Any],
         detail: dict[str, Any],
-    ) -> list[tuple[int, dict[str, Any]]]:
-        root_error_timestamp = str(detail.get("root_error_timestamp") or "")
-        root_candidates = detail.get("root_candidates") if isinstance(detail.get("root_candidates"), list) else []
-        candidate_ids = {
-            str(item.get("event_id") or "")
-            for item in root_candidates
-            if isinstance(item, dict) and item.get("event_id")
-        }
-        candidate_texts = [
-            str(item.get("root_cause") or item.get("message") or "").strip().lower()
-            for item in root_candidates
-            if isinstance(item, dict) and str(item.get("root_cause") or item.get("message") or "").strip()
-        ]
-        selected: list[tuple[int, dict[str, Any]]] = []
-        for index, event in enumerate(timeline, start=1):
-            if isinstance(event, dict) and self._is_relevant_timeline_event(
-                event,
-                root_error_timestamp,
-                candidate_ids,
-                candidate_texts,
-            ):
-                selected.append((index, event))
-        return selected
-
-    def _is_relevant_timeline_event(
-        self,
-        event: dict[str, Any],
-        root_error_timestamp: str,
-        candidate_ids: set[str],
-        candidate_texts: list[str],
-    ) -> bool:
-        level = str(event.get("level") or "").upper()
-        if level in {"ERROR", "FATAL", "CRITICAL", "WARN"}:
-            return True
-        if str(event.get("timestamp") or "") and str(event.get("timestamp") or "") == root_error_timestamp:
-            return True
-        if str(event.get("event_id") or "") in candidate_ids:
-            return True
-        if any(str(event.get(key) or "").strip() for key in ("root_cause", "exception_class", "root_exception_class", "exception_chain", "incident_role")):
-            return True
-        text = " ".join(str(event.get(key) or "") for key in ("message", "root_cause")).lower()
-        if any(token in text for token in ("exception", "error", "timeout", "failed", "failure", "refused", "denied", "unavailable", "panic")):
-            return True
-        return any(candidate and candidate in text for candidate in candidate_texts)
-
-    def _import_one(self, detail: dict[str, Any], source_name: str, rca: RootCauseAnalysis) -> None:
+        source_name: str,
+        rca: RootCauseAnalysis,
+        decision: dict[str, Any] | None = None,
+    ) -> None:
         incident_id = str(detail.get("incident_id") or "I00000")
         incident_node = f"Incident:{incident_id}"
         root_service_raw = str(detail.get("root_service_candidate") or "")
@@ -508,13 +556,21 @@ class IncidentGraphIntegrator:
             )
             self._write_edge(incident_node, root_service, "OBSERVED_AT", "最底层异常首先定位到该服务", {"raw_service": root_service_raw})
         if exception_name:
-            self._write_node(exception_name, "异常分析层", "Exception", root_cause[:500], source_name, {"root_cause": root_cause})
+            self._write_node(
+                exception_name,
+                "异常分析层",
+                "Exception",
+                root_cause[:500],
+                source_name,
+                {"root_cause": root_cause},
+                preserve_existing=True,
+            )
             self._write_edge(incident_node, exception_name, "HAS_EXCEPTION", "日志中提取到的底层异常特征", {"root_cause": root_cause})
 
         # logfault-incident-clustering-v2: preserve every exception class, not only Top-1.
         exception_summaries = detail.get("exception_summary") or detail.get("exception_classes") or []
         if isinstance(exception_summaries, list):
-            for summary in exception_summaries:
+            for summary in exception_summaries[: max(1, int(getattr(self.settings, "rca_graph_max_exceptions", 3)))]:
                 if isinstance(summary, dict):
                     class_name = str(summary.get("root_exception_class") or summary.get("exception_class") or "").strip()
                     summary_meta = dict(summary)
@@ -548,11 +604,14 @@ class IncidentGraphIntegrator:
             trace_node = ""
 
         timeline = detail.get("timeline") or []
-        if isinstance(timeline, list):
-            timeline = timeline[: max(1, int(self.settings.incident_timeline_limit))]
-        else:
+        if not isinstance(timeline, list):
             timeline = []
-        selected_timeline = self._select_relevant_timeline(timeline, detail)
+        selection = select_relevant_timeline(timeline, detail, self.settings)
+        selected_timeline = selection.events
+        self.pruning_stats["timeline_events_total"] += selection.total_events
+        self.pruning_stats["timeline_events_selected"] += selection.selected_events
+        self.pruning_stats["duplicate_events_skipped"] += selection.duplicate_events_skipped
+        self.pruning_stats["irrelevant_events_skipped"] += selection.irrelevant_events_skipped
         prev_event_node = ""
         prev_service_node = ""
         for idx, event in selected_timeline:
@@ -641,7 +700,7 @@ class IncidentGraphIntegrator:
             prev_event_node = event_node
 
         # Candidate nodes make the evidence auditable even when timeline was trimmed.
-        for idx, candidate in enumerate((detail.get("root_candidates") or [])[:10], start=1):
+        for idx, candidate in enumerate((detail.get("root_candidates") or [])[: max(1, int(getattr(self.settings, "rca_graph_max_root_candidates", 3)))], start=1):
             if not isinstance(candidate, dict):
                 continue
             cand_service = self._resolve_arch_service(str(candidate.get("service") or ""))
@@ -664,7 +723,7 @@ class IncidentGraphIntegrator:
                 )
                 self._write_edge(cand_service, cand_node, "EMITS", "候选根因服务产生该日志", {"rank": idx})
 
-        self._write_rca(incident_node, incident_id, rca, source_name)
+        self._write_rca(incident_node, incident_id, rca, source_name, decision)
 
         top = rca.hypotheses[0] if rca.hypotheses else None
         top_text = f", rca={top.candidate}/{top.fault_mode}/{top.confidence:.2f}" if top else ""
@@ -679,8 +738,22 @@ class IncidentGraphIntegrator:
         incident_id: str,
         rca: RootCauseAnalysis,
         source_name: str,
+        decision: dict[str, Any] | None = None,
     ) -> None:
-        for hypothesis in rca.hypotheses:
+        decision = decision if isinstance(decision, dict) else {}
+        model_grounded = bool(
+            str(decision.get("source") or "").lower() == "llm"
+            and decision.get("selected_node_id")
+        )
+        decision_path = [
+            str(item.get("node") or "").strip()
+            for item in (decision.get("propagation_path") or decision.get("display_chain") or [])
+            if model_grounded
+            and isinstance(item, dict)
+            and str(item.get("node") or "").strip() in self._architecture_nodes
+        ]
+        model_root = decision_path[0] if decision_path else ""
+        for hypothesis in rca.hypotheses[: max(1, int(getattr(self.settings, "rca_graph_max_hypotheses", 3)))]:
             data = hypothesis.model_dump()
             node_name = f"RCAHypothesis:{incident_id}:{hypothesis.rank:02d}"
             self._write_node(
@@ -707,7 +780,7 @@ class IncidentGraphIntegrator:
                     hypothesis.fault_mode,
                     {"rank": hypothesis.rank, "confidence": hypothesis.confidence},
                 )
-                if hypothesis.rank == 1:
+                if hypothesis.rank == 1 and not model_root:
                     self._write_edge(
                         incident_node,
                         hypothesis.candidate,
@@ -740,6 +813,65 @@ class IncidentGraphIntegrator:
                     {"rank": hypothesis.rank},
                 )
 
+        if not model_root:
+            return
+        decision_node = f"RCAHypothesis:{incident_id}:LLM"
+        decision_meta = {
+            "rank": 0,
+            "candidate": model_root,
+            "candidate_node_id": decision.get("selected_node_id"),
+            "candidate_kind": self._architecture_nodes.get(model_root, {}).get("kind"),
+            "architecture_node": True,
+            "fault_mode": decision.get("selected_fault_mode"),
+            "confidence": decision.get("confidence"),
+            "status": "llm_grounded",
+            "summary": decision.get("most_likely_reason"),
+            "chain": decision_path,
+            "display_chain": decision.get("display_chain") or [],
+            "model_decision": True,
+        }
+        self._write_node(
+            decision_node,
+            "根因推理层",
+            "RCAHypothesis",
+            str(decision.get("most_likely_reason") or "大模型架构约束根因结论"),
+            source_name,
+            decision_meta,
+        )
+        self._write_edge(
+            incident_node,
+            decision_node,
+            "HAS_HYPOTHESIS",
+            "大模型基于完整架构图谱形成的根因结论",
+            {"rank": 0, "source": "llm", "confidence": decision.get("confidence")},
+        )
+        self._write_edge(
+            decision_node,
+            model_root,
+            "CANDIDATE_CAUSE",
+            str(decision.get("selected_fault_mode") or "LLM_GROUNDED_RCA"),
+            {"rank": 0, "source": "llm", "confidence": decision.get("confidence")},
+        )
+        self._write_edge(
+            incident_node,
+            model_root,
+            "SUSPECTED_ROOT_CAUSE",
+            "大模型基于完整架构图谱选择的根因实体",
+            {
+                "source": "llm",
+                "confidence": decision.get("confidence"),
+                "fault_mode": decision.get("selected_fault_mode"),
+            },
+        )
+        for affected in decision_path[1:]:
+            self._write_edge(
+                decision_node,
+                affected,
+                "AFFECTS",
+                "大模型传播路径上的受影响架构节点",
+                {"rank": 0, "source": "llm"},
+            )
+
     def _exception_node_name(self, root_cause: str) -> str:
         text = root_cause.strip() or "UnknownException"
         match = re.search(r"([A-Za-z_][\w.$]*(?:Exception|Error))", text)
@@ -753,23 +885,30 @@ class IncidentGraphIntegrator:
             return ""
         normalized = self._norm_service(service_name)
         best = ""
-        for name, info in self._known_nodes.items():
+        for name, info in self._architecture_nodes.items():
             kind = str(info.get("kind") or "")
+            if kind not in {"Service", "API", "Component", "Pod"}:
+                continue
             meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
-            if meta.get("dynamic_observation") or (
-                "raw_service" in meta
-                and str(info.get("description") or "") == "异常链路关联到的服务"
-            ):
-                continue
-            if not name:
-                continue
-            if name == service_name:
-                return name
-            if kind in {"Service", "API", "Component"} and self._norm_service(name) == normalized:
-                return name
-            if kind in {"Service", "API", "Component"} and normalized and normalized in self._norm_service(name):
-                best = best or name
-        return best or service_name
+            identifiers = [name]
+            aliases = meta.get("aliases") or meta.get("alias") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            identifiers.extend(str(item) for item in aliases if str(item).strip())
+            for identifier in identifiers:
+                if identifier == service_name:
+                    return name
+                node_norm = self._norm_service(identifier)
+                if node_norm and node_norm == normalized:
+                    return name
+                if normalized and len(normalized) >= 4 and (normalized in node_norm or node_norm in normalized):
+                    best = best or name
+        if best:
+            return best
+        if bool(getattr(self.settings, "rca_graph_write_unresolved_services", False)):
+            return service_name
+        self._unresolved_services.add(service_name)
+        return ""
 
     def _norm_service(self, value: str) -> str:
         text = value.lower()
@@ -856,7 +995,7 @@ class LogFaultRunner:
                     [
                         f"- 最可能原因：{decision.get('selected_candidate') or '未选择'}",
                         f"- 原因摘要：{decision.get('most_likely_reason') or ''}",
-                        f"- 排查方法：",
+                        "- 排查方法：",
                     ]
                 )
                 for item in decision.get("troubleshooting_methods") or []:

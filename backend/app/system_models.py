@@ -9,6 +9,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=40, pattern=r"^[A-Za-z0-9_.-]+$")
     password: str = Field(min_length=8, max_length=128)
     display_name: str = Field(min_length=1, max_length=80)
+    employee_id: str = Field(min_length=1, max_length=64)
 
 
 class LoginRequest(BaseModel):

@@ -1,196 +1,637 @@
+import { createForceLayout } from "./graph-layout.js";
+import { buildIncidentSemantics } from "./graph-semantics.js";
+
 const SVG_NS = "http://www.w3.org/2000/svg";
+const NODE_RADIUS = 32;
+const MIN_SCALE = 0.18;
+const MAX_SCALE = 2.4;
+
+let graphSequence = 0;
 
 const palette = {
-  Service: "#4568dc", API: "#5d7ce3", Component: "#6679aa", System: "#394a78",
-  Database: "#11938f", Cache: "#13a5a0", Queue: "#7a62c8", Middleware: "#6975bd",
-  Cluster: "#16817e", Instance: "#e68a35", Host: "#d1772d", Pod: "#de7d45",
-  Incident: "#ce4052", RCAHypothesis: "#a848a8", LogEvent: "#c85c72", Exception: "#b93645", Trace: "#8b5baa",
+  UIControl: "#c44578",
+  UIFunction: "#c06b2b",
+  Service: "#3f6fba",
+  API: "#5179bd",
+  Component: "#61769b",
+  Function: "#6d7f9d",
+  System: "#334b72",
+  Database: "#178a80",
+  Cache: "#179b91",
+  Queue: "#7460ad",
+  Middleware: "#6874a7",
+  Cluster: "#117b74",
+  Instance: "#c8722f",
+  Host: "#b8662b",
+  Pod: "#ca7044",
+  VM: "#a96332",
+  NetworkSwitch: "#258b82",
+  Incident: "#c43d4d",
+  RCAHypothesis: "#95509a",
+  LogEvent: "#ba596d",
+  Exception: "#a93040",
+  Trace: "#765795",
 };
 
 function svgElement(name, attributes = {}) {
   const element = document.createElementNS(SVG_NS, name);
-  Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
+  Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, String(value)));
   return element;
 }
 
-function groupFor(node) {
-  if (["Incident", "RCAHypothesis", "LogEvent", "Exception", "Trace", "Window", "Metric"].includes(node.kind)) return 4;
-  if (["Instance", "Host", "Pod"].includes(node.kind)) return 3;
-  if (["Database", "Cache", "Queue", "Middleware", "Cluster"].includes(node.kind)) return 2;
-  if (["Service", "Component", "Function"].includes(node.kind)) return 1;
-  return 0;
-}
-
-function layout(nodes) {
-  const groups = Array.from({ length: 5 }, () => []);
-  nodes.forEach((node) => groups[groupFor(node)].push(node));
-  groups.forEach((items) => items.sort((a, b) => a.name.localeCompare(b.name, "zh-CN")));
-  const positions = new Map();
-  let maxRows = 1;
-  groups.forEach((items, column) => {
-    maxRows = Math.max(maxRows, items.length);
-    items.forEach((node, row) => positions.set(node.name, { x: 70 + column * 230, y: 70 + row * 84 }));
-  });
-  return { positions, width: 70 + 5 * 230, height: Math.max(650, 100 + maxRows * 84) };
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function short(value, length = 20) {
   const text = String(value || "");
-  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+  return text.length > length ? `${text.slice(0, length - 1)}...` : text;
+}
+
+function nodeLines(value) {
+  const text = String(value || "未命名节点");
+  if (text.length <= 11) return [text];
+  if (text.length <= 20) {
+    const splitAt = Math.ceil(text.length / 2);
+    return [text.slice(0, splitAt), text.slice(splitAt)];
+  }
+  return [text.slice(0, 10), `${text.slice(10, 19)}...`];
+}
+
+export function calculateFitTransform(bounds, viewportWidth, viewportHeight, options = {}) {
+  const padding = Number(options.padding) || 0;
+  const minScale = Number(options.minScale) || MIN_SCALE;
+  const maxScale = Number(options.maxScale) || MAX_SCALE;
+  const graphWidth = Math.max(1, bounds.maxX - bounds.minX);
+  const graphHeight = Math.max(1, bounds.maxY - bounds.minY);
+  const availableWidth = Math.max(1, viewportWidth - padding * 2);
+  const availableHeight = Math.max(1, viewportHeight - padding * 2);
+  const scale = clamp(Math.min(availableWidth / graphWidth, availableHeight / graphHeight), minScale, maxScale);
+  const centerX = (bounds.minX + bounds.maxX) / 2;
+  const centerY = (bounds.minY + bounds.maxY) / 2;
+  return {
+    scale,
+    panX: viewportWidth / 2 - centerX * scale,
+    panY: viewportHeight / 2 - centerY * scale,
+  };
+}
+
+export function createViewportState(initial = {}) {
+  let scale = clamp(Number(initial.scale) || 1, MIN_SCALE, MAX_SCALE);
+  let panX = Number(initial.panX) || 0;
+  let panY = Number(initial.panY) || 0;
+  return {
+    value: () => ({ scale, panX, panY }),
+    set(next) {
+      scale = clamp(Number(next.scale) || 1, MIN_SCALE, MAX_SCALE);
+      panX = Number(next.panX) || 0;
+      panY = Number(next.panY) || 0;
+    },
+    panBy(deltaX, deltaY) {
+      panX += Number(deltaX) || 0;
+      panY += Number(deltaY) || 0;
+    },
+    zoomAt(nextScale, screenX, screenY) {
+      const targetScale = clamp(Number(nextScale) || scale, MIN_SCALE, MAX_SCALE);
+      const worldX = (screenX - panX) / scale;
+      const worldY = (screenY - panY) / scale;
+      scale = targetScale;
+      panX = screenX - worldX * scale;
+      panY = screenY - worldY * scale;
+    },
+    toWorld(screenX, screenY) {
+      return { x: (screenX - panX) / scale, y: (screenY - panY) / scale };
+    },
+  };
+}
+
+export function shouldShowEdgeLabels(nodeCount, edgeCount) {
+  return edgeCount <= 12 && edgeCount <= Math.max(6, nodeCount * 0.8);
+}
+
+function marker(defs, id, color) {
+  const element = svgElement("marker", {
+    id,
+    viewBox: "0 0 10 10",
+    refX: "9",
+    refY: "5",
+    markerWidth: "6",
+    markerHeight: "6",
+    orient: "auto",
+    markerUnits: "strokeWidth",
+  });
+  element.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color }));
+  defs.append(element);
+}
+
+function routeMap(edges) {
+  const groups = new Map();
+  edges.forEach((edge) => {
+    const ends = [edge.source, edge.target].sort();
+    const key = `${ends[0]}\u0000${ends[1]}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(edge);
+  });
+  const routes = new Map();
+  groups.forEach((items) => {
+    items.forEach((edge, index) => {
+      routes.set(edge, items.length === 1 ? 0 : (index - (items.length - 1) / 2) * 28);
+    });
+  });
+  return routes;
+}
+
+function edgeGeometry(source, target, curvature = 0, radius = NODE_RADIUS) {
+  if (source.x === target.x && source.y === target.y) {
+    const loopRadius = radius + 22;
+    return {
+      d: `M ${source.x} ${source.y - radius} C ${source.x + loopRadius} ${source.y - loopRadius * 2}, ${source.x - loopRadius} ${source.y - loopRadius * 2}, ${source.x} ${source.y - radius}`,
+      labelX: source.x,
+      labelY: source.y - loopRadius * 1.7,
+    };
+  }
+  const deltaX = target.x - source.x;
+  const deltaY = target.y - source.y;
+  const distance = Math.max(1, Math.hypot(deltaX, deltaY));
+  const unitX = deltaX / distance;
+  const unitY = deltaY / distance;
+  const perpendicularX = -unitY;
+  const perpendicularY = unitX;
+  const startX = source.x + unitX * radius;
+  const startY = source.y + unitY * radius;
+  const endX = target.x - unitX * (radius + 4);
+  const endY = target.y - unitY * (radius + 4);
+  const controlX = (startX + endX) / 2 + perpendicularX * curvature;
+  const controlY = (startY + endY) / 2 + perpendicularY * curvature;
+  const labelX = (startX + 2 * controlX + endX) / 4;
+  const labelY = (startY + 2 * controlY + endY) / 4 - 7;
+  return {
+    d: `M ${startX} ${startY} Q ${controlX} ${controlY} ${endX} ${endY}`,
+    labelX,
+    labelY,
+  };
+}
+
+export function calculateClientPoint(rect, width, height, clientX, clientY) {
+  const scale = Math.min(
+    Math.max(1, Number(rect.width)) / Math.max(1, width),
+    Math.max(1, Number(rect.height)) / Math.max(1, height),
+  );
+  const offsetX = (Number(rect.width) - width * scale) / 2;
+  const offsetY = (Number(rect.height) - height * scale) / 2;
+  return {
+    x: (clientX - Number(rect.left) - offsetX) / scale,
+    y: (clientY - Number(rect.top) - offsetY) / scale,
+  };
+}
+
+function clientPoint(svg, event, width, height) {
+  return calculateClientPoint(svg.getBoundingClientRect(), width, height, event.clientX, event.clientY);
+}
+
+function appendTextLines(group, lines) {
+  const title = svgElement("text", { class: "graph-node-title", x: "0" });
+  const firstY = lines.length === 1 ? 4 : -2;
+  lines.forEach((line, index) => {
+    const span = svgElement("tspan", { x: "0", y: firstY + index * 12 });
+    span.textContent = line;
+    title.append(span);
+  });
+  group.append(title);
+}
+
+function appendBadge(group, label, className, y, width) {
+  const badge = svgElement("g", { class: `graph-node-badge ${className}`, transform: `translate(${-width / 2} ${y})` });
+  badge.append(svgElement("rect", { width, height: "18", rx: "4" }));
+  const text = svgElement("text", { x: width / 2, y: "12" });
+  text.textContent = label;
+  badge.append(text);
+  group.append(badge);
 }
 
 export function renderGraph(
   container,
   graph,
-  { onSelect = () => {}, onSelectEdge = () => {} } = {},
+  {
+    mode = "architecture",
+    hypotheses = [],
+    llmDecision = {},
+    onSelect = () => {},
+    onSelectEdge = () => {},
+  } = {},
 ) {
   container.replaceChildren();
   const nodes = (graph.nodes || []).slice(0, 500);
   const nodeNames = new Set(nodes.map((node) => node.name));
-  const edges = (graph.edges || []).filter((edge) => nodeNames.has(edge.source) && nodeNames.has(edge.target)).slice(0, 1200);
+  const edges = (graph.edges || [])
+    .filter((edge) => nodeNames.has(edge.source) && nodeNames.has(edge.target))
+    .slice(0, 1200);
   if (!nodes.length) return null;
 
-  const { positions, width, height } = layout(nodes);
-  const svg = svgElement("svg", { role: "img", "aria-label": "项目知识图谱", viewBox: `0 0 ${width} ${height}` });
+  const sequence = ++graphSequence;
+  const viewportWidth = Math.max(720, container.clientWidth || 960);
+  const viewportHeight = mode === "incident" ? 640 : 720;
+  const density = Math.max(1, Math.sqrt(nodes.length / (mode === "incident" ? 14 : 18)));
+  const width = Math.min(3200, Math.max(viewportWidth, viewportWidth * density));
+  const height = Math.min(2400, Math.max(viewportHeight, viewportHeight * density * 0.82));
+  const semantics = mode === "incident"
+    ? buildIncidentSemantics(hypotheses, llmDecision, nodeNames)
+    : { primary: null, alternatives: [], overlays: [], candidateRanks: {}, start: "", end: "", warnings: [] };
+  const layout = createForceLayout(nodes, edges, {
+    mode,
+    primaryChain: semantics.primary?.chain || [],
+    width,
+    height,
+    nodeRadius: NODE_RADIUS,
+    linkDistance: mode === "incident" ? 182 : 172,
+    collisionSpacing: mode === "incident" ? 34 : 30,
+  });
+  const viewportState = createViewportState();
+  const routes = routeMap(edges);
+  const showEdgeLabels = shouldShowEdgeLabels(nodes.length, edges.length);
+
+  const svg = svgElement("svg", {
+    class: "graph-svg",
+    role: "img",
+    "aria-label": mode === "incident" ? "故障传播知识图谱" : "系统架构知识图谱",
+    viewBox: `0 0 ${viewportWidth} ${viewportHeight}`,
+    tabindex: "0",
+  });
   const defs = svgElement("defs");
-  const marker = svgElement("marker", { id: "arrow", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse" });
-  marker.append(svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#aeb8ca" }));
-  defs.append(marker);
+  const markerIds = {
+    base: `graph-arrow-base-${sequence}`,
+    alternative: `graph-arrow-alternative-${sequence}`,
+    model: `graph-arrow-model-${sequence}`,
+    algorithm: `graph-arrow-algorithm-${sequence}`,
+  };
+  marker(defs, markerIds.base, "#9aa6b8");
+  marker(defs, markerIds.alternative, "#98a4b5");
+  marker(defs, markerIds.model, "#cf3545");
+  marker(defs, markerIds.algorithm, "#c47a20");
   svg.append(defs);
-  const viewport = svgElement("g");
+
+  const viewport = svgElement("g", { class: "graph-viewport" });
+  const baseEdgeLayer = svgElement("g", { class: "graph-layer graph-layer-edges" });
+  const alternativeLayer = svgElement("g", { class: "graph-layer graph-layer-alternatives" });
+  const primaryUnderlayLayer = svgElement("g", { class: "graph-layer graph-layer-primary-underlay" });
+  const primaryLayer = svgElement("g", { class: "graph-layer graph-layer-primary" });
+  const nodeLayer = svgElement("g", { class: "graph-layer graph-layer-nodes" });
+  viewport.append(baseEdgeLayer, alternativeLayer, primaryUnderlayLayer, primaryLayer, nodeLayer);
   svg.append(viewport);
-  const edgeLayer = svgElement("g");
-  const nodeLayer = svgElement("g");
-  viewport.append(edgeLayer, nodeLayer);
 
-  const visibleEdgePaths = () => edgeLayer.querySelectorAll("path[data-edge-visible]");
-
-  let selectedEdge = null;
-  edges.forEach((edge) => {
-    const source = positions.get(edge.source);
-    const target = positions.get(edge.target);
-    if (!source || !target) return;
-    const x1 = source.x + 150;
-    const y1 = source.y + 27;
-    const x2 = target.x;
-    const y2 = target.y + 27;
-    const bend = Math.max(40, Math.abs(x2 - x1) * 0.38);
-    const pathData = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+  const edgeRecords = [];
+  edges.forEach((edge, index) => {
+    const path = svgElement("path", {
+      class: "graph-edge",
+      fill: "none",
+      "marker-end": `url(#${markerIds.base})`,
+      "data-edge-key": String(index),
+    });
     const hitPath = svgElement("path", {
-      d: pathData, fill: "none", stroke: "transparent", "stroke-width": "14",
-      "pointer-events": "stroke", tabindex: "0", role: "button",
+      class: "graph-edge-hit",
+      fill: "none",
+      tabindex: "0",
+      role: "button",
       "aria-label": `关系：${edge.source} ${edge.type} ${edge.target}`,
     });
-    const path = svgElement("path", {
-      d: pathData,
-      fill: "none", stroke: "#b9c2d2", "stroke-width": "1.25", "marker-end": "url(#arrow)",
-      "pointer-events": "none", "data-edge-visible": "true",
+    const label = svgElement("text", {
+      class: `graph-edge-label${showEdgeLabels ? "" : " graph-edge-label-on-demand"}`,
+      "text-anchor": "middle",
     });
-    [hitPath, path].forEach((candidate) => {
-      candidate.dataset.source = edge.source;
-      candidate.dataset.target = edge.target;
-      candidate.dataset.type = edge.type;
-    });
-    hitPath.style.cursor = "pointer";
-    const chooseEdge = (event) => {
-      event.stopPropagation();
-      if (selected) selected.setAttribute("stroke", "#d4dcea");
-      selected = null;
-      visibleEdgePaths().forEach((candidate) => {
-        candidate.setAttribute("stroke", "#d3d9e4");
-        candidate.setAttribute("stroke-width", "1");
-        candidate.setAttribute("opacity", ".42");
-      });
-      selectedEdge = path;
-      path.setAttribute("stroke", "#3157d5");
-      path.setAttribute("stroke-width", "3");
-      path.setAttribute("opacity", "1");
-      onSelectEdge(edge);
-    };
-    hitPath.addEventListener("click", chooseEdge);
-    hitPath.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") chooseEdge(event);
-    });
-    edgeLayer.append(hitPath, path);
-    if (edges.length <= 55) {
-      const label = svgElement("text", { x: String((x1 + x2) / 2), y: String((y1 + y2) / 2 - 6), "text-anchor": "middle", fill: "#8792a6", "font-size": "9" });
-      label.textContent = short(edge.type, 18);
-      label.style.pointerEvents = "none";
-      edgeLayer.append(label);
+    label.textContent = short(edge.type, 18);
+    baseEdgeLayer.append(path, hitPath, label);
+    edgeRecords.push({ edge, path, hitPath, label, curvature: routes.get(edge) || 0, index });
+  });
+
+  const overlayRecords = [];
+  semantics.overlays.forEach((overlay) => {
+    const layer = overlay.variant === "alternative" ? alternativeLayer : primaryLayer;
+    if (overlay.variant !== "alternative") {
+      const underlay = svgElement("path", { class: "graph-propagation-underlay", fill: "none" });
+      primaryUnderlayLayer.append(underlay);
+      overlayRecords.push({ overlay, path: underlay, underlay: true });
     }
-  });
-
-  let selected = null;
-  nodes.forEach((node) => {
-    const pos = positions.get(node.name);
-    const group = svgElement("g", {
-      transform: `translate(${pos.x} ${pos.y})`, tabindex: "0", role: "button",
-      "aria-label": `节点：${node.name}，类型：${node.kind || "Component"}`,
+    const path = svgElement("path", {
+      class: `graph-propagation-edge graph-propagation-${overlay.variant}`,
+      fill: "none",
+      "marker-end": `url(#${markerIds[overlay.variant]})`,
     });
-    group.style.cursor = "pointer";
-    const color = palette[node.kind] || "#64748b";
-    const rect = svgElement("rect", { width: "150", height: "54", rx: "10", fill: "#fff", stroke: "#d4dcea", "stroke-width": "1.2" });
-    const accent = svgElement("rect", { width: "5", height: "54", rx: "2.5", fill: color });
-    const title = svgElement("text", { x: "15", y: "23", fill: "#17213a", "font-size": "12", "font-weight": "650" });
-    title.textContent = short(node.name, 19);
-    const kind = svgElement("text", { x: "15", y: "40", fill: "#7a8599", "font-size": "9.5" });
-    kind.textContent = node.kind || "Component";
-    const browserTitle = svgElement("title");
-    browserTitle.textContent = `${node.name} · ${node.kind}\n${node.description || ""}`;
-    group.append(rect, accent, title, kind, browserTitle);
-    const choose = () => {
-      if (selected) selected.setAttribute("stroke", "#d4dcea");
-      selectedEdge = null;
-      selected = rect;
-      rect.setAttribute("stroke", color);
-      rect.setAttribute("stroke-width", "2.5");
-      visibleEdgePaths().forEach((path) => {
-        const active = path.dataset.source === node.name || path.dataset.target === node.name;
-        path.setAttribute("stroke", active ? color : "#d3d9e4");
-        path.setAttribute("stroke-width", active ? "2.2" : "1");
-        path.setAttribute("opacity", active ? "1" : ".42");
-      });
-      onSelect(node, edges.filter((edge) => edge.source === node.name || edge.target === node.name));
-    };
-    group.addEventListener("click", (event) => { event.stopPropagation(); choose(); });
-    group.addEventListener("keydown", (event) => { if (event.key === "Enter") choose(); });
-    nodeLayer.append(group);
+    layer.append(path);
+    overlayRecords.push({ overlay, path, underlay: false });
   });
 
-  let scale = 1;
-  let panX = 0;
-  let panY = 0;
-  let dragging = false;
-  let start = { x: 0, y: 0 };
-  const transform = () => viewport.setAttribute("transform", `translate(${panX} ${panY}) scale(${scale})`);
-  const zoom = (factor) => { scale = Math.max(0.35, Math.min(2.4, scale * factor)); transform(); };
-  const reset = () => { scale = 1; panX = 0; panY = 0; transform(); };
-  svg.addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1.1 : 0.9); }, { passive: false });
+  const nodeRecords = new Map();
+  nodes.forEach((node) => {
+    const isStart = node.name === semantics.start;
+    const isEnd = node.name === semantics.end;
+    const semanticClasses = [
+      isStart ? "graph-node-start" : "",
+      isEnd ? "graph-node-end" : "",
+      (isStart || isEnd) && semantics.primary?.source === "llm" ? "graph-node-primary-model" : "",
+      (isStart || isEnd) && semantics.primary?.source === "algorithm" ? "graph-node-primary-algorithm" : "",
+    ].filter(Boolean).join(" ");
+    const group = svgElement("g", {
+      class: `graph-node${semanticClasses ? ` ${semanticClasses}` : ""}`,
+      tabindex: "0",
+      role: "button",
+      "aria-label": `节点：${node.name}，类型：${node.kind || "Component"}`,
+      "data-node-name": node.name,
+    });
+    const display = semantics.displayByNode?.[node.name] || null;
+    group.style.setProperty("--node-color", palette[node.kind] || "#61738f");
+    group.append(svgElement("circle", { class: "graph-node-halo", r: NODE_RADIUS + 7 }));
+    group.append(svgElement("circle", { class: "graph-node-circle", r: NODE_RADIUS }));
+    appendTextLines(group, nodeLines(display?.label || node.name));
+    const kind = svgElement("text", { class: "graph-node-kind", x: "0", y: NODE_RADIUS + 17 });
+    kind.textContent = display?.stage || node.kind || "Component";
+    group.append(kind);
+
+    const rank = semantics.candidateRanks[node.name];
+    if (rank) appendBadge(group, `Top-${rank}`, "graph-rank-badge", NODE_RADIUS + 22, 42);
+    if (isStart && isEnd) appendBadge(group, "起点 / 终点", "graph-endpoint-badge", -NODE_RADIUS - 29, 72);
+    else if (isStart) appendBadge(group, "起点", "graph-start-badge", -NODE_RADIUS - 29, 42);
+    else if (isEnd) appendBadge(group, "终点", "graph-end-badge", -NODE_RADIUS - 29, 42);
+
+    const browserTitle = svgElement("title");
+    browserTitle.textContent = `${display?.label || node.name} · ${display?.stage || node.kind || "Component"}${display?.explanation ? `\n${display.explanation}` : ""}${display && display.label !== node.name ? `\n真实节点：${node.name}` : ""}${node.description ? `\n${node.description}` : ""}`;
+    group.append(browserTitle);
+    nodeLayer.append(group);
+    nodeRecords.set(node.name, { node, group });
+  });
+
+  const applyViewport = () => {
+    const { scale, panX, panY } = viewportState.value();
+    viewport.setAttribute("transform", `translate(${panX} ${panY}) scale(${scale})`);
+    svg.classList.toggle("graph-zoomed-out", scale < 0.55);
+  };
+
+  const updatePositions = () => {
+    nodeRecords.forEach(({ group }, name) => {
+      const position = layout.position(name);
+      if (position) group.setAttribute("transform", `translate(${position.x} ${position.y})`);
+    });
+    edgeRecords.forEach((record) => {
+      const source = layout.position(record.edge.source);
+      const target = layout.position(record.edge.target);
+      if (!source || !target) return;
+      const geometry = edgeGeometry(source, target, record.curvature);
+      record.path.setAttribute("d", geometry.d);
+      record.hitPath.setAttribute("d", geometry.d);
+      record.label.setAttribute("x", geometry.labelX);
+      record.label.setAttribute("y", geometry.labelY);
+    });
+    overlayRecords.forEach((record) => {
+      const source = layout.position(record.overlay.source);
+      const target = layout.position(record.overlay.target);
+      if (!source || !target) return;
+      record.path.setAttribute("d", edgeGeometry(source, target, 0, NODE_RADIUS + 2).d);
+    });
+  };
+
+  const clearFocus = () => {
+    nodeRecords.forEach(({ group }) => group.classList.remove("graph-selected", "graph-related", "graph-muted"));
+    edgeRecords.forEach(({ path, label }) => {
+      path.classList.remove("graph-selected", "graph-related", "graph-muted");
+      label.classList.remove("graph-selected", "graph-related", "graph-muted");
+    });
+    overlayRecords.forEach(({ path }) => path.classList.remove("graph-related", "graph-muted"));
+  };
+
+  const chooseNode = (name) => {
+    const record = nodeRecords.get(name);
+    if (!record) return;
+    const relatedNames = new Set([name]);
+    const relatedEdges = edges.filter((edge) => {
+      const related = edge.source === name || edge.target === name;
+      if (related) relatedNames.add(edge.source === name ? edge.target : edge.source);
+      return related;
+    });
+    semantics.overlays.forEach((edge) => {
+      if (edge.source === name || edge.target === name) {
+        relatedNames.add(edge.source === name ? edge.target : edge.source);
+      }
+    });
+    nodeRecords.forEach(({ group }, nodeName) => {
+      group.classList.toggle("graph-selected", nodeName === name);
+      group.classList.toggle("graph-related", nodeName !== name && relatedNames.has(nodeName));
+      group.classList.toggle("graph-muted", !relatedNames.has(nodeName));
+    });
+    edgeRecords.forEach(({ edge, path, label }) => {
+      const related = edge.source === name || edge.target === name;
+      path.classList.toggle("graph-related", related);
+      path.classList.toggle("graph-muted", !related);
+      label.classList.toggle("graph-related", related);
+      label.classList.toggle("graph-muted", !related);
+    });
+    overlayRecords.forEach(({ overlay, path }) => {
+      const related = overlay.source === name || overlay.target === name;
+      path.classList.toggle("graph-related", related);
+      path.classList.toggle("graph-muted", !related);
+    });
+    onSelect(record.node, relatedEdges);
+  };
+
+  const chooseEdge = (record) => {
+    nodeRecords.forEach(({ group }, name) => {
+      const related = name === record.edge.source || name === record.edge.target;
+      group.classList.toggle("graph-related", related);
+      group.classList.toggle("graph-muted", !related);
+      group.classList.remove("graph-selected");
+    });
+    edgeRecords.forEach(({ path, label, index }) => {
+      const selected = index === record.index;
+      path.classList.toggle("graph-selected", selected);
+      path.classList.toggle("graph-muted", !selected);
+      label.classList.toggle("graph-selected", selected);
+      label.classList.toggle("graph-muted", !selected);
+    });
+    overlayRecords.forEach(({ path }) => path.classList.add("graph-muted"));
+    onSelectEdge(record.edge);
+  };
+
+  edgeRecords.forEach((record) => {
+    const choose = (event) => {
+      event.stopPropagation();
+      chooseEdge(record);
+    };
+    record.hitPath.addEventListener("click", choose);
+    record.hitPath.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") choose(event);
+    });
+  });
+
+  let destroyed = false;
+  let animationFrame = 0;
+  let fitWhenSettled = true;
+
+  const graphBounds = () => {
+    const positions = layout.snapshot();
+    const xs = positions.map((point) => point.x);
+    const ys = positions.map((point) => point.y);
+    const margin = NODE_RADIUS + 42;
+    return {
+      minX: Math.min(...xs) - margin,
+      minY: Math.min(...ys) - margin,
+      maxX: Math.max(...xs) + margin,
+      maxY: Math.max(...ys) + margin,
+    };
+  };
+
+  const fit = () => {
+    viewportState.set(calculateFitTransform(graphBounds(), viewportWidth, viewportHeight, { padding: 64 }));
+    applyViewport();
+  };
+
+  const schedule = () => {
+    if (destroyed || animationFrame) return;
+    animationFrame = requestAnimationFrame(() => {
+      animationFrame = 0;
+      if (destroyed || !svg.isConnected) {
+        destroyed = true;
+        return;
+      }
+      const settled = layout.step();
+      updatePositions();
+      if (settled) {
+        if (fitWhenSettled) {
+          fitWhenSettled = false;
+          fit();
+        }
+      } else {
+        schedule();
+      }
+    });
+  };
+
+  nodeRecords.forEach(({ group }, name) => {
+    let pointer = null;
+    group.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+      const world = viewportState.toWorld(point.x, point.y);
+      const position = layout.position(name);
+      pointer = {
+        id: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        offsetX: world.x - position.x,
+        offsetY: world.y - position.y,
+        dragging: false,
+      };
+      group.setPointerCapture?.(event.pointerId);
+    });
+    group.addEventListener("pointermove", (event) => {
+      if (!pointer || pointer.id !== event.pointerId) return;
+      if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > 4) {
+        pointer.dragging = true;
+      }
+      if (!pointer.dragging) return;
+      const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+      const world = viewportState.toWorld(point.x, point.y);
+      layout.move(name, world.x - pointer.offsetX, world.y - pointer.offsetY);
+      layout.reheat();
+      updatePositions();
+      schedule();
+    });
+    const finishPointer = (event) => {
+      if (!pointer || pointer.id !== event.pointerId) return;
+      const wasDragging = pointer.dragging;
+      pointer = null;
+      group.releasePointerCapture?.(event.pointerId);
+      if (!wasDragging) chooseNode(name);
+    };
+    group.addEventListener("pointerup", finishPointer);
+    group.addEventListener("pointercancel", () => { pointer = null; });
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        chooseNode(name);
+      }
+    });
+  });
+
+  let panPointer = null;
   svg.addEventListener("pointerdown", (event) => {
-    // 只允许从画布空白处开始拖动。过去在节点上也调用 pointer capture，
-    // 某些浏览器会把随后合成的 click 重定向到 SVG，导致节点点击看起来无效。
-    if (event.target !== svg) return;
-    dragging = true;
-    start = { x: event.clientX - panX, y: event.clientY - panY };
+    if (event.target !== svg || event.button !== 0) return;
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+    panPointer = { id: event.pointerId, x: point.x, y: point.y, moved: false };
     svg.setPointerCapture?.(event.pointerId);
   });
-  svg.addEventListener("pointermove", (event) => { if (!dragging) return; panX = event.clientX - start.x; panY = event.clientY - start.y; transform(); });
-  svg.addEventListener("pointerup", () => { dragging = false; });
-  svg.addEventListener("pointercancel", () => { dragging = false; });
-  svg.addEventListener("click", (event) => {
-    if (event.target === svg) {
-      selectedEdge = null;
-      if (selected) selected.setAttribute("stroke", "#d4dcea");
-      selected = null;
-      visibleEdgePaths().forEach((path) => { path.setAttribute("stroke", "#b9c2d2"); path.setAttribute("stroke-width", "1.25"); path.setAttribute("opacity", "1"); });
-    }
+  svg.addEventListener("pointermove", (event) => {
+    if (!panPointer || panPointer.id !== event.pointerId) return;
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+    const deltaX = point.x - panPointer.x;
+    const deltaY = point.y - panPointer.y;
+    if (Math.hypot(deltaX, deltaY) > 1) panPointer.moved = true;
+    viewportState.panBy(deltaX, deltaY);
+    panPointer.x = point.x;
+    panPointer.y = point.y;
+    applyViewport();
   });
+  const finishPan = (event) => {
+    if (!panPointer || panPointer.id !== event.pointerId) return;
+    const moved = panPointer.moved;
+    panPointer = null;
+    svg.releasePointerCapture?.(event.pointerId);
+    if (!moved) clearFocus();
+  };
+  svg.addEventListener("pointerup", finishPan);
+  svg.addEventListener("pointercancel", () => { panPointer = null; });
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
+    const { scale } = viewportState.value();
+    viewportState.zoomAt(scale * (event.deltaY < 0 ? 1.12 : 0.88), point.x, point.y);
+    applyViewport();
+  }, { passive: false });
+
   container.append(svg);
-  return { zoomIn: () => zoom(1.18), zoomOut: () => zoom(0.84), reset, nodeCount: nodes.length, edgeCount: edges.length };
+  updatePositions();
+  fit();
+  schedule();
+
+  const zoomBy = (factor) => {
+    const current = viewportState.value();
+    viewportState.zoomAt(current.scale * factor, viewportWidth / 2, viewportHeight / 2);
+    applyViewport();
+  };
+
+  return {
+    zoomIn: () => zoomBy(1.18),
+    zoomOut: () => zoomBy(0.84),
+    fit,
+    reset: fit,
+    relayout() {
+      layout.reset();
+      updatePositions();
+      fitWhenSettled = true;
+      schedule();
+    },
+    destroy() {
+      destroyed = true;
+      if (animationFrame) cancelAnimationFrame(animationFrame);
+      animationFrame = 0;
+    },
+    nodeCount: nodes.length,
+    edgeCount: edges.length,
+    semantics,
+  };
 }
 
-export function graphLegend(includeDynamic = true) {
-  const entries = [["Service", "服务"], ["Database", "数据库/缓存"], ["Cluster", "集群"], ["Instance", "实例"]];
-  if (includeDynamic) entries.push(["Incident", "故障"], ["RCAHypothesis", "根因假设"]);
-  return entries.map(([kind, label]) => `<span><i class="legend-dot" style="background:${palette[kind]}"></i>${label}</span>`).join("");
+export function graphLegend(includeDynamic = true, includePropagation = false) {
+  const entries = [
+    ["UIControl", "界面交互"],
+    ["Service", "服务"],
+    ["Database", "数据资源"],
+    ["Cluster", "集群"],
+    ["Instance", "实例"],
+  ];
+  if (includeDynamic) entries.push(["Incident", "故障"], ["RCAHypothesis", "根因候选"]);
+  const nodeLegend = entries
+    .map(([kind, label]) => `<span><i class="legend-dot" style="background:${palette[kind]}"></i>${label}</span>`)
+    .join("");
+  if (!includePropagation) return nodeLegend;
+  return `${nodeLegend}<span><i class="legend-line legend-line-model"></i>模型结论</span><span><i class="legend-line legend-line-algorithm"></i>算法首选</span><span><i class="legend-line legend-line-alternative"></i>其他候选</span>`;
 }

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 
-ROOT_KEYWORDS = (
+ATOMIC_ROOT_KEYWORDS = (
     "rediscommandtimeoutexception",
     "redisconnectionexception",
     "jedisclusterexception",
@@ -16,21 +16,42 @@ ROOT_KEYWORDS = (
     "communications exception",
     "communicationsexception",
     "deadlock",
+    "mysqltransactionrollbackexception",
+    "lock wait timeout",
     "sqltransientconnectionexception",
     "sqlintegrityconstraintviolationexception",
+    "hikaripool",
     "connection refused",
+    "connection reset",
     "read timed out",
     "unknownhostexception",
-    "hikaripool",
+    "outofmemoryerror",
+    "java heap space",
+    "read-only file system",
+    "alreadyclosedexception",
+    "nic link down",
+    "cpu load",
+    "hardware host crash",
 )
-UPSTREAM_KEYWORDS = (
+ROOT_KEYWORDS = ATOMIC_ROOT_KEYWORDS
+
+WRAPPER_PROPAGATION_KEYWORDS = (
     "bad gateway",
     "downstreamserviceexception",
     "downstream call",
     "downstream service",
+    "gateway error",
+    "proxyfilter",
+    "http 500",
+    "http 502",
+    "http 504",
+    "500 internal server error",
+    "504 gateway time-out",
 )
+UPSTREAM_KEYWORDS = WRAPPER_PROPAGATION_KEYWORDS
+
 ERROR_LEVELS = {"ERROR", "FATAL"}
-TECHNICAL_FAULT_FAMILIES = {"redis", "database", "network", "timeout", "classloading"}
+TECHNICAL_FAULT_FAMILIES = {"redis", "database", "network", "timeout", "classloading", "memory", "disk", "hardware", "mq"}
 
 
 INCIDENT_COLUMNS = [
@@ -80,12 +101,28 @@ def _event_text(row: pd.Series | dict[str, Any]) -> str:
     ).lower()
 
 
+def _is_wrapper_error(row: pd.Series | dict[str, Any]) -> bool:
+    class_name = _string(row.get("root_exception_class") or row.get("exception_class")).lower()
+    text = f"{class_name} {_event_text(row)}"
+    if "downstreamserviceexception" in class_name or "gateway" in class_name or "proxyfilter" in class_name:
+        return True
+    return any(keyword in text for keyword in WRAPPER_PROPAGATION_KEYWORDS)
+
+
 def _fault_family(row: pd.Series | dict[str, Any]) -> str:
     class_name = _string(row.get("root_exception_class") or row.get("exception_class")).lower()
     text = f"{class_name} {_event_text(row)}"
+    if any(token in text for token in ("outofmemory", "heap space", "metaspace", "gc overhead")):
+        return "memory"
+    if any(token in text for token in ("read-only file system", "ioexception", "disk")):
+        return "disk"
+    if any(token in text for token in ("nic link down", "hardware host crash", "cpu load")):
+        return "hardware"
+    if any(token in text for token in ("rabbitmq", "kafka", "rocketmq", "amqp", "alreadyclosedexception")):
+        return "mq"
     if any(token in text for token in ("redis", "jedis", "lettuce")):
         return "redis"
-    if any(token in text for token in ("sql", "jdbc", "hikari", "mysql", "postgres", "oracle", "database", "communications")):
+    if any(token in text for token in ("sql", "jdbc", "hikari", "mysql", "postgres", "oracle", "database", "communications", "deadlock")):
         return "database"
     if any(token in text for token in ("classformat", "verifyerror", "noclassdeffound", "classnotfound", "linkageerror")):
         return "classloading"
@@ -93,7 +130,7 @@ def _fault_family(row: pd.Series | dict[str, Any]) -> str:
         return "network"
     if any(token in text for token in ("timeout", "timed out")):
         return "timeout"
-    if any(token in text for token in ("license", "password", "authentication", "authorization", "accessdenied")):
+    if any(token in text for token in ("license", "password", "authentication", "authorization", "accessdenied", "401")):
         return "authentication"
     if any(token in text for token in ("business", "illegalargument", "illegalstate")):
         return "business"
@@ -101,19 +138,14 @@ def _fault_family(row: pd.Series | dict[str, Any]) -> str:
 
 
 def _is_technical_error(row: pd.Series | dict[str, Any]) -> bool:
-    """Return True for errors that normally represent a system/infrastructure fault.
-
-    Business/authentication exceptions are still preserved in events.csv and may be
-    attached as context, but they do not automatically create an Incident.
-    """
-
+    """Return True for errors that normally represent a system/infrastructure fault."""
     level = _string(row.get("level")).upper()
     if level not in ERROR_LEVELS:
         return False
     family = _fault_family(row)
     if family in TECHNICAL_FAULT_FAMILIES:
         return True
-    return any(keyword in _event_text(row) for keyword in ROOT_KEYWORDS)
+    return any(keyword in _event_text(row) for keyword in ATOMIC_ROOT_KEYWORDS)
 
 
 def annotate_windows(
@@ -236,17 +268,22 @@ def _candidate_score(
         score += 5.0
     elif level == "WARN":
         score += 1.0
+
     if _string(row.get("root_exception_class")):
         score += 4.0
     elif _string(row.get("exception_class")):
         score += 2.0
-    if any(keyword in text for keyword in ROOT_KEYWORDS):
-        score += 5.0
-    if any(keyword in text for keyword in UPSTREAM_KEYWORDS):
-        score -= 2.5
+
+    is_atomic_root = any(keyword in text for keyword in ATOMIC_ROOT_KEYWORDS)
+    is_wrapper = _is_wrapper_error(row)
+
+    if is_atomic_root:
+        score += 10.0
+    if is_wrapper:
+        score -= 12.0
+
     seconds = max((pd.Timestamp(row["timestamp"]) - incident_start).total_seconds(), 0.0)
-    score += max(0.0, 2.0 - seconds / 120.0)
-    # Rare exception classes are often more diagnostic than a flood of repeated wrappers.
+    score += max(0.0, 3.0 - seconds / 60.0)
     score += 3.0 / math.sqrt(max(1, class_count))
     return round(score, 6)
 
@@ -295,18 +332,13 @@ def _region_from_rows(rows: list[pd.Series]) -> dict[str, Any]:
 def _cluster_error_indices(error_events: pd.DataFrame, explain_config: dict) -> list[list[int]]:
     """Aggregate request-level ERROR rows into fault episodes.
 
-    V2 accidentally treated traceId as an isolation boundary: two Redis timeout
-    errors with different request traceIds could never merge. During one outage,
-    hundreds of requests therefore became hundreds of Incidents. V3 makes traceId
-    a *positive join signal*, not a split key. Same service/class or same
-    service/fault-family can merge across different traceIds when they are close in
-    time.
+    Uses traceId, downstream target indicators, short-time-window propagation, and
+    service/family similarity to cluster errors into unified incidents.
     """
 
     if error_events.empty:
         return []
 
-    # Exact signatures may recur for a little longer than family-level variants.
     exact_gap = pd.Timedelta(
         minutes=float(
             explain_config.get(
@@ -343,8 +375,11 @@ def _cluster_error_indices(error_events: pd.DataFrame, explain_config: dict) -> 
         timestamp = pd.Timestamp(row["timestamp"])
         trace_id = _string(row.get("trace_id"))
         service = _string(row.get("service"))
+        downstream = _string(row.get("downstream_target"))
         family = _fault_family(row)
         exception_key = _string(row.get("root_exception_class")) or _string(row.get("exception_class")) or family
+        is_wrapper = _is_wrapper_error(row)
+        is_atomic = any(k in _event_text(row) for k in ATOMIC_ROOT_KEYWORDS)
 
         selected: dict[str, Any] | None = None
         selected_score = -1
@@ -359,10 +394,22 @@ def _cluster_error_indices(error_events: pd.DataFrame, explain_config: dict) -> 
             same_class = exception_key in cluster["classes"]
             same_family = family in cluster["families"]
             same_service = bool(not service or not cluster["services"] or service in cluster["services"])
+            same_downstream = bool(
+                downstream and (
+                    downstream in cluster["services"] or
+                    downstream in cluster["downstreams"]
+                )
+            )
+            short_window = gap <= pd.Timedelta(seconds=20)
+            cluster_has_atomic = cluster.get("has_atomic", False)
 
             score = -1
             if same_trace and gap <= trace_gap:
                 score = 100
+            elif same_downstream and gap <= pd.Timedelta(seconds=45):
+                score = 95
+            elif short_window and (is_wrapper or cluster_has_atomic or is_atomic):
+                score = 85
             elif same_class and same_service and gap <= exact_gap:
                 score = 90
             elif same_family and same_service and gap <= family_gap:
@@ -385,8 +432,10 @@ def _cluster_error_indices(error_events: pd.DataFrame, explain_config: dict) -> 
                 "last": timestamp,
                 "traces": set(),
                 "services": set(),
+                "downstreams": set(),
                 "families": set(),
                 "classes": set(),
+                "has_atomic": False,
             }
             clusters.append(selected)
 
@@ -396,6 +445,10 @@ def _cluster_error_indices(error_events: pd.DataFrame, explain_config: dict) -> 
             selected["traces"].add(trace_id)
         if service:
             selected["services"].add(service)
+        if downstream:
+            selected["downstreams"].add(downstream)
+        if is_atomic:
+            selected["has_atomic"] = True
         selected["families"].add(family)
         selected["classes"].add(exception_key)
 

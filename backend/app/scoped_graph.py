@@ -472,9 +472,8 @@ class ProjectScopedGraphClient:
 
     def clear_project_graph(self) -> dict[str, int]:
         graph = self.read_graph(limit=5000)
-        deleted = 0
-        # Raw node deletion removes adjacent project edges first.
-        for node in graph.nodes:
-            if self.delete_node_by_name(node.name):
-                deleted += 1
+        # Resolve the project snapshot once, then let the raw client remove
+        # adjacent edges and vertices in one bounded pass. This avoids an
+        # expensive full-graph read for every individual node.
+        deleted = self.delete_nodes_by_names([node.name for node in graph.nodes])
         return {"deleted_vertices": deleted}

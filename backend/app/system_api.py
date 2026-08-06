@@ -14,7 +14,8 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 
 from .auth import (
     current_token_hash,
@@ -24,8 +25,9 @@ from .auth import (
     require_user,
     verify_password,
 )
-from pydantic import BaseModel, Field
 from .config import get_settings
+from .graph_admin import GraphAdminService
+from .hugegraph_client import HugeGraphRestClient, HugeGraphRestError
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
     EdgeDeleteRequest,
@@ -69,6 +71,11 @@ def _project_for_user(
         # Returning 404 avoids leaking project identifiers between users.
         raise HTTPException(status_code=404, detail="项目不存在")
     return project
+
+
+def _require_admin(user: dict[str, Any]) -> None:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅系统管理员有权管理 HugeGraph")
 
 
 def _incident_for_user(
@@ -312,6 +319,180 @@ def update_user(
         password_hash=new_hash,
     )
     return {"user": public_user(updated or target_user)}
+
+
+# HugeGraph administration -------------------------------------------------
+
+
+class GraphOperationPreviewRequest(BaseModel):
+    action: str = Field(..., max_length=40)
+    project_id: str = Field(..., min_length=1, max_length=80)
+    target_id: str = Field("", max_length=160)
+
+
+class GraphOperationExecuteRequest(BaseModel):
+    confirmation_text: str = Field(..., min_length=1, max_length=200)
+
+
+def _graph_admin_service(database: SystemDatabase | None = None) -> GraphAdminService:
+    return GraphAdminService(database or get_system_db(), HugeGraphRestClient())
+
+
+def _graph_service_error(exc: Exception) -> HTTPException:
+    message = str(exc).strip().replace("\r", " ").replace("\n", " ")[:800]
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=403, detail=message)
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=message)
+    if isinstance(exc, HugeGraphRestError):
+        return HTTPException(status_code=503, detail=f"HugeGraph 操作失败：{message}")
+    return HTTPException(status_code=500, detail=f"图谱管理操作失败：{message}")
+
+
+@router.get("/admin/graph/status")
+def admin_graph_status(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    try:
+        return {"status": _graph_admin_service().status()}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/overview")
+def admin_graph_overview(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    try:
+        return {"overview": _graph_admin_service().overview()}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/data")
+def admin_graph_data(
+    entity: str = Query("nodes"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    project_id: str = Query(""),
+    category: str = Query(""),
+    q: str = Query("", max_length=200),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    if entity not in {"nodes", "edges"}:
+        raise HTTPException(status_code=422, detail="entity 仅支持 nodes 或 edges")
+    try:
+        return _graph_admin_service().data(
+            entity=entity,
+            page=page,
+            page_size=page_size,
+            project_id=project_id.strip(),
+            category=category.strip(),
+            query=q,
+        )
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/quality")
+def admin_graph_quality(
+    project_id: str = Query(""),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    if project_id and not get_system_db().get_project(project_id):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    try:
+        return {"quality": _graph_admin_service().quality(project_id.strip())}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/batches")
+def admin_graph_batches(
+    project_id: str = Query(..., min_length=1),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    database = get_system_db()
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    items = database.list_log_batches(project_id)
+    return {
+        "items": [
+            {key: item.get(key) for key in ("id", "filename", "status", "created_at", "completed_at")}
+            for item in items
+        ]
+    }
+
+
+@router.get("/admin/graph/export")
+def admin_graph_export(
+    project_id: str = Query(..., min_length=1),
+    user: dict[str, Any] = Depends(require_user),
+) -> Response:
+    _require_admin(user)
+    try:
+        payload = _graph_admin_service().project_export(project_id)
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"project-{project_id}-graph.json"
+    return Response(
+        content=body,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/admin/graph/operations/preview", status_code=201)
+def preview_admin_graph_operation(
+    payload: GraphOperationPreviewRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    if payload.action not in {"cleanup_batch", "clear_project"}:
+        raise HTTPException(status_code=422, detail="不支持的图谱操作")
+    try:
+        operation = _graph_admin_service().preview_operation(
+            actor_id=str(user["id"]),
+            action=payload.action,
+            project_id=payload.project_id,
+            target_id=payload.target_id,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.post("/admin/graph/operations/{operation_id}/execute")
+def execute_admin_graph_operation(
+    operation_id: str,
+    payload: GraphOperationExecuteRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    try:
+        operation = _graph_admin_service().execute_operation(
+            operation_id=operation_id,
+            actor_id=str(user["id"]),
+            confirmation_text=payload.confirmation_text,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/operations")
+def list_admin_graph_operations(
+    limit: int = Query(100, ge=1, le=500),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    return {"items": _graph_admin_service().operations(limit)}
 
 
 @router.post("/projects", status_code=201)

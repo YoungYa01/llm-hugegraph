@@ -61,6 +61,22 @@ export const api = {
   users: () => request("/users"),
   updateUser: (userId, payload) => request(`/users/${userId}`, { method: "PATCH", body: JSON.stringify(payload) }),
 
+  adminGraphStatus: () => request("/admin/graph/status"),
+  adminGraphOverview: () => request("/admin/graph/overview"),
+  adminGraphData: (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+    });
+    return request(`/admin/graph/data?${params.toString()}`);
+  },
+  adminGraphQuality: (projectId = "") => request(`/admin/graph/quality${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
+  adminGraphBatches: (projectId) => request(`/admin/graph/batches?project_id=${encodeURIComponent(projectId)}`),
+  adminGraphExport: (projectId) => request(`/admin/graph/export?project_id=${encodeURIComponent(projectId)}`),
+  previewAdminGraphOperation: (payload) => request("/admin/graph/operations/preview", { method: "POST", body: JSON.stringify(payload) }),
+  executeAdminGraphOperation: (operationId, confirmationText) => request(`/admin/graph/operations/${operationId}/execute`, { method: "POST", body: JSON.stringify({ confirmation_text: confirmationText }) }),
+  adminGraphOperations: (limit = 100) => request(`/admin/graph/operations?limit=${limit}`),
+
   projects: (archived = false) => request(`/projects?include_archived=${archived}`),
   project: (id) => request(`/projects/${id}`),
   createProject: (payload) => request("/projects", { method: "POST", body: JSON.stringify(payload) }),

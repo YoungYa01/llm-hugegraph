@@ -4,7 +4,7 @@
   cursor: pointer; font-weight: 650; transition: 150ms ease;
 }
 .button:hover:not(:disabled) { transform: translateY(-1px); }
-.button:disabled { cursor: wait; opacity: 0.62; }
+.button:disabled { cursor: not-allowed; opacity: 0.62; }
 .button-primary { color: #fff; background: var(--brand); box-shadow: 0 5px 16px rgb(49 87 213 / 20%); }
 .button-primary:hover:not(:disabled) { background: var(--brand-dark); }
 .button-secondary { border-color: var(--line-strong); color: var(--ink-800); background: #fff; }

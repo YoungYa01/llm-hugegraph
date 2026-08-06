@@ -48,6 +48,42 @@ def _public_operation(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _orphan_diagnosis(node: dict[str, Any]) -> tuple[str, str, str]:
+    """Return a conservative reason, suggestion and deletion risk."""
+    kind = str(node.get("kind") or "")
+    source_file = str(node.get("source_file") or "").lower()
+    meta = node.get("meta") if isinstance(node.get("meta"), dict) else {}
+    if not node.get("project_id"):
+        return (
+            "节点缺少项目命名空间或 project_id，无法与项目内关系正确匹配",
+            "先核对节点来源和项目归属，确认无业务引用后再处理",
+            "high",
+        )
+    if kind in DYNAMIC_KINDS:
+        return (
+            "日志/RCA 动态节点没有关联边，可能由分析写入中断或关联批次已被部分清理造成",
+            "核对对应日志批次；若批次已失效，可删除该节点",
+            "low",
+        )
+    if source_file == "manual" or bool(meta.get("manual")):
+        return (
+            "节点由人工创建，但尚未建立关系，或原有关系已被删除",
+            "先在系统架构图谱补充关系；确认属于误建数据后再删除",
+            "medium",
+        )
+    if source_file:
+        return (
+            "架构导入只生成了节点，可能未抽取到关系、关系端点名称不一致或关系写入失败",
+            "检查来源文档中的上下游描述及导入记录，优先补关系而不是直接删除",
+            "medium",
+        )
+    return (
+        "节点没有来源文件和任何有效关系，可能是历史残留或关系已被清理",
+        "核对业务组件是否仍存在，确认无引用后再删除",
+        "high",
+    )
+
+
 class GraphAdminService:
     """Read-only inspection plus narrowly scoped, audited graph maintenance."""
 
@@ -158,6 +194,8 @@ class GraphAdminService:
                         (target or {}).get("internal_name") or target_id
                     ),
                     "project_id": project_id,
+                    "source_project_id": str((source or {}).get("project_id") or ""),
+                    "target_project_id": str((target or {}).get("project_id") or ""),
                     "project_name": str(
                         (project_map.get(project_id) or {}).get("name") or "未归属项目"
                     ),
@@ -302,8 +340,46 @@ class GraphAdminService:
             for endpoint in (edge["source_id"], edge["target_id"])
             if edge["valid"]
         }
-        orphan_nodes = [item for item in nodes if item["id"] not in connected]
+        orphan_nodes = []
+        for item in nodes:
+            if item["id"] in connected:
+                continue
+            reason, suggestion, deletion_risk = _orphan_diagnosis(item)
+            orphan_nodes.append(
+                {
+                    **item,
+                    "likely_reason": reason,
+                    "suggestion": suggestion,
+                    "deletion_risk": deletion_risk,
+                }
+            )
         invalid_edges = [item for item in edges if not item["valid"]]
+        cross_project_edges = [
+            item
+            for item in edges
+            if item["source_project_id"]
+            and item["target_project_id"]
+            and item["source_project_id"] != item["target_project_id"]
+        ]
+        known_project_ids = {str(item["id"]) for item in snapshot["projects"]}
+        unknown_project_nodes = [
+            item
+            for item in nodes
+            if item["project_id"] and item["project_id"] not in known_project_ids
+        ]
+        unscoped_nodes = []
+        for item in nodes:
+            if item["project_id"]:
+                continue
+            reason, suggestion, deletion_risk = _orphan_diagnosis(item)
+            unscoped_nodes.append(
+                {
+                    **item,
+                    "likely_reason": reason,
+                    "suggestion": suggestion,
+                    "deletion_risk": deletion_risk,
+                }
+            )
         groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
         for edge in edges:
             groups[(edge["source_id"], edge["target_id"], edge["relation"])].append(
@@ -325,14 +401,39 @@ class GraphAdminService:
                 "orphan_nodes": len(orphan_nodes),
                 "invalid_edges": len(invalid_edges),
                 "duplicate_edge_groups": len(duplicate_groups),
-                "unscoped_nodes": sum(not item["project_id"] for item in nodes),
+                "unscoped_nodes": len(unscoped_nodes),
+                "cross_project_edges": len(cross_project_edges),
+                "unknown_project_nodes": len(unknown_project_nodes),
             },
             "orphan_nodes": orphan_nodes[:200],
             "invalid_edges": invalid_edges[:200],
             "duplicate_edges": duplicate_groups[:200],
+            "cross_project_edges": cross_project_edges[:200],
+            "unknown_project_nodes": unknown_project_nodes[:200],
+            "unscoped_nodes": unscoped_nodes[:200],
             "sample_limit": 200,
+            "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "scan": snapshot["scan"],
         }
+
+    @staticmethod
+    def _project_orphan_nodes(
+        snapshot: dict[str, Any], project_id: str
+    ) -> list[dict[str, Any]]:
+        nodes = [node for node in snapshot["nodes"] if node["project_id"] == project_id]
+        node_ids = {node["id"] for node in nodes}
+        connected = {
+            endpoint
+            for edge in snapshot["edges"]
+            if edge["valid"]
+            and (
+                edge["project_id"] == project_id
+                or edge["source_id"] in node_ids
+                or edge["target_id"] in node_ids
+            )
+            for endpoint in (edge["source_id"], edge["target_id"])
+        }
+        return [node for node in nodes if node["id"] not in connected]
 
     def project_export(self, project_id: str) -> dict[str, Any]:
         project = self.database.get_project(project_id)
@@ -365,6 +466,7 @@ class GraphAdminService:
         action: str,
         project_id: str,
         target_id: str = "",
+        target_names: list[str] | None = None,
     ) -> dict[str, Any]:
         project = self.database.get_project(project_id)
         if not project:
@@ -405,6 +507,40 @@ class GraphAdminService:
             ]
             confirmation = str(target_id)
             description = f"清理日志批次 {batch['filename']} 产生的动态图谱数据"
+        elif action == "delete_orphan_nodes":
+            requested_names = list(
+                dict.fromkeys(
+                    str(name).strip()
+                    for name in (target_names or [])
+                    if str(name).strip()
+                )
+            )
+            if not requested_names:
+                raise ValueError("请至少选择一个孤立节点")
+            if len(requested_names) > 200:
+                raise ValueError("单次最多删除 200 个孤立节点")
+            current_orphans = {
+                node["name"]: node
+                for node in self._project_orphan_nodes(snapshot, project_id)
+            }
+            invalid_names = [
+                name for name in requested_names if name not in current_orphans
+            ]
+            if invalid_names:
+                raise ValueError("所选节点已不再是孤立节点，请重新执行质量检查")
+            affected_nodes = [current_orphans[name] for name in requested_names]
+            affected_ids = {node["id"] for node in affected_nodes}
+            affected_edges = [
+                edge
+                for edge in project_edges
+                if edge["source_id"] in affected_ids
+                or edge["target_id"] in affected_ids
+            ]
+            confirmation = f"删除{len(affected_nodes)}个孤立节点"
+            description = (
+                f"删除项目 {project['name']} 中选中的 {len(affected_nodes)} 个孤立节点"
+            )
+            target_id = f"selected:{len(affected_nodes)}"
         else:
             raise ValueError("不支持的图谱操作")
         preview = {
@@ -416,6 +552,9 @@ class GraphAdminService:
             "affected_nodes": len(affected_nodes),
             "affected_edges": len(affected_edges),
             "node_samples": [node["name"] for node in affected_nodes[:10]],
+            "target_names": [node["name"] for node in affected_nodes]
+            if action == "delete_orphan_nodes"
+            else [],
             "irreversible": True,
         }
         row = self.database.create_graph_admin_operation(
@@ -448,6 +587,23 @@ class GraphAdminService:
         if (datetime.now(timezone.utc) - created_at).total_seconds() > 600:
             raise ValueError("操作预览已超过 10 分钟，请重新预览")
 
+        preview = _json_dict(row.get("preview_json"))
+        orphan_names: list[str] = []
+        if row["action"] == "delete_orphan_nodes":
+            orphan_names = [
+                str(name) for name in preview.get("target_names") or [] if str(name)
+            ]
+            current_orphan_names = {
+                node["name"]
+                for node in self._project_orphan_nodes(
+                    self.snapshot(), str(row["project_id"])
+                )
+            }
+            if not orphan_names or any(
+                name not in current_orphan_names for name in orphan_names
+            ):
+                raise ValueError("孤立节点状态已经变化，请重新检查并生成预览")
+
         if not self.database.start_graph_admin_operation(operation_id):
             raise ValueError("该操作已被其他请求执行，请刷新审计记录")
         scoped = ProjectScopedGraphClient(str(row["project_id"]), self.client)
@@ -456,6 +612,11 @@ class GraphAdminService:
                 result = scoped.clear_project_graph()
             elif row["action"] == "cleanup_batch":
                 result = scoped.delete_incident_batch(str(row["target_id"]))
+            elif row["action"] == "delete_orphan_nodes":
+                result = {
+                    "requested_vertices": len(orphan_names),
+                    "deleted_vertices": scoped.delete_nodes_by_names(orphan_names),
+                }
             else:
                 raise ValueError("不支持的图谱操作")
             self.database.finish_graph_admin_operation(operation_id, result=result)

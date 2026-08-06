@@ -6,6 +6,7 @@ const number = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 
 const actionLabel = (action) => ({
   clear_project: "清空项目图谱",
   cleanup_batch: "清理批次动态图谱",
+  delete_orphan_nodes: "删除孤立节点",
 }[action] || action);
 
 const statusLabel = (status) => ({
@@ -21,6 +22,8 @@ const statusColor = (status) => ({
   completed: "#16a34a",
   failed: "#dc2626",
 }[status] || "#64748b");
+
+const riskLabel = (risk) => ({ high: "高", medium: "中", low: "低" }[risk] || risk);
 
 export async function renderGraphAdminContent(content) {
   const state = {
@@ -145,13 +148,17 @@ function renderMain(root, connection, overview, operations, state, content) {
 
   bindProjectActions(root, overview.projects || [], content);
   bindExplorer(root, state);
-  root.querySelector("#run-quality-check")?.addEventListener("click", () => loadQuality(root));
+  root.querySelector("#run-quality-check")?.addEventListener("click", () => loadQuality(root, state, content));
   root.querySelector("#refresh-operation-log")?.addEventListener("click", () => loadOperations(root));
   loadExplorer(root, state);
 }
 
 function metricCard(label, value, color, detail) {
   return `<section class="card" style="padding:16px"><span style="font-size:12px;color:var(--ink-500)">${label}</span><strong style="display:block;font-size:24px;color:${color};margin:5px 0">${value}</strong><small style="color:var(--ink-500)">${detail}</small></section>`;
+}
+
+function qualityMetric(label, value, hasIssue, detail) {
+  return `<div class="quality-metric"><span>${label}</span><strong style="color:${hasIssue ? "#dc2626" : "#16a34a"}">${value}</strong><small>${detail}</small></div>`;
 }
 
 function schemaState(label, ready) {
@@ -228,7 +235,7 @@ async function loadExplorer(root, state) {
       return;
     }
     const nodes = result.entity === "nodes";
-    area.innerHTML = `<div class="table-wrap"><table class="table"><thead><tr>${nodes ? "<th>节点名称</th><th>类型 / 层级</th><th>项目</th><th>来源</th>" : "<th>起点 → 终点</th><th>关系类型</th><th>项目</th><th>有效性</th>"}</tr></thead><tbody>${result.items.map((item) => nodes ? `
+    area.innerHTML = `<div class="table-wrap graph-admin-scroll"><table class="table"><thead><tr>${nodes ? "<th>节点名称</th><th>类型 / 层级</th><th>项目</th><th>来源</th>" : "<th>起点 → 终点</th><th>关系类型</th><th>项目</th><th>有效性</th>"}</tr></thead><tbody>${result.items.map((item) => nodes ? `
       <tr><td><strong>${escapeHtml(item.name)}</strong><small style="display:block;color:var(--ink-400);max-width:360px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(item.description || item.internal_name)}</small></td><td>${escapeHtml(item.kind)}<small style="display:block;color:var(--ink-400)">${escapeHtml(item.layer)}</small></td><td>${escapeHtml(item.project_name)}</td><td>${escapeHtml(item.source_file || "-")}</td></tr>` : `
       <tr><td><strong>${escapeHtml(item.source)}</strong> → <strong>${escapeHtml(item.target)}</strong><small style="display:block;color:var(--ink-400)">${escapeHtml(item.description || "")}</small></td><td>${escapeHtml(item.relation)}</td><td>${escapeHtml(item.project_name)}</td><td style="color:${item.valid ? "#16a34a" : "#dc2626"}">${item.valid ? "有效" : "端点缺失"}</td></tr>`).join("")}</tbody></table></div>
       <div style="display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:12px;font-size:12px;color:var(--ink-500)">
@@ -244,7 +251,7 @@ async function loadExplorer(root, state) {
   }
 }
 
-async function loadQuality(root) {
+async function loadQuality(root, state, content) {
   const area = root.querySelector("#quality-result");
   const button = root.querySelector("#run-quality-check");
   const projectId = root.querySelector("#quality-project")?.value || "";
@@ -254,13 +261,44 @@ async function loadQuality(root) {
     const { quality } = await api.adminGraphQuality(projectId);
     const summary = quality.summary;
     area.innerHTML = `
-      <div class="grid grid-4" style="margin-bottom:12px">
-        ${metricCard("孤立节点", number(summary.orphan_nodes), summary.orphan_nodes ? "#d97706" : "#16a34a", "无有效关系连接")}
-        ${metricCard("无效关系", number(summary.invalid_edges), summary.invalid_edges ? "#dc2626" : "#16a34a", "起点或终点缺失")}
-        ${metricCard("重复关系组", number(summary.duplicate_edge_groups), summary.duplicate_edge_groups ? "#d97706" : "#16a34a", "起点、终点和类型相同")}
-        ${metricCard("未归属节点", number(summary.unscoped_nodes), summary.unscoped_nodes ? "#d97706" : "#16a34a", "缺少项目命名空间")}
+      <div class="quality-summary" style="margin-bottom:12px">
+        ${qualityMetric("孤立节点", number(summary.orphan_nodes), summary.orphan_nodes, "无有效关系连接")}
+        ${qualityMetric("无效关系", number(summary.invalid_edges), summary.invalid_edges, "起点或终点缺失")}
+        ${qualityMetric("重复关系", number(summary.duplicate_edge_groups), summary.duplicate_edge_groups, "完全相同的关系")}
+        ${qualityMetric("未归属节点", number(summary.unscoped_nodes), summary.unscoped_nodes, "缺少项目命名空间")}
+        ${qualityMetric("跨项目关系", number(summary.cross_project_edges), summary.cross_project_edges, "关系跨越项目")}
+        ${qualityMetric("失效项目归属", number(summary.unknown_project_nodes), summary.unknown_project_nodes, "项目已不存在")}
       </div>
-      ${qualityDetails(quality)}`;
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:4px 0 10px;flex-wrap:wrap">
+        <span style="font-size:11px;color:var(--ink-400)">检查时间：${formatDate(quality.checked_at)} · 问题样本最多展示 ${number(quality.sample_limit)} 条</span>
+        ${projectId ? `<button class="button button-ghost button-small" id="delete-selected-orphans" disabled style="color:#dc2626;border:1px solid rgba(220,38,38,.25)">删除选中孤立节点</button>` : `<span style="font-size:11px;color:#b45309">如需删除孤立节点，请先选择具体项目后重新检查</span>`}
+      </div>
+      ${qualityDetails(quality, Boolean(projectId))}`;
+
+    if (projectId) {
+      const orphanCheckboxes = [...area.querySelectorAll(".orphan-checkbox")];
+      const deleteButton = area.querySelector("#delete-selected-orphans");
+      const syncDeleteButton = () => {
+        const count = orphanCheckboxes.filter((item) => item.checked).length;
+        deleteButton.disabled = count === 0;
+        deleteButton.textContent = count ? `删除选中孤立节点（${count}）` : "删除选中孤立节点";
+      };
+      orphanCheckboxes.forEach((checkbox) => checkbox.addEventListener("change", syncDeleteButton));
+      area.querySelector("#select-all-orphans")?.addEventListener("change", (event) => {
+        orphanCheckboxes.forEach((checkbox) => { checkbox.checked = event.target.checked; });
+        syncDeleteButton();
+      });
+      deleteButton?.addEventListener("click", () => {
+        const selectedNames = orphanCheckboxes
+          .filter((item) => item.checked)
+          .map((item) => quality.orphan_nodes[Number(item.dataset.orphanIndex)]?.name)
+          .filter(Boolean);
+        const project = (state.overview?.projects || []).find((item) => String(item.id) === projectId);
+        if (project && selectedNames.length) {
+          openOperationModal(content, "delete_orphan_nodes", project, selectedNames);
+        }
+      });
+    }
   } catch (error) {
     area.innerHTML = `<span style="color:#dc2626">${escapeHtml(error.message)}</span>`;
   } finally {
@@ -268,14 +306,25 @@ async function loadQuality(root) {
   }
 }
 
-function qualityDetails(quality) {
+function qualityDetails(quality, allowOrphanSelection) {
   const rows = [
-    ...(quality.orphan_nodes || []).map((item) => ["孤立节点", item.name, item.kind]),
-    ...(quality.invalid_edges || []).map((item) => ["无效关系", `${item.source} → ${item.target}`, item.relation]),
-    ...(quality.duplicate_edges || []).map((item) => ["重复关系", `${item.source} → ${item.target}`, `${item.relation} × ${item.count}`]),
+    ...(quality.orphan_nodes || []).map((item, index) => ({
+      issue: "孤立节点",
+      target: item.name,
+      type: item.kind,
+      reason: item.likely_reason,
+      suggestion: item.suggestion,
+      risk: item.deletion_risk,
+      orphanIndex: index,
+    })),
+    ...(quality.invalid_edges || []).map((item) => ({ issue: "无效关系", target: `${item.source} → ${item.target}`, type: item.relation, reason: "关系起点或终点在当前图谱中不存在", suggestion: "核对关系写入和节点清理记录" })),
+    ...(quality.duplicate_edges || []).map((item) => ({ issue: "重复关系", target: `${item.source} → ${item.target}`, type: `${item.relation} × ${item.count}`, reason: "存在相同起点、终点和类型的多条关系", suggestion: "保留一条有效关系并检查重复导入来源" })),
+    ...(quality.cross_project_edges || []).map((item) => ({ issue: "跨项目关系", target: `${item.source} → ${item.target}`, type: item.relation, reason: `起点属于 ${item.source_project_id}，终点属于 ${item.target_project_id}`, suggestion: "检查项目命名空间和导入数据是否串用" })),
+    ...(quality.unknown_project_nodes || []).map((item) => ({ issue: "失效项目归属", target: item.name, type: item.kind, reason: `引用不存在的项目 ${item.project_id}`, suggestion: "核对项目是否已删除，再决定迁移或清理节点" })),
+    ...(quality.unscoped_nodes || []).filter((item) => !(quality.orphan_nodes || []).some((orphan) => orphan.id === item.id)).map((item) => ({ issue: "未归属节点", target: item.name, type: item.kind, reason: item.likely_reason, suggestion: item.suggestion, risk: item.deletion_risk })),
   ].slice(0, 200);
-  if (!rows.length) return `<div style="padding:14px;border:1px solid #bbf7d0;background:#f0fdf4;color:#166534;border-radius:8px">未发现孤立节点、无效关系或重复关系。</div>`;
-  return `<details><summary style="cursor:pointer;font-weight:600">查看问题样本（最多 200 条）</summary><div class="table-wrap" style="margin-top:10px"><table class="table"><thead><tr><th>问题</th><th>对象</th><th>类型</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(row[0])}</td><td>${escapeHtml(row[1])}</td><td>${escapeHtml(row[2])}</td></tr>`).join("")}</tbody></table></div></details>`;
+  if (!rows.length) return `<div style="padding:14px;border:1px solid #bbf7d0;background:#f0fdf4;color:#166534;border-radius:8px">当前范围未发现图谱质量问题。</div>`;
+  return `<div class="table-wrap graph-admin-scroll graph-quality-scroll"><table class="table"><thead><tr><th style="width:42px">${allowOrphanSelection && quality.orphan_nodes?.length ? '<input type="checkbox" id="select-all-orphans" title="全选当前孤立节点" />' : ""}</th><th>问题 / 对象</th><th>可能原因</th><th>处理建议</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${row.orphanIndex !== undefined && allowOrphanSelection ? `<input type="checkbox" class="orphan-checkbox" data-orphan-index="${row.orphanIndex}" />` : ""}</td><td><strong>${escapeHtml(row.issue)}</strong><span style="display:block;font-size:12px;margin-top:3px;word-break:break-all">${escapeHtml(row.target)}</span><small style="color:var(--ink-400)">${escapeHtml(row.type || "-")}${row.risk ? ` · 删除风险 ${escapeHtml(riskLabel(row.risk))}` : ""}</small></td><td style="min-width:260px;font-size:12px;line-height:1.5">${escapeHtml(row.reason || "-")}</td><td style="min-width:240px;font-size:12px;line-height:1.5">${escapeHtml(row.suggestion || "-")}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function operationTable(items = []) {
@@ -301,7 +350,7 @@ async function loadOperations(root) {
   }
 }
 
-async function openOperationModal(content, action, project) {
+async function openOperationModal(content, action, project, selectedNames = []) {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   backdrop.innerHTML = `<section class="modal" role="dialog" aria-modal="true" style="max-width:560px"><header class="modal-header"><h2>${escapeHtml(actionLabel(action))}</h2><button class="button button-ghost" data-close>✕</button></header><div class="modal-body" id="graph-operation-body">${loading("正在准备操作范围…")}</div></section>`;
@@ -321,6 +370,7 @@ async function openOperationModal(content, action, project) {
       <div style="padding:11px 13px;border-radius:7px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;font-size:12px;margin-bottom:14px">该操作会删除 HugeGraph 数据且无法撤销。第一步只生成影响预览，不会修改数据。</div>
       <div class="field"><label>目标项目</label><input class="input" value="${escapeHtml(project.name)}" disabled /></div>
       ${action === "cleanup_batch" ? `<div class="field" style="margin-top:12px"><label>目标日志批次</label><select class="select" id="operation-target">${batches.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.filename)} · ${formatDate(item.created_at)}</option>`).join("")}</select></div>` : ""}
+      ${action === "delete_orphan_nodes" ? `<div style="margin-top:12px"><strong style="font-size:12px">已选择 ${number(selectedNames.length)} 个孤立节点</strong><div style="max-height:130px;overflow:auto;margin-top:7px;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--surface-soft);font-size:11px;word-break:break-all">${selectedNames.map(escapeHtml).join("、")}</div></div>` : ""}
       <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:18px"><button class="button button-secondary" data-cancel>取消</button><button class="button button-primary" id="create-operation-preview">生成影响预览</button></div>`;
     body.querySelector("[data-cancel]")?.addEventListener("click", close);
     body.querySelector("#create-operation-preview")?.addEventListener("click", async () => {
@@ -328,7 +378,7 @@ async function openOperationModal(content, action, project) {
       setBusy(button, true, "扫描中…");
       try {
         const targetId = body.querySelector("#operation-target")?.value || "";
-        const { operation } = await api.previewAdminGraphOperation({ action, project_id: project.id, target_id: targetId });
+        const { operation } = await api.previewAdminGraphOperation({ action, project_id: project.id, target_id: targetId, target_names: selectedNames });
         renderConfirmation(body, operation, close, content);
       } catch (error) {
         toast(error.message, "error");

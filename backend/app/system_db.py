@@ -604,12 +604,6 @@ class SystemDatabase:
                 row["resolved_count"] = int(agg.get("cnt_resolved") or 0)
         return rows
 
-    def update_log_batch_progress(self, batch_id: str, progress: int, message: str) -> None:
-        self.execute(
-            "UPDATE log_batches SET progress = ?, progress_message = ? WHERE id = ?",
-            (max(0, min(100, progress)), message[:255], batch_id),
-        )
-
     def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str) -> None:
         self.execute(
             "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, completed_at = ? WHERE id = ?",
@@ -619,12 +613,25 @@ class SystemDatabase:
     def update_log_batch_progress(
         self,
         batch_id: str,
+        progress: int | None = None,
+        progress_message: str | None = None,
         *,
         status: str = "processing",
-        percent: int = 0,
+        percent: int | None = None,
         stage: str = "",
-        message: str = "",
+        message: str | None = None,
     ) -> None:
+        """Persist task progress while accepting both legacy and structured calls.
+
+        Background analysis historically called this method as
+        ``(batch_id, progress, message)``. Newer callers use keyword-only
+        ``percent/stage/message`` values. Keeping one implementation prevents a
+        later duplicate definition from silently breaking either call style.
+        """
+        progress_value = percent if percent is not None else progress
+        progress_value = max(0, min(100, int(progress_value or 0)))
+        message_value = message if message is not None else progress_message
+        message_value = str(message_value or "")
         item = self.get_log_batch(batch_id)
         summary: dict[str, Any] = {}
         if item:
@@ -635,14 +642,24 @@ class SystemDatabase:
                 summary = {}
         summary.update(
             {
-                "progress_percent": max(0, min(100, int(percent))),
+                "progress_percent": progress_value,
                 "progress_stage": stage,
-                "progress_message": message,
+                "progress_message": message_value,
             }
         )
         self.execute(
-            "UPDATE log_batches SET status = ?, summary_json = ? WHERE id = ?",
-            (status, json.dumps(summary, ensure_ascii=False), batch_id),
+            """
+            UPDATE log_batches
+            SET status = ?, progress = ?, progress_message = ?, summary_json = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                progress_value,
+                message_value[:255],
+                json.dumps(summary, ensure_ascii=False),
+                batch_id,
+            ),
         )
 
     def fail_log_batch(self, batch_id: str, error_message: str) -> None:

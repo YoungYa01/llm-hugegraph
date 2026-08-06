@@ -97,7 +97,7 @@ def test_delete_log_batch_cascades_incidents_and_actions(tmp_path) -> None:
 
 def test_log_batch_progress_is_stored_in_summary_json(tmp_path) -> None:
     database = SystemDatabase(tmp_path / "progress.db")
-    user = database.create_user("operator", "hash", "Operator")
+    user = database.create_user("operator", "hash", "Operator", "EMP-001")
     project = database.create_project(user["id"], "Order", "")
     batch = database.create_log_batch(project["id"], "logs.zip", "/tmp/logs.zip", "", "", "/tmp/out", user["id"])
 
@@ -115,7 +115,17 @@ def test_log_batch_progress_is_stored_in_summary_json(tmp_path) -> None:
     assert summary["progress_percent"] == 42
     assert summary["progress_stage"] == "graph_cleanup"
     assert summary["progress_message"] == "正在清理动态图谱节点和关系"
-    assert database.list_incident_actions(incident["id"]) == []
+    assert item["progress"] == 42
+    assert item["progress_message"] == "正在清理动态图谱节点和关系"
+
+    database.update_log_batch_progress(batch["id"], 65, "正在执行图谱 RCA 根因推理")
+    legacy_item = database.get_log_batch(batch["id"])
+    legacy_summary = __import__("json").loads(legacy_item["summary_json"])
+    assert legacy_item["status"] == "processing"
+    assert legacy_item["progress"] == 65
+    assert legacy_item["progress_message"] == "正在执行图谱 RCA 根因推理"
+    assert legacy_summary["progress_percent"] == 65
+    assert legacy_summary["progress_message"] == "正在执行图谱 RCA 根因推理"
 
 
 def test_existing_database_adds_employee_id_column(tmp_path) -> None:

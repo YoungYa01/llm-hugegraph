@@ -328,6 +328,7 @@ class GraphOperationPreviewRequest(BaseModel):
     action: str = Field(..., max_length=40)
     project_id: str = Field(..., min_length=1, max_length=80)
     target_id: str = Field("", max_length=160)
+    target_names: list[str] = Field(default_factory=list, max_length=200)
 
 
 class GraphOperationExecuteRequest(BaseModel):
@@ -454,7 +455,7 @@ def preview_admin_graph_operation(
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     _require_admin(user)
-    if payload.action not in {"cleanup_batch", "clear_project"}:
+    if payload.action not in {"cleanup_batch", "clear_project", "delete_orphan_nodes"}:
         raise HTTPException(status_code=422, detail="不支持的图谱操作")
     try:
         operation = _graph_admin_service().preview_operation(
@@ -462,6 +463,7 @@ def preview_admin_graph_operation(
             action=payload.action,
             project_id=payload.project_id,
             target_id=payload.target_id,
+            target_names=payload.target_names,
         )
         return {"operation": operation}
     except Exception as exc:
@@ -1015,11 +1017,21 @@ async def _run_log_analysis_task(
 ) -> None:
     database = get_system_db()
     try:
-        database.update_log_batch_progress(batch_id, 20, "正在进行日志结构化解析与滑动窗口异常挖掘...")
+        database.update_log_batch_progress(
+            batch_id,
+            percent=20,
+            stage="log_parsing",
+            message="正在进行日志结构化解析与滑动窗口异常挖掘...",
+        )
         runner = LogFaultRunner()
         summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
 
-        database.update_log_batch_progress(batch_id, 65, "正在结合 HugeGraph 拓扑做图谱 RCA 根因推理...")
+        database.update_log_batch_progress(
+            batch_id,
+            percent=65,
+            stage="graph_rca",
+            message="正在结合 HugeGraph 拓扑做图谱 RCA 根因推理...",
+        )
         scoped = ProjectScopedGraphClient(project_id)
         imported = await run_in_threadpool(
             IncidentGraphIntegrator(scoped, employee_id=employee_id).import_path,
@@ -1029,7 +1041,12 @@ async def _run_log_analysis_task(
         )
         import_data = imported.model_dump()
 
-        database.update_log_batch_progress(batch_id, 88, "持久化故障事件与 RCA 诊断结论...")
+        database.update_log_batch_progress(
+            batch_id,
+            percent=88,
+            stage="persisting_results",
+            message="持久化故障事件与 RCA 诊断结论...",
+        )
         await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
         details = _load_details(output_dir)
         _persist_incidents(

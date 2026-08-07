@@ -129,11 +129,30 @@ class SystemDatabase:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS graph_admin_operations (
+                    id TEXT PRIMARY KEY,
+                    actor_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    project_id TEXT,
+                    target_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'previewed',
+                    confirmation_text TEXT NOT NULL,
+                    preview_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id, status);
                 CREATE INDEX IF NOT EXISTS idx_architectures_project ON architecture_imports(project_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_log_batches_project ON log_batches(project_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_incidents_project ON incidents(project_id, status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_actions_incident ON incident_actions(incident_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_graph_admin_operations_created ON graph_admin_operations(created_at);
+                CREATE INDEX IF NOT EXISTS idx_graph_admin_operations_project ON graph_admin_operations(project_id, created_at);
                 """
             )
             user_cols = [row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()]
@@ -146,6 +165,94 @@ class SystemDatabase:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
                 if "progress_message" not in cols:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
+
+    # Graph administration and audit
+    def create_graph_admin_operation(
+        self,
+        *,
+        actor_id: str,
+        action: str,
+        project_id: str | None,
+        target_id: str,
+        confirmation_text: str,
+        preview: dict[str, Any],
+    ) -> dict[str, Any]:
+        operation_id = str(uuid.uuid4())
+        self.execute(
+            """
+            INSERT INTO graph_admin_operations(
+                id, actor_id, action, project_id, target_id, status,
+                confirmation_text, preview_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'previewed', ?, ?, ?)
+            """,
+            (
+                operation_id,
+                actor_id,
+                action,
+                project_id,
+                target_id,
+                confirmation_text,
+                json.dumps(preview, ensure_ascii=False),
+                utc_now(),
+            ),
+        )
+        return self.get_graph_admin_operation(operation_id) or {}
+
+    def get_graph_admin_operation(self, operation_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM graph_admin_operations WHERE id = ?",
+            (operation_id,),
+        )
+
+    def start_graph_admin_operation(self, operation_id: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE graph_admin_operations
+                SET status = 'running', started_at = ?
+                WHERE id = ? AND status = 'previewed'
+                """,
+                (utc_now(), operation_id),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
+    def finish_graph_admin_operation(
+        self,
+        operation_id: str,
+        *,
+        result: dict[str, Any] | None = None,
+        error_message: str = "",
+    ) -> None:
+        status = "failed" if error_message else "completed"
+        self.execute(
+            """
+            UPDATE graph_admin_operations
+            SET status = ?, result_json = ?, error_message = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                json.dumps(result or {}, ensure_ascii=False),
+                error_message[:4000],
+                utc_now(),
+                operation_id,
+            ),
+        )
+
+    def list_graph_admin_operations(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.query_all(
+            """
+            SELECT o.*, u.username AS actor_username, u.display_name AS actor_display_name,
+                   u.employee_id AS actor_employee_id, p.name AS project_name
+            FROM graph_admin_operations o
+            LEFT JOIN users u ON u.id = o.actor_id
+            LEFT JOIN projects p ON p.id = o.project_id
+            ORDER BY o.created_at DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 500)),),
+        )
 
     def query_one(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -497,12 +604,6 @@ class SystemDatabase:
                 row["resolved_count"] = int(agg.get("cnt_resolved") or 0)
         return rows
 
-    def update_log_batch_progress(self, batch_id: str, progress: int, message: str) -> None:
-        self.execute(
-            "UPDATE log_batches SET progress = ?, progress_message = ? WHERE id = ?",
-            (max(0, min(100, progress)), message[:255], batch_id),
-        )
-
     def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str) -> None:
         self.execute(
             "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, completed_at = ? WHERE id = ?",
@@ -512,12 +613,25 @@ class SystemDatabase:
     def update_log_batch_progress(
         self,
         batch_id: str,
+        progress: int | None = None,
+        progress_message: str | None = None,
         *,
         status: str = "processing",
-        percent: int = 0,
+        percent: int | None = None,
         stage: str = "",
-        message: str = "",
+        message: str | None = None,
     ) -> None:
+        """Persist task progress while accepting both legacy and structured calls.
+
+        Background analysis historically called this method as
+        ``(batch_id, progress, message)``. Newer callers use keyword-only
+        ``percent/stage/message`` values. Keeping one implementation prevents a
+        later duplicate definition from silently breaking either call style.
+        """
+        progress_value = percent if percent is not None else progress
+        progress_value = max(0, min(100, int(progress_value or 0)))
+        message_value = message if message is not None else progress_message
+        message_value = str(message_value or "")
         item = self.get_log_batch(batch_id)
         summary: dict[str, Any] = {}
         if item:
@@ -528,14 +642,24 @@ class SystemDatabase:
                 summary = {}
         summary.update(
             {
-                "progress_percent": max(0, min(100, int(percent))),
+                "progress_percent": progress_value,
                 "progress_stage": stage,
-                "progress_message": message,
+                "progress_message": message_value,
             }
         )
         self.execute(
-            "UPDATE log_batches SET status = ?, summary_json = ? WHERE id = ?",
-            (status, json.dumps(summary, ensure_ascii=False), batch_id),
+            """
+            UPDATE log_batches
+            SET status = ?, progress = ?, progress_message = ?, summary_json = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                progress_value,
+                message_value[:255],
+                json.dumps(summary, ensure_ascii=False),
+                batch_id,
+            ),
         )
 
     def fail_log_batch(self, batch_id: str, error_message: str) -> None:

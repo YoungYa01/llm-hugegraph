@@ -2,11 +2,13 @@ import { api } from "../api.js";
 import { setUser, user } from "../auth.js";
 import { cacheProject } from "../state.js";
 import { badge, emptyState, errorState, escapeHtml, formatDate, loading, setBusy, toast } from "../ui.js";
+import { renderGraphAdminContent } from "./graph-admin-page.js";
 
 const SVG = {
   projects: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>`,
   database: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>`,
   users: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 1 0 7.75"></path></svg>`,
+  graph: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"></circle><circle cx="19" cy="6" r="2"></circle><circle cx="12" cy="18" r="2"></circle><path d="M7 7l4 9M17 7l-4 9M7 6h10"></path></svg>`,
   gear: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`,
   pencil: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`,
   plus: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`,
@@ -24,7 +26,7 @@ export async function renderProjectsPage(root, { onLogout }) {
   const account = user() || {};
   const isAdmin = account.role === "admin";
   const initial = (account.display_name || account.username || "U").slice(0, 1).toUpperCase();
-  let currentTab = "projects"; // "projects" | "log_db" | "users"
+  let currentTab = "projects"; // "projects" | "log_db" | "users" | "graph"
   let logDbState = { page: 1, limit: 15, project_id: "", status: "", has_fault: "", search: "" };
 
   function renderShell() {
@@ -57,6 +59,9 @@ export async function renderProjectsPage(root, { onLogout }) {
               <a class="nav-link ${currentTab === "users" ? "active" : ""}" id="tab-users-btn" href="javascript:void(0)">
                 <span class="nav-icon">${SVG.users}</span><span>用户与权限管理</span>
               </a>
+              <a class="nav-link ${currentTab === "graph" ? "active" : ""}" id="tab-graph-btn" href="javascript:void(0)">
+                <span class="nav-icon">${SVG.graph}</span><span>图谱管理</span>
+              </a>
             ` : ""}
           </nav>
 
@@ -79,7 +84,7 @@ export async function renderProjectsPage(root, { onLogout }) {
           <header class="topbar">
             <div style="display:flex;align-items:center;gap:10px">
               <span style="font-size:14px;font-weight:700;color:var(--ink-900)">
-                ${currentTab === "projects" ? "项目空间" : currentTab === "log_db" ? "全站日志数据库管理" : "全站用户与权限管理"}
+                ${{ projects: "项目空间", log_db: "全站日志数据库管理", users: "全站用户与权限管理", graph: "HugeGraph 图谱管理" }[currentTab] || "控制台"}
               </span>
             </div>
             <div style="display:flex;align-items:center;gap:12px">
@@ -121,6 +126,15 @@ export async function renderProjectsPage(root, { onLogout }) {
         currentTab = "users";
         renderShell();
         await loadUsersTab();
+      }
+    });
+
+    root.querySelector("#tab-graph-btn")?.addEventListener("click", async () => {
+      if (currentTab !== "graph") {
+        currentTab = "graph";
+        renderShell();
+        const content = root.querySelector("#main-workspace-content");
+        if (content) await renderGraphAdminContent(content);
       }
     });
   }

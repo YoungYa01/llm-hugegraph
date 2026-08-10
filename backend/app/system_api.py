@@ -331,6 +331,11 @@ class GraphOperationPreviewRequest(BaseModel):
     target_names: list[str] = Field(default_factory=list, max_length=200)
 
 
+class DeleteOrphanNodesPreviewRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=80)
+    target_names: list[str] = Field(..., max_length=200)
+
+
 class GraphOperationExecuteRequest(BaseModel):
     confirmation_text: str = Field(..., min_length=1, max_length=200)
 
@@ -463,6 +468,25 @@ def preview_admin_graph_operation(
             action=payload.action,
             project_id=payload.project_id,
             target_id=payload.target_id,
+            target_names=payload.target_names,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.post("/admin/graph/orphan-nodes/operations/preview", status_code=201)
+def preview_delete_orphan_nodes_operation(
+    payload: DeleteOrphanNodesPreviewRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    """Preview orphan deletion without trusting a client-provided action name."""
+    _require_admin(user)
+    try:
+        operation = _graph_admin_service().preview_operation(
+            actor_id=str(user["id"]),
+            action="delete_orphan_nodes",
+            project_id=payload.project_id,
             target_names=payload.target_names,
         )
         return {"operation": operation}

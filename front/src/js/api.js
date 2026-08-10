@@ -74,6 +74,10 @@ export const api = {
   adminGraphBatches: (projectId) => request(`/admin/graph/batches?project_id=${encodeURIComponent(projectId)}`),
   adminGraphExport: (projectId) => request(`/admin/graph/export?project_id=${encodeURIComponent(projectId)}`),
   previewAdminGraphOperation: (payload) => request("/admin/graph/operations/preview", { method: "POST", body: JSON.stringify(payload) }),
+  previewDeleteOrphanNodes: (projectId, targetNames) => request("/admin/graph/orphan-nodes/operations/preview", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId, target_names: targetNames }),
+  }),
   executeAdminGraphOperation: (operationId, confirmationText) => request(`/admin/graph/operations/${operationId}/execute`, { method: "POST", body: JSON.stringify({ confirmation_text: confirmationText }) }),
   adminGraphOperations: (limit = 100) => request(`/admin/graph/operations?limit=${limit}`),
 

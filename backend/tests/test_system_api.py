@@ -12,6 +12,40 @@ from app.rca_decision import RcaDecisionService
 from app.system_db import SystemDatabase
 
 
+def test_orphan_delete_preview_uses_server_side_operation_name(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeGraphAdminService:
+        def preview_operation(self, **kwargs) -> dict:
+            captured.update(kwargs)
+            return {"id": "preview-1", "action": kwargs["action"]}
+
+    monkeypatch.setattr(
+        system_api, "_graph_admin_service", lambda: FakeGraphAdminService()
+    )
+    app = FastAPI()
+    app.include_router(system_api.router)
+    app.dependency_overrides[auth.require_user] = lambda: {
+        "id": "admin-1",
+        "role": "admin",
+    }
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/admin/graph/orphan-nodes/operations/preview",
+        json={"project_id": "project-1", "target_names": ["isolated-service"]},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["operation"]["action"] == "delete_orphan_nodes"
+    assert captured == {
+        "actor_id": "admin-1",
+        "action": "delete_orphan_nodes",
+        "project_id": "project-1",
+        "target_names": ["isolated-service"],
+    }
+
+
 def test_auth_project_and_dashboard_api(tmp_path, monkeypatch) -> None:
     database = SystemDatabase(tmp_path / "api.db")
     monkeypatch.setattr(system_api, "get_system_db", lambda: database)

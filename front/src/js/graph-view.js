@@ -44,6 +44,37 @@ const palette = {
   Trace: "#765795",
 };
 
+const swimlanes = [
+  {
+    id: "ui",
+    label: "UI 交互与页面功能",
+    description: "页面、控件与用户入口",
+    color: "#c44578",
+    kinds: new Set(["UIControl", "UIFunction"]),
+  },
+  {
+    id: "service",
+    label: "接口网关与业务服务",
+    description: "API、网关和业务处理模块",
+    color: "#3f6fba",
+    kinds: new Set(["API", "Service", "System", "Component", "Function"]),
+  },
+  {
+    id: "data",
+    label: "数据存储与中间件",
+    description: "数据库、缓存、消息与逻辑集群",
+    color: "#178a80",
+    kinds: new Set(["Database", "Cache", "Queue", "Middleware", "Cluster"]),
+  },
+  {
+    id: "runtime",
+    label: "容器实例与宿主机",
+    description: "实例、容器、虚机、主机与网络",
+    color: "#c8722f",
+    kinds: new Set(["Instance", "Host", "Pod", "VM", "NetworkSwitch"]),
+  },
+];
+
 function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
 }
@@ -81,8 +112,7 @@ export function calculateFitTransform(bounds, viewportWidth, viewportHeight, opt
   };
 }
 
-// Kept as a public helper for callers and tests that use the old viewport API.
-// Graph rendering itself now delegates viewport behavior to d3.zoom.
+// Retained for compatibility with existing layout tests and callers.
 export function createViewportState(initial = {}) {
   let scale = clamp(Number(initial.scale) || 1, MIN_SCALE, MAX_SCALE);
   let panX = Number(initial.panX) || 0;
@@ -114,6 +144,19 @@ export function createViewportState(initial = {}) {
 
 export function shouldShowEdgeLabels(nodeCount, edgeCount) {
   return edgeCount <= 12 && edgeCount <= Math.max(6, nodeCount * 0.8);
+}
+
+export function calculateClientPoint(rect, width, height, clientX, clientY) {
+  const scale = Math.min(
+    Math.max(1, Number(rect.width)) / Math.max(1, width),
+    Math.max(1, Number(rect.height)) / Math.max(1, height),
+  );
+  const offsetX = (Number(rect.width) - width * scale) / 2;
+  const offsetY = (Number(rect.height) - height * scale) / 2;
+  return {
+    x: (clientX - Number(rect.left) - offsetX) / scale,
+    y: (clientY - Number(rect.top) - offsetY) / scale,
+  };
 }
 
 function appendMarker(defs, id, color) {
@@ -148,11 +191,11 @@ function routeMap(edges) {
   return routes;
 }
 
-function edgeGeometry(source, target, curvature = 0, radius = NODE_RADIUS) {
+function edgeGeometry(source, target, curvature = 0) {
   if (source.x === target.x && source.y === target.y) {
-    const loopRadius = radius + 22;
+    const loopRadius = NODE_RADIUS + 22;
     return {
-      d: `M ${source.x} ${source.y - radius} C ${source.x + loopRadius} ${source.y - loopRadius * 2}, ${source.x - loopRadius} ${source.y - loopRadius * 2}, ${source.x} ${source.y - radius}`,
+      d: `M ${source.x} ${source.y - NODE_RADIUS} C ${source.x + loopRadius} ${source.y - loopRadius * 2}, ${source.x - loopRadius} ${source.y - loopRadius * 2}, ${source.x} ${source.y - NODE_RADIUS}`,
       labelX: source.x,
       labelY: source.y - loopRadius * 1.7,
     };
@@ -164,29 +207,18 @@ function edgeGeometry(source, target, curvature = 0, radius = NODE_RADIUS) {
   const unitY = deltaY / distance;
   const perpendicularX = -unitY;
   const perpendicularY = unitX;
-  const startX = source.x + unitX * radius;
-  const startY = source.y + unitY * radius;
-  const endX = target.x - unitX * (radius + 4);
-  const endY = target.y - unitY * (radius + 4);
+  const sourceOffset = NODE_RADIUS;
+  const targetOffset = NODE_RADIUS + 4;
+  const startX = source.x + unitX * sourceOffset;
+  const startY = source.y + unitY * sourceOffset;
+  const endX = target.x - unitX * targetOffset;
+  const endY = target.y - unitY * targetOffset;
   const controlX = (startX + endX) / 2 + perpendicularX * curvature;
   const controlY = (startY + endY) / 2 + perpendicularY * curvature;
   return {
     d: `M ${startX} ${startY} Q ${controlX} ${controlY} ${endX} ${endY}`,
     labelX: (startX + 2 * controlX + endX) / 4,
     labelY: (startY + 2 * controlY + endY) / 4 - 7,
-  };
-}
-
-export function calculateClientPoint(rect, width, height, clientX, clientY) {
-  const scale = Math.min(
-    Math.max(1, Number(rect.width)) / Math.max(1, width),
-    Math.max(1, Number(rect.height)) / Math.max(1, height),
-  );
-  const offsetX = (Number(rect.width) - width * scale) / 2;
-  const offsetY = (Number(rect.height) - height * scale) / 2;
-  return {
-    x: (clientX - Number(rect.left) - offsetX) / scale,
-    y: (clientY - Number(rect.top) - offsetY) / scale,
   };
 }
 
@@ -219,6 +251,56 @@ function initialPosition(node, index, count, width, height, primaryIndexes) {
   };
 }
 
+function laneForNode(node) {
+  const direct = swimlanes.find((lane) => lane.kinds.has(String(node.kind || "")));
+  if (direct) return direct;
+  const text = `${node.kind || ""} ${node.layer || ""} ${node.name || ""}`.toLocaleLowerCase();
+  if (/ui|页面|界面|前端|交互|控件/.test(text)) return swimlanes[0];
+  if (/数据库|数据|存储|缓存|消息|队列|中间件|database|cache|queue|cluster/.test(text)) return swimlanes[2];
+  if (/实例|容器|宿主|主机|虚机|网络|instance|pod|host|vm/.test(text)) return swimlanes[3];
+  return swimlanes[1];
+}
+
+export function createSwimlanePlan(nodes, minimumWidth = 960) {
+  const groups = new Map(swimlanes.map((lane) => [lane.id, []]));
+  nodes.forEach((node) => groups.get(laneForNode(node).id).push(node));
+  const outerPadding = 34;
+  const laneGap = 18;
+  const canvasWidth = Math.max(minimumWidth, outerPadding * 2 + laneGap * 3 + 220 * swimlanes.length);
+  const laneWidth = (canvasWidth - outerPadding * 2 - laneGap * 3) / swimlanes.length;
+  const laneSpecs = swimlanes.map((lane) => {
+    const laneNodes = groups.get(lane.id).sort((left, right) => (
+      String(left.kind || "").localeCompare(String(right.kind || ""), "zh-CN")
+      || String(left.name).localeCompare(String(right.name), "zh-CN")
+    ));
+    const columns = laneNodes.length > 5 && laneWidth >= 220 ? 2 : 1;
+    return { ...lane, nodes: laneNodes, columns, rows: Math.max(1, Math.ceil(laneNodes.length / columns)) };
+  });
+  const laneHeight = Math.max(520, 142 + Math.max(...laneSpecs.map((lane) => lane.rows)) * 112);
+  const guides = [];
+  const positions = new Map();
+  let cursorX = outerPadding;
+  laneSpecs.forEach((lane) => {
+    guides.push({ ...lane, x: cursorX, y: 32, width: laneWidth, height: laneHeight });
+    lane.nodes.forEach((node, index) => {
+      const column = index % lane.columns;
+      const row = Math.floor(index / lane.columns);
+      const targetX = cursorX + laneWidth * ((column + 0.5) / lane.columns);
+      const targetY = 148 + row * 112;
+      positions.set(node.name, {
+        x: targetX,
+        y: targetY,
+        laneTargetX: targetX,
+        laneTargetY: targetY,
+        laneId: lane.id,
+        laneColor: lane.color,
+      });
+    });
+    cursorX += laneWidth + laneGap;
+  });
+  return { positions, guides, width: canvasWidth, height: laneHeight + 64 };
+}
+
 function appendTextLines(group, lines) {
   const title = group.append("text").attr("class", "graph-node-title").attr("x", 0);
   const firstY = lines.length === 1 ? 4 : -2;
@@ -240,6 +322,7 @@ export function renderGraph(
   graph,
   {
     mode = "architecture",
+    layoutMode = "force",
     hypotheses = [],
     llmDecision = {},
     onSelect = () => {},
@@ -255,28 +338,43 @@ export function renderGraph(
   if (!nodes.length) return null;
 
   const sequence = ++graphSequence;
+  const activeLayout = mode === "architecture" && layoutMode === "swimlane" ? "swimlane" : "force";
+  const isSwimlane = activeLayout === "swimlane";
   const viewportWidth = Math.max(720, container.clientWidth || 960);
   const viewportHeight = mode === "incident" ? 640 : 720;
   const density = Math.max(1, Math.sqrt(nodes.length / (mode === "incident" ? 14 : 18)));
-  const width = Math.min(3200, Math.max(viewportWidth, viewportWidth * density));
-  const height = Math.min(2400, Math.max(viewportHeight, viewportHeight * density * 0.82));
+  const swimlanePlan = isSwimlane ? createSwimlanePlan(nodes, viewportWidth) : null;
+  const width = swimlanePlan?.width || Math.min(3200, Math.max(viewportWidth, viewportWidth * density));
+  const height = swimlanePlan?.height || Math.min(2400, Math.max(viewportHeight, viewportHeight * density * 0.82));
   const semantics = mode === "incident"
     ? buildIncidentSemantics(hypotheses, llmDecision, nodeNames)
     : { primary: null, alternatives: [], overlays: [], candidateRanks: {}, start: "", end: "", warnings: [] };
   const routes = routeMap(edges);
-  const showEdgeLabels = shouldShowEdgeLabels(nodes.length, edges.length);
+  const showEdgeLabels = isSwimlane ? edges.length <= 18 : shouldShowEdgeLabels(nodes.length, edges.length);
   const visiblePrimaryChain = (semantics.primary?.chain || []).filter((name) => nodeNames.has(name));
   const primaryIndexes = new Map(visiblePrimaryChain.map((name, index) => [name, index]));
 
-  const simulationNodes = nodes.map((node, index) => ({
-    ...node,
-    __data: node,
-    ...initialPosition(node, index, nodes.length, width, height, primaryIndexes),
-  }));
+  const simulationNodes = nodes.map((node, index) => {
+    const position = swimlanePlan?.positions.get(node.name)
+      || initialPosition(node, index, nodes.length, width, height, primaryIndexes);
+    return { ...node, __data: node, ...position, initialX: position.x, initialY: position.y };
+  });
   const nodeByName = new Map(simulationNodes.map((node) => [node.name, node]));
+  const laneById = new Map((swimlanePlan?.guides || []).map((lane) => [lane.id, lane]));
+  const constrainToLane = (node, nextX, nextY) => {
+    const lane = laneById.get(node.laneId);
+    if (!lane) return { x: nextX, y: nextY };
+    const horizontalPadding = NODE_RADIUS + 14;
+    const topPadding = 66 + NODE_RADIUS + 18;
+    const bottomPadding = NODE_RADIUS + 28;
+    return {
+      x: clamp(nextX, lane.x + horizontalPadding, lane.x + lane.width - horizontalPadding),
+      y: clamp(nextY, lane.y + topPadding, lane.y + lane.height - bottomPadding),
+    };
+  };
   const simulationLinks = edges.map((edge, index) => ({
-    source: edge.source,
-    target: edge.target,
+    source: nodeByName.get(edge.source),
+    target: nodeByName.get(edge.target),
     data: edge,
     curvature: routes.get(edge) || 0,
     index,
@@ -284,7 +382,7 @@ export function renderGraph(
 
   const svg = select(container)
     .append("svg")
-    .attr("class", "graph-svg")
+    .attr("class", `graph-svg graph-layout-${activeLayout}`)
     .attr("role", "img")
     .attr("aria-label", mode === "incident" ? "故障传播知识图谱" : "系统架构知识图谱")
     .attr("viewBox", `0 0 ${viewportWidth} ${viewportHeight}`)
@@ -296,17 +394,57 @@ export function renderGraph(
     model: `graph-arrow-model-${sequence}`,
     algorithm: `graph-arrow-algorithm-${sequence}`,
   };
-  appendMarker(defs, markerIds.base, "#9aa6b8");
+  appendMarker(defs, markerIds.base, "#8795aa");
   appendMarker(defs, markerIds.alternative, "#98a4b5");
   appendMarker(defs, markerIds.model, "#cf3545");
   appendMarker(defs, markerIds.algorithm, "#c47a20");
 
   const viewport = svg.append("g").attr("class", "graph-viewport");
+  const guideLayer = viewport.append("g").attr("class", "graph-layer graph-layout-guides");
   const baseEdgeLayer = viewport.append("g").attr("class", "graph-layer graph-layer-edges");
   const alternativeLayer = viewport.append("g").attr("class", "graph-layer graph-layer-alternatives");
   const primaryUnderlayLayer = viewport.append("g").attr("class", "graph-layer graph-layer-primary-underlay");
   const primaryLayer = viewport.append("g").attr("class", "graph-layer graph-layer-primary");
   const nodeLayer = viewport.append("g").attr("class", "graph-layer graph-layer-nodes");
+
+  if (isSwimlane) {
+    const guides = guideLayer.selectAll("g.graph-swimlane")
+      .data(swimlanePlan.guides)
+      .join("g")
+      .attr("class", (lane) => `graph-swimlane graph-swimlane-${lane.id}`)
+      .style("--lane-color", (lane) => lane.color);
+    guides.append("rect")
+      .attr("class", "graph-swimlane-panel")
+      .attr("x", (lane) => lane.x)
+      .attr("y", (lane) => lane.y)
+      .attr("width", (lane) => lane.width)
+      .attr("height", (lane) => lane.height)
+      .attr("rx", 12);
+    guides.append("rect")
+      .attr("class", "graph-swimlane-header")
+      .attr("x", (lane) => lane.x)
+      .attr("y", (lane) => lane.y)
+      .attr("width", (lane) => lane.width)
+      .attr("height", 66)
+      .attr("rx", 12);
+    guides.append("rect")
+      .attr("class", "graph-swimlane-accent")
+      .attr("x", (lane) => lane.x)
+      .attr("y", (lane) => lane.y)
+      .attr("width", 5)
+      .attr("height", 66)
+      .attr("rx", 3);
+    guides.append("text")
+      .attr("class", "graph-swimlane-title")
+      .attr("x", (lane) => lane.x + 17)
+      .attr("y", (lane) => lane.y + 27)
+      .text((lane) => lane.label);
+    guides.append("text")
+      .attr("class", "graph-swimlane-description")
+      .attr("x", (lane) => lane.x + 17)
+      .attr("y", (lane) => lane.y + 47)
+      .text((lane) => `${lane.description} · ${lane.nodes.length} 个节点`);
+  }
 
   const edgeGroups = baseEdgeLayer.selectAll("g.graph-edge-record")
     .data(simulationLinks)
@@ -328,9 +466,8 @@ export function renderGraph(
     .attr("text-anchor", "middle")
     .text((edge) => short(edge.data.type, 18));
 
-  const overlayData = semantics.overlays.map((overlay) => ({ ...overlay }));
-  const primaryOverlayData = overlayData.filter((overlay) => overlay.variant !== "alternative");
-  const alternativeOverlayData = overlayData.filter((overlay) => overlay.variant === "alternative");
+  const primaryOverlayData = semantics.overlays.filter((overlay) => overlay.variant !== "alternative");
+  const alternativeOverlayData = semantics.overlays.filter((overlay) => overlay.variant === "alternative");
   const overlayUnderlays = primaryUnderlayLayer.selectAll("path")
     .data(primaryOverlayData)
     .join("path")
@@ -353,22 +490,19 @@ export function renderGraph(
   const nodeSelection = nodeLayer.selectAll("g.graph-node")
     .data(simulationNodes, (node) => node.name)
     .join("g")
-    .attr("class", (node) => {
-      const isStart = node.name === semantics.start;
-      const isEnd = node.name === semantics.end;
-      return [
-        "graph-node",
-        isStart ? "graph-node-start" : "",
-        isEnd ? "graph-node-end" : "",
-        (isStart || isEnd) && semantics.primary?.source === "llm" ? "graph-node-primary-model" : "",
-        (isStart || isEnd) && semantics.primary?.source === "algorithm" ? "graph-node-primary-algorithm" : "",
-      ].filter(Boolean).join(" ");
-    })
+    .attr("class", (node) => [
+      "graph-node",
+      node.name === semantics.start ? "graph-node-start" : "",
+      node.name === semantics.end ? "graph-node-end" : "",
+      (node.name === semantics.start || node.name === semantics.end) && semantics.primary?.source === "llm" ? "graph-node-primary-model" : "",
+      (node.name === semantics.start || node.name === semantics.end) && semantics.primary?.source === "algorithm" ? "graph-node-primary-algorithm" : "",
+    ].filter(Boolean).join(" "))
     .attr("tabindex", 0)
     .attr("role", "button")
     .attr("aria-label", (node) => `节点：${node.name}，类型：${node.kind || "Component"}`)
     .attr("data-node-name", (node) => node.name)
-    .style("--node-color", (node) => palette[node.kind] || "#61738f");
+    .style("--node-color", (node) => palette[node.kind] || "#61738f")
+    .style("--lane-color", (node) => node.laneColor || palette[node.kind] || "#61738f");
 
   nodeSelection.append("circle").attr("class", "graph-node-halo").attr("r", NODE_RADIUS + 7);
   nodeSelection.append("circle").attr("class", "graph-node-circle").attr("r", NODE_RADIUS);
@@ -381,7 +515,6 @@ export function renderGraph(
       .attr("x", 0)
       .attr("y", NODE_RADIUS + 17)
       .text(display?.stage || node.kind || "Component");
-
     const rank = semantics.candidateRanks[node.name];
     if (rank) appendBadge(group, `Top-${rank}`, "graph-rank-badge", NODE_RADIUS + 22, 42);
     const isStart = node.name === semantics.start;
@@ -389,39 +522,50 @@ export function renderGraph(
     if (isStart && isEnd) appendBadge(group, "起点 / 终点", "graph-endpoint-badge", -NODE_RADIUS - 29, 72);
     else if (isStart) appendBadge(group, "起点", "graph-start-badge", -NODE_RADIUS - 29, 42);
     else if (isEnd) appendBadge(group, "终点", "graph-end-badge", -NODE_RADIUS - 29, 42);
-
-    group.append("title").text(
-      `${display?.label || node.name} · ${display?.stage || node.kind || "Component"}`
-      + `${display?.explanation ? `\n${display.explanation}` : ""}`
-      + `${display && display.label !== node.name ? `\n真实节点：${node.name}` : ""}`
-      + `${node.description ? `\n${node.description}` : ""}`,
-    );
   });
+  nodeSelection.append("title").text((node) => (
+    `${node.name} · ${node.kind || "Component"}${node.layer ? `\n架构层：${node.layer}` : ""}${node.description ? `\n${node.description}` : ""}`
+  ));
 
-  const simulation = forceSimulation(simulationNodes)
-    .force("link", forceLink(simulationLinks)
-      .id((node) => node.name)
-      .distance(mode === "incident" ? 182 : 172)
-      .strength(mode === "incident" ? 0.52 : 0.34))
-    .force("charge", forceManyBody().strength(Math.max(-720, -250 - nodes.length * 3.2)))
-    .force("collision", forceCollide(NODE_RADIUS + (mode === "incident" ? 34 : 30)).strength(0.95).iterations(2))
-    .force("center", forceCenter(width / 2, height / 2))
-    .force("x", forceX((node) => {
-      if (mode !== "incident" || !primaryIndexes.has(node.name)) return width / 2;
-      const index = primaryIndexes.get(node.name);
-      return primaryIndexes.size === 1 ? width / 2 : 110 + index * ((width - 220) / (primaryIndexes.size - 1));
-    }).strength((node) => (mode === "incident" && primaryIndexes.has(node.name) ? 0.32 : 0.018)))
-    .force("y", forceY(height / 2).strength((node) => (
-      mode === "incident" && primaryIndexes.has(node.name) ? 0.22 : 0.024
-    )))
-    .velocityDecay(0.34)
-    .alphaDecay(0.035);
+  let simulation = forceSimulation(simulationNodes);
+  if (isSwimlane) {
+    simulation
+      .force("link", forceLink(simulationLinks)
+        .id((node) => node.name)
+        .distance(138)
+        .strength(0.08))
+      .force("charge", forceManyBody().strength(Math.max(-210, -72 - nodes.length * 1.4)))
+      .force("collision", forceCollide(NODE_RADIUS + 24).strength(1).iterations(3))
+      .force("x", forceX((node) => node.laneTargetX).strength(0.38))
+      .force("y", forceY((node) => node.laneTargetY).strength(0.32))
+      .velocityDecay(0.42)
+      .alphaDecay(0.042);
+  } else {
+    simulation
+      .force("link", forceLink(simulationLinks)
+        .id((node) => node.name)
+        .distance(mode === "incident" ? 182 : 172)
+        .strength(mode === "incident" ? 0.52 : 0.34))
+      .force("charge", forceManyBody().strength(Math.max(-720, -250 - nodes.length * 3.2)))
+      .force("collision", forceCollide(NODE_RADIUS + (mode === "incident" ? 34 : 30)).strength(0.95).iterations(2))
+      .force("center", forceCenter(width / 2, height / 2))
+      .force("x", forceX((node) => {
+        if (mode !== "incident" || !primaryIndexes.has(node.name)) return width / 2;
+        const index = primaryIndexes.get(node.name);
+        return primaryIndexes.size === 1 ? width / 2 : 110 + index * ((width - 220) / (primaryIndexes.size - 1));
+      }).strength((node) => (mode === "incident" && primaryIndexes.has(node.name) ? 0.32 : 0.018)))
+      .force("y", forceY(height / 2).strength((node) => (
+        mode === "incident" && primaryIndexes.has(node.name) ? 0.22 : 0.024
+      )))
+      .velocityDecay(0.34)
+      .alphaDecay(0.035);
+  }
 
   const updatePositions = () => {
-    const margin = NODE_RADIUS + 44;
     simulationNodes.forEach((node) => {
-      node.x = clamp(Number.isFinite(node.x) ? node.x : width / 2, margin, width - margin);
-      node.y = clamp(Number.isFinite(node.y) ? node.y : height / 2, margin, height - margin);
+      node.x = Number.isFinite(node.x) ? node.x : width / 2;
+      node.y = Number.isFinite(node.y) ? node.y : height / 2;
+      if (isSwimlane) Object.assign(node, constrainToLane(node, node.x, node.y));
     });
     nodeSelection.attr("transform", (node) => `translate(${node.x} ${node.y})`);
     edgeGroups.each(function updateEdge(link) {
@@ -434,7 +578,7 @@ export function renderGraph(
     const overlayPath = (overlay) => {
       const source = nodeByName.get(overlay.source);
       const target = nodeByName.get(overlay.target);
-      return source && target ? edgeGeometry(source, target, 0, NODE_RADIUS + 2).d : "";
+      return source && target ? edgeGeometry(source, target).d : "";
     };
     overlayUnderlays.attr("d", overlayPath);
     primaryOverlays.attr("d", overlayPath);
@@ -442,7 +586,7 @@ export function renderGraph(
   };
 
   const clearFocus = () => {
-    nodeSelection.classed("graph-selected graph-related graph-muted", false);
+    nodeSelection.classed("graph-selected graph-related graph-muted graph-search-hit", false);
     edgePaths.classed("graph-selected graph-related graph-muted", false);
     edgeLabels.classed("graph-selected graph-related graph-muted", false);
     allOverlays.classed("graph-related graph-muted", false);
@@ -458,9 +602,7 @@ export function renderGraph(
       return related;
     });
     semantics.overlays.forEach((edge) => {
-      if (edge.source === name || edge.target === name) {
-        relatedNames.add(edge.source === name ? edge.target : edge.source);
-      }
+      if (edge.source === name || edge.target === name) relatedNames.add(edge.source === name ? edge.target : edge.source);
     });
     nodeSelection
       .classed("graph-selected", (item) => item.name === name)
@@ -483,12 +625,8 @@ export function renderGraph(
 
   const chooseEdge = (selectedLink) => {
     nodeSelection
-      .classed("graph-related", (node) => (
-        node.name === selectedLink.data.source || node.name === selectedLink.data.target
-      ))
-      .classed("graph-muted", (node) => (
-        node.name !== selectedLink.data.source && node.name !== selectedLink.data.target
-      ))
+      .classed("graph-related", (node) => node.name === selectedLink.data.source || node.name === selectedLink.data.target)
+      .classed("graph-muted", (node) => node.name !== selectedLink.data.source && node.name !== selectedLink.data.target)
       .classed("graph-selected", false);
     edgePaths
       .classed("graph-selected", (link) => link.index === selectedLink.index)
@@ -512,7 +650,6 @@ export function renderGraph(
       event.stopPropagation();
       chooseEdge(link);
     });
-
   nodeSelection
     .on("click", (event, node) => {
       if (event.defaultPrevented) return;
@@ -529,7 +666,13 @@ export function renderGraph(
   const graphBounds = () => {
     const xs = simulationNodes.map((node) => node.x);
     const ys = simulationNodes.map((node) => node.y);
-    const margin = NODE_RADIUS + 42;
+    if (isSwimlane) {
+      swimlanePlan.guides.forEach((lane) => {
+        xs.push(lane.x, lane.x + lane.width);
+        ys.push(lane.y, lane.y + lane.height);
+      });
+    }
+    const margin = isSwimlane ? 24 : NODE_RADIUS + 42;
     return {
       minX: Math.min(...xs) - margin,
       minY: Math.min(...ys) - margin,
@@ -549,18 +692,14 @@ export function renderGraph(
       viewport.attr("transform", event.transform);
       svg.classed("graph-zoomed-out", event.transform.k < 0.55);
     });
-
   svg.call(zoomBehavior).on("dblclick.zoom", null);
   svg.on("click.graph-clear", (event) => {
     if (event.target === svg.node()) clearFocus();
   });
 
   const fit = () => {
-    const next = calculateFitTransform(graphBounds(), viewportWidth, viewportHeight, { padding: 64 });
-    svg.call(
-      zoomBehavior.transform,
-      zoomIdentity.translate(next.panX, next.panY).scale(next.scale),
-    );
+    const next = calculateFitTransform(graphBounds(), viewportWidth, viewportHeight, { padding: isSwimlane ? 28 : 64 });
+    svg.call(zoomBehavior.transform, zoomIdentity.translate(next.panX, next.panY).scale(next.scale));
   };
 
   const nodeDrag = drag()
@@ -570,15 +709,22 @@ export function renderGraph(
       if (!event.active) simulation.alphaTarget(0.16).restart();
       node.fx = node.x;
       node.fy = node.y;
+      if (isSwimlane) {
+        guideLayer.selectAll(".graph-swimlane")
+          .classed("graph-swimlane-active", (lane) => lane.id === node.laneId);
+      }
     })
     .on("drag", (event, node) => {
-      node.fx = clamp(event.x, NODE_RADIUS + 44, width - NODE_RADIUS - 44);
-      node.fy = clamp(event.y, NODE_RADIUS + 44, height - NODE_RADIUS - 44);
+      const point = isSwimlane ? constrainToLane(node, event.x, event.y) : { x: event.x, y: event.y };
+      node.x = point.x;
+      node.y = point.y;
+      node.fx = node.x;
+      node.fy = node.y;
+      updatePositions();
     })
-    .on("end", (event, node) => {
+    .on("end", (event) => {
       if (!event.active) simulation.alphaTarget(0);
-      node.fx = null;
-      node.fy = null;
+      if (isSwimlane) guideLayer.selectAll(".graph-swimlane").classed("graph-swimlane-active", false);
     });
   nodeSelection.call(nodeDrag);
 
@@ -591,20 +737,44 @@ export function renderGraph(
   updatePositions();
   fit();
 
-  const zoomBy = (factor) => {
-    svg.call(zoomBehavior.scaleBy, factor, [viewportWidth / 2, viewportHeight / 2]);
+  let searchPulseTimer = 0;
+  const focusNode = (name) => {
+    const node = nodeByName.get(name);
+    if (!node) return false;
+    chooseNode(node);
+    const scale = isSwimlane ? 1 : 1.12;
+    svg.call(
+      zoomBehavior.transform,
+      zoomIdentity.translate(viewportWidth / 2 - node.x * scale, viewportHeight / 2 - node.y * scale).scale(scale),
+    );
+    nodeSelection.filter((item) => item.name === name).classed("graph-search-hit", false);
+    void nodeSelection.filter((item) => item.name === name).node()?.getBoundingClientRect();
+    nodeSelection.filter((item) => item.name === name).classed("graph-search-hit", true);
+    if (searchPulseTimer) window.clearTimeout(searchPulseTimer);
+    searchPulseTimer = window.setTimeout(() => {
+      nodeSelection.filter((item) => item.name === name).classed("graph-search-hit", false);
+      searchPulseTimer = 0;
+    }, 1800);
+    return true;
   };
 
+  const zoomBy = (factor) => svg.call(zoomBehavior.scaleBy, factor, [viewportWidth / 2, viewportHeight / 2]);
   return {
     zoomIn: () => zoomBy(1.18),
     zoomOut: () => zoomBy(0.84),
     fit,
     reset: fit,
+    focusNode,
+    clearFocus,
     relayout() {
       simulationNodes.forEach((node, index) => {
-        const position = initialPosition(node, index, simulationNodes.length, width, height, primaryIndexes);
+        const position = isSwimlane
+          ? swimlanePlan.positions.get(node.name)
+          : initialPosition(node, index, simulationNodes.length, width, height, primaryIndexes);
         node.x = position.x;
         node.y = position.y;
+        node.initialX = position.x;
+        node.initialY = position.y;
         node.vx = 0;
         node.vy = 0;
         node.fx = null;
@@ -616,6 +786,7 @@ export function renderGraph(
     },
     destroy() {
       simulation.stop();
+      if (searchPulseTimer) window.clearTimeout(searchPulseTimer);
       nodeSelection.on(".drag", null).on("click", null).on("keydown", null);
       edgeHitPaths.on("click", null).on("keydown", null);
       svg.on(".zoom", null).on(".graph-clear", null);
@@ -623,6 +794,7 @@ export function renderGraph(
     nodeCount: nodes.length,
     edgeCount: edges.length,
     semantics,
+    layoutMode: activeLayout,
   };
 }
 

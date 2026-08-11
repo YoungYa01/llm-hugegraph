@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.analyzer import RuleBasedArchitectureExtractor
-from app.log_integration import (
-    IncidentGraphIntegrator,
-    LogFaultRunner,
-    PendingGraphEdge,
-    PendingGraphNode,
-)
+from app.log_integration import IncidentGraphIntegrator, LogFaultRunner
 from app.models import GraphEdge, GraphNode, GraphResponse
 from app.rca_engine import RootCauseEngine, hypotheses_from_persisted_graph
 
@@ -140,41 +136,75 @@ def test_incident_import_does_not_overwrite_curated_architecture_nodes() -> None
     assert ("Incident:I00001", "Redis生产集群", "SUSPECTED_ROOT_CAUSE") in db.edges
 
 
-def test_pending_graph_pruning_keeps_edges_to_existing_architecture_nodes() -> None:
-    integrator = IncidentGraphIntegrator(db=FakeGraphDb(architecture_graph()))  # type: ignore[arg-type]
+def test_grounded_model_path_is_persisted_into_incident_fusion_graph() -> None:
+    db = FakeGraphDb(architecture_graph())
+    integrator = IncidentGraphIntegrator(db=db)  # type: ignore[arg-type]
+    integrator.decision_service = SimpleNamespace(
+        enrich=lambda detail, analysis, architecture: {
+            "source": "llm",
+            "selected_node_id": "redis-2",
+            "selected_candidate": "redis-2",
+            "selected_fault_mode": "REDIS_UNREACHABLE",
+            "confidence": 0.96,
+            "most_likely_reason": "redis-2 不可用并向上游传播",
+            "most_likely_reasons": ["redis-2 连接失败"],
+            "troubleshooting_methods": ["检查 redis-2"],
+            "propagation_path": [
+                {"node_id": "redis-2", "node": "redis-2"},
+                {"node_id": "redis-prod", "node": "Redis生产集群"},
+                {"node_id": "security-service", "node": "security-service"},
+                {"node_id": "api-gateway", "node": "api-gateway"},
+            ],
+        }
+    )
+
+    integrator._import_details([redis_timeout_detail()], "test.json")
+
+    updated_names = {item["name"] for item in db.upserts}
+    assert "RCAHypothesis:I00001:LLM" in updated_names
+    assert ("Incident:I00001", "redis-2", "SUSPECTED_ROOT_CAUSE") in db.edges
+    assert ("RCAHypothesis:I00001:LLM", "api-gateway", "AFFECTS") in db.edges
+    assert integrator.rca_results[0]["llm_decision"]["selected_node_id"] == "redis-2"
+
+
+def test_edge_write_resolves_native_hugegraph_id_instead_of_model_entity_id() -> None:
+    db = SimpleNamespace(
+        find_node_by_name=lambda name: {"id": f'native:"{name}"'},
+    )
+    integrator = IncidentGraphIntegrator(db=db)  # type: ignore[arg-type]
     integrator._known_nodes = {
-        "Redis生产集群": {"kind": "Cluster", "layer": "基础设施层", "description": "", "meta": {}},
-    }
-    integrator._pending_nodes = {
-        "Incident:I00001": PendingGraphNode("Incident:I00001", "异常分析层", "Incident", "", "test.json"),
-        "RCAHypothesis:I00001:01": PendingGraphNode("RCAHypothesis:I00001:01", "根因推理层", "RCAHypothesis", "", "test.json"),
-        "UnrelatedRuntimeNode": PendingGraphNode("UnrelatedRuntimeNode", "异常分析层", "LogEvent", "", "test.json"),
-    }
-    integrator._pending_edges = {
-        ("Incident:I00001", "RCAHypothesis:I00001:01", "HAS_HYPOTHESIS"): PendingGraphEdge(
-            "Incident:I00001",
-            "RCAHypothesis:I00001:01",
-            "HAS_HYPOTHESIS",
-        ),
-        ("RCAHypothesis:I00001:01", "Redis生产集群", "CANDIDATE_CAUSE"): PendingGraphEdge(
-            "RCAHypothesis:I00001:01",
-            "Redis生产集群",
-            "CANDIDATE_CAUSE",
-        ),
-        ("UnrelatedRuntimeNode", "MissingArchitectureNode", "NOISE"): PendingGraphEdge(
-            "UnrelatedRuntimeNode",
-            "MissingArchitectureNode",
-            "NOISE",
-        ),
+        "security-service": {"id": "project::p1::security-service"},
     }
 
-    nodes, edges = integrator._pruned_pending_graph()
+    vertex_id = integrator._resolve_vertex_id("security-service")
 
-    assert {node.name for node in nodes} == {"Incident:I00001", "RCAHypothesis:I00001:01"}
-    assert {(edge.source, edge.target, edge.type) for edge in edges} == {
-        ("Incident:I00001", "RCAHypothesis:I00001:01", "HAS_HYPOTHESIS"),
-        ("RCAHypothesis:I00001:01", "Redis生产集群", "CANDIDATE_CAUSE"),
-    }
+    assert vertex_id == 'native:"security-service"'
+    assert vertex_id != "project::p1::security-service"
+
+
+def test_existing_shared_exception_is_reused_without_vertex_update() -> None:
+    class ExistingExceptionDb:
+        def find_node_by_name(self, name: str) -> dict:
+            return {"id": f'native:"{name}"'}
+
+        def upsert_node(self, **kwargs):
+            raise AssertionError("existing exception must not be updated")
+
+    integrator = IncidentGraphIntegrator(db=ExistingExceptionDb())  # type: ignore[arg-type]
+    name = "Exception:访问URI[/bdp-etl/service/v0/flows]"
+
+    integrator._write_node(
+        name,
+        "异常分析层",
+        "Exception",
+        "404 NOT_FOUND",
+        "logs.zip",
+        {"root_cause": "404 NOT_FOUND"},
+        preserve_existing=True,
+    )
+
+    assert integrator._vertex_id_cache[name] == f'native:"{name}"'
+    assert name in integrator._known_nodes
 
 
 def test_rule_fallback_extracts_aliases_and_redis_member_topology() -> None:

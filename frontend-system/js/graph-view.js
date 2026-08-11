@@ -3,12 +3,14 @@ import { buildIncidentSemantics } from "./graph-semantics.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const NODE_RADIUS = 32;
-const MIN_SCALE = 0.35;
+const MIN_SCALE = 0.18;
 const MAX_SCALE = 2.4;
 
 let graphSequence = 0;
 
 const palette = {
+  UIControl: "#c44578",
+  UIFunction: "#c06b2b",
   Service: "#3f6fba",
   API: "#5179bd",
   Component: "#61769b",
@@ -22,6 +24,8 @@ const palette = {
   Instance: "#c8722f",
   Host: "#b8662b",
   Pod: "#ca7044",
+  VM: "#a96332",
+  NetworkSwitch: "#258b82",
   Incident: "#c43d4d",
   RCAHypothesis: "#95509a",
   LogEvent: "#ba596d",
@@ -225,8 +229,11 @@ export function renderGraph(
   if (!nodes.length) return null;
 
   const sequence = ++graphSequence;
-  const width = Math.max(720, container.clientWidth || 960);
-  const height = mode === "incident" ? 640 : 720;
+  const viewportWidth = Math.max(720, container.clientWidth || 960);
+  const viewportHeight = mode === "incident" ? 640 : 720;
+  const density = Math.max(1, Math.sqrt(nodes.length / (mode === "incident" ? 14 : 18)));
+  const width = Math.min(3200, Math.max(viewportWidth, viewportWidth * density));
+  const height = Math.min(2400, Math.max(viewportHeight, viewportHeight * density * 0.82));
   const semantics = mode === "incident"
     ? buildIncidentSemantics(hypotheses, llmDecision, nodeNames)
     : { primary: null, alternatives: [], overlays: [], candidateRanks: {}, start: "", end: "", warnings: [] };
@@ -236,6 +243,8 @@ export function renderGraph(
     width,
     height,
     nodeRadius: NODE_RADIUS,
+    linkDistance: mode === "incident" ? 182 : 172,
+    collisionSpacing: mode === "incident" ? 34 : 30,
   });
   const viewportState = createViewportState();
   const routes = routeMap(edges);
@@ -245,7 +254,7 @@ export function renderGraph(
     class: "graph-svg",
     role: "img",
     "aria-label": mode === "incident" ? "故障传播知识图谱" : "系统架构知识图谱",
-    viewBox: `0 0 ${width} ${height}`,
+    viewBox: `0 0 ${viewportWidth} ${viewportHeight}`,
     tabindex: "0",
   });
   const defs = svgElement("defs");
@@ -328,12 +337,13 @@ export function renderGraph(
       "aria-label": `节点：${node.name}，类型：${node.kind || "Component"}`,
       "data-node-name": node.name,
     });
+    const display = semantics.displayByNode?.[node.name] || null;
     group.style.setProperty("--node-color", palette[node.kind] || "#61738f");
     group.append(svgElement("circle", { class: "graph-node-halo", r: NODE_RADIUS + 7 }));
     group.append(svgElement("circle", { class: "graph-node-circle", r: NODE_RADIUS }));
-    appendTextLines(group, nodeLines(node.name));
+    appendTextLines(group, nodeLines(display?.label || node.name));
     const kind = svgElement("text", { class: "graph-node-kind", x: "0", y: NODE_RADIUS + 17 });
-    kind.textContent = node.kind || "Component";
+    kind.textContent = display?.stage || node.kind || "Component";
     group.append(kind);
 
     const rank = semantics.candidateRanks[node.name];
@@ -343,7 +353,7 @@ export function renderGraph(
     else if (isEnd) appendBadge(group, "终点", "graph-end-badge", -NODE_RADIUS - 29, 42);
 
     const browserTitle = svgElement("title");
-    browserTitle.textContent = `${node.name} · ${node.kind || "Component"}${node.description ? `\n${node.description}` : ""}`;
+    browserTitle.textContent = `${display?.label || node.name} · ${display?.stage || node.kind || "Component"}${display?.explanation ? `\n${display.explanation}` : ""}${display && display.label !== node.name ? `\n真实节点：${node.name}` : ""}${node.description ? `\n${node.description}` : ""}`;
     group.append(browserTitle);
     nodeLayer.append(group);
     nodeRecords.set(node.name, { node, group });
@@ -468,7 +478,7 @@ export function renderGraph(
   };
 
   const fit = () => {
-    viewportState.set(calculateFitTransform(graphBounds(), width, height, { padding: 52 }));
+    viewportState.set(calculateFitTransform(graphBounds(), viewportWidth, viewportHeight, { padding: 64 }));
     applyViewport();
   };
 
@@ -499,7 +509,7 @@ export function renderGraph(
       if (event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-      const point = clientPoint(svg, event, width, height);
+      const point = clientPoint(svg, event, viewportWidth, viewportHeight);
       const world = viewportState.toWorld(point.x, point.y);
       const position = layout.position(name);
       pointer = {
@@ -518,7 +528,7 @@ export function renderGraph(
         pointer.dragging = true;
       }
       if (!pointer.dragging) return;
-      const point = clientPoint(svg, event, width, height);
+      const point = clientPoint(svg, event, viewportWidth, viewportHeight);
       const world = viewportState.toWorld(point.x, point.y);
       layout.move(name, world.x - pointer.offsetX, world.y - pointer.offsetY);
       layout.reheat();
@@ -545,13 +555,13 @@ export function renderGraph(
   let panPointer = null;
   svg.addEventListener("pointerdown", (event) => {
     if (event.target !== svg || event.button !== 0) return;
-    const point = clientPoint(svg, event, width, height);
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
     panPointer = { id: event.pointerId, x: point.x, y: point.y, moved: false };
     svg.setPointerCapture?.(event.pointerId);
   });
   svg.addEventListener("pointermove", (event) => {
     if (!panPointer || panPointer.id !== event.pointerId) return;
-    const point = clientPoint(svg, event, width, height);
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
     const deltaX = point.x - panPointer.x;
     const deltaY = point.y - panPointer.y;
     if (Math.hypot(deltaX, deltaY) > 1) panPointer.moved = true;
@@ -571,7 +581,7 @@ export function renderGraph(
   svg.addEventListener("pointercancel", () => { panPointer = null; });
   svg.addEventListener("wheel", (event) => {
     event.preventDefault();
-    const point = clientPoint(svg, event, width, height);
+    const point = clientPoint(svg, event, viewportWidth, viewportHeight);
     const { scale } = viewportState.value();
     viewportState.zoomAt(scale * (event.deltaY < 0 ? 1.12 : 0.88), point.x, point.y);
     applyViewport();
@@ -584,7 +594,7 @@ export function renderGraph(
 
   const zoomBy = (factor) => {
     const current = viewportState.value();
-    viewportState.zoomAt(current.scale * factor, width / 2, height / 2);
+    viewportState.zoomAt(current.scale * factor, viewportWidth / 2, viewportHeight / 2);
     applyViewport();
   };
 
@@ -612,6 +622,7 @@ export function renderGraph(
 
 export function graphLegend(includeDynamic = true, includePropagation = false) {
   const entries = [
+    ["UIControl", "界面交互"],
     ["Service", "服务"],
     ["Database", "数据资源"],
     ["Cluster", "集群"],

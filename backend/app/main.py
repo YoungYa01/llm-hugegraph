@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from urllib.parse import unquote
@@ -43,6 +44,10 @@ async def request_log_middleware(request: Request, call_next):
         elapsed = time.time() - start
         logger.info("REQ END method=%s path=%s status=%s elapsed=%.2fs", request.method, request.url.path, response.status_code, elapsed)
         return response
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # 优雅静默处理 Ctrl+C 中断与任务取消，防止吐出满屏 CancelledError 导致终端假死
+        logger.info("REQ SHUTDOWN method=%s path=%s", request.method, request.url.path)
+        raise
     except Exception:
         elapsed = time.time() - start
         logger.exception("REQ ERROR method=%s path=%s elapsed=%.2fs", request.method, request.url.path, elapsed)

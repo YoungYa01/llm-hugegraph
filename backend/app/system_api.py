@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import shutil
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,8 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 
 from .auth import (
     current_token_hash,
@@ -23,6 +26,8 @@ from .auth import (
     verify_password,
 )
 from .config import get_settings
+from .graph_admin import GraphAdminService
+from .hugegraph_client import HugeGraphRestClient, HugeGraphRestError
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
     EdgeDeleteRequest,
@@ -62,10 +67,15 @@ def _project_for_user(
     database: SystemDatabase | None = None,
 ) -> dict[str, Any]:
     project = (database or get_system_db()).get_project(project_id)
-    if not project or project.get("owner_id") != user.get("id"):
+    if not project or (user.get("role") != "admin" and project.get("owner_id") != user.get("id")):
         # Returning 404 avoids leaking project identifiers between users.
         raise HTTPException(status_code=404, detail="项目不存在")
     return project
+
+
+def _require_admin(user: dict[str, Any]) -> None:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅系统管理员有权管理 HugeGraph")
 
 
 def _incident_for_user(
@@ -109,7 +119,7 @@ def _data_dir(project_id: str, category: str, item_id: str) -> Path:
 
 
 def _public_project(project: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in project.items() if key != "owner_id"}
+    return dict(project)
 
 
 def _architecture_result(item: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +137,10 @@ def _batch_result(item: dict[str, Any]) -> dict[str, Any]:
         if key not in {"input_path", "train_path", "rca_json"}
     }
     result["summary"] = _json(result.pop("summary_json", "{}"), {})
+    # severity_dist 和 resolved_count 由 list_log_batches 附加，直接透传
+    # （get_log_batch 单条查询无聚合时给出空默认值，保持兼容）
+    result.setdefault("severity_dist", {"critical": 0, "high": 0, "medium": 0, "low": 0})
+    result.setdefault("resolved_count", 0)
     return result
 
 
@@ -151,11 +165,15 @@ def register(payload: RegisterRequest) -> dict[str, Any]:
     database = get_system_db()
     if not settings.allow_registration and database.user_count() > 0:
         raise HTTPException(status_code=403, detail="系统已关闭自助注册")
+    employee_id = payload.employee_id.strip()
+    if not employee_id:
+        raise HTTPException(status_code=422, detail="工号不能为空")
     try:
         user = database.create_user(
             payload.username.strip(),
             hash_password(payload.password),
             payload.display_name.strip(),
+            employee_id,
         )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="用户名已存在") from exc
@@ -198,8 +216,309 @@ def list_projects(
     include_archived: bool = Query(False),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
-    items = get_system_db().list_projects(str(user["id"]), include_archived)
+    del include_archived
+    items = get_system_db().list_projects_for_user(user)
     return {"items": [_public_project(item) for item in items]}
+
+
+@router.get("/users")
+def list_users(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅系统管理员有权查看所有用户")
+    database = get_system_db()
+    return {"items": database.list_all_users()}
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field("", max_length=120)
+    employee_id: str | None = Field(None, max_length=64)
+    old_password: str = Field("", max_length=120)
+    new_password: str = Field("", max_length=120)
+
+
+@router.patch("/auth/profile")
+def update_own_profile(
+    payload: ProfileUpdateRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    user_id = str(user["id"])
+    
+    new_hash = None
+    if payload.new_password.strip():
+        if not payload.old_password:
+            raise HTTPException(status_code=400, detail="修改密码时必须输入当前旧密码")
+        if not verify_password(payload.old_password, str(user.get("password_hash") or "")):
+            raise HTTPException(status_code=400, detail="旧密码验证错误")
+        if len(payload.new_password.strip()) < 4:
+            raise HTTPException(status_code=400, detail="新密码至少包含4位字符")
+        new_hash = hash_password(payload.new_password.strip())
+
+    display_name = payload.display_name.strip() if payload.display_name.strip() else None
+    employee_id = payload.employee_id.strip() if payload.employee_id is not None else None
+    if payload.employee_id is not None and not employee_id:
+        raise HTTPException(status_code=400, detail="工号不能为空")
+
+    updated = database.update_user_profile(
+        user_id,
+        display_name=display_name,
+        employee_id=employee_id,
+        password_hash=new_hash,
+    )
+    return {"user": public_user(updated or user)}
+
+
+class AdminUserUpdateRequest(BaseModel):
+    display_name: str = Field("", max_length=120)
+    employee_id: str | None = Field(None, max_length=64)
+    role: str = Field("user", max_length=20)
+    is_active: int = Field(1)
+    new_password: str = Field("", max_length=120)
+
+
+@router.patch("/users/{user_id}")
+def update_user(
+    user_id: str,
+    payload: AdminUserUpdateRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅系统管理员有权管理用户账号")
+    
+    database = get_system_db()
+    target_user = database.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
+    if not target_user:
+        raise HTTPException(status_code=404, detail="目标用户不存在")
+
+    # 安全拦截：管理员账号不允许被停用
+    if (target_user.get("role") == "admin" or payload.role == "admin") and payload.is_active == 0:
+        raise HTTPException(status_code=400, detail="出于安全保护，系统管理员账号不可被停用")
+
+    if user_id == str(user["id"]) and payload.role != "admin":
+        raise HTTPException(status_code=400, detail="出于安全保护，不能降级您自己的管理员权限")
+
+    new_hash = None
+    if payload.new_password.strip():
+        if len(payload.new_password.strip()) < 4:
+            raise HTTPException(status_code=400, detail="新密码至少包含4位字符")
+        new_hash = hash_password(payload.new_password.strip())
+
+    display_name = payload.display_name.strip() if payload.display_name.strip() else None
+    employee_id = payload.employee_id.strip() if payload.employee_id is not None else None
+    if payload.employee_id is not None and not employee_id:
+        raise HTTPException(status_code=400, detail="工号不能为空")
+
+    updated = database.update_user_profile(
+        user_id,
+        display_name=display_name,
+        employee_id=employee_id,
+        role=payload.role,
+        is_active=payload.is_active,
+        password_hash=new_hash,
+    )
+    return {"user": public_user(updated or target_user)}
+
+
+# HugeGraph administration -------------------------------------------------
+
+
+class GraphOperationPreviewRequest(BaseModel):
+    action: str = Field(..., max_length=40)
+    project_id: str = Field(..., min_length=1, max_length=80)
+    target_id: str = Field("", max_length=160)
+    target_names: list[str] = Field(default_factory=list, max_length=200)
+
+
+class DeleteOrphanNodesPreviewRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=80)
+    target_names: list[str] = Field(..., max_length=200)
+
+
+class GraphOperationExecuteRequest(BaseModel):
+    confirmation_text: str = Field(..., min_length=1, max_length=200)
+
+
+def _graph_admin_service(database: SystemDatabase | None = None) -> GraphAdminService:
+    return GraphAdminService(database or get_system_db(), HugeGraphRestClient())
+
+
+def _graph_service_error(exc: Exception) -> HTTPException:
+    message = str(exc).strip().replace("\r", " ").replace("\n", " ")[:800]
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=403, detail=message)
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=message)
+    if isinstance(exc, HugeGraphRestError):
+        return HTTPException(status_code=503, detail=f"HugeGraph 操作失败：{message}")
+    return HTTPException(status_code=500, detail=f"图谱管理操作失败：{message}")
+
+
+@router.get("/admin/graph/status")
+def admin_graph_status(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    try:
+        return {"status": _graph_admin_service().status()}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/overview")
+def admin_graph_overview(
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    try:
+        return {"overview": _graph_admin_service().overview()}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/data")
+def admin_graph_data(
+    entity: str = Query("nodes"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    project_id: str = Query(""),
+    category: str = Query(""),
+    q: str = Query("", max_length=200),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    if entity not in {"nodes", "edges"}:
+        raise HTTPException(status_code=422, detail="entity 仅支持 nodes 或 edges")
+    try:
+        return _graph_admin_service().data(
+            entity=entity,
+            page=page,
+            page_size=page_size,
+            project_id=project_id.strip(),
+            category=category.strip(),
+            query=q,
+        )
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/quality")
+def admin_graph_quality(
+    project_id: str = Query(""),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    if project_id and not get_system_db().get_project(project_id):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    try:
+        return {"quality": _graph_admin_service().quality(project_id.strip())}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/batches")
+def admin_graph_batches(
+    project_id: str = Query(..., min_length=1),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    database = get_system_db()
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    items = database.list_log_batches(project_id)
+    return {
+        "items": [
+            {key: item.get(key) for key in ("id", "filename", "status", "created_at", "completed_at")}
+            for item in items
+        ]
+    }
+
+
+@router.get("/admin/graph/export")
+def admin_graph_export(
+    project_id: str = Query(..., min_length=1),
+    user: dict[str, Any] = Depends(require_user),
+) -> Response:
+    _require_admin(user)
+    try:
+        payload = _graph_admin_service().project_export(project_id)
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"project-{project_id}-graph.json"
+    return Response(
+        content=body,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/admin/graph/operations/preview", status_code=201)
+def preview_admin_graph_operation(
+    payload: GraphOperationPreviewRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    if payload.action not in {"cleanup_batch", "clear_project", "delete_orphan_nodes"}:
+        raise HTTPException(status_code=422, detail="不支持的图谱操作")
+    try:
+        operation = _graph_admin_service().preview_operation(
+            actor_id=str(user["id"]),
+            action=payload.action,
+            project_id=payload.project_id,
+            target_id=payload.target_id,
+            target_names=payload.target_names,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.post("/admin/graph/orphan-nodes/operations/preview", status_code=201)
+def preview_delete_orphan_nodes_operation(
+    payload: DeleteOrphanNodesPreviewRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    """Preview orphan deletion without trusting a client-provided action name."""
+    _require_admin(user)
+    try:
+        operation = _graph_admin_service().preview_operation(
+            actor_id=str(user["id"]),
+            action="delete_orphan_nodes",
+            project_id=payload.project_id,
+            target_names=payload.target_names,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.post("/admin/graph/operations/{operation_id}/execute")
+def execute_admin_graph_operation(
+    operation_id: str,
+    payload: GraphOperationExecuteRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    try:
+        operation = _graph_admin_service().execute_operation(
+            operation_id=operation_id,
+            actor_id=str(user["id"]),
+            confirmation_text=payload.confirmation_text,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.get("/admin/graph/operations")
+def list_admin_graph_operations(
+    limit: int = Query(100, ge=1, le=500),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _require_admin(user)
+    return {"items": _graph_admin_service().operations(limit)}
 
 
 @router.post("/projects", status_code=201)
@@ -236,16 +555,33 @@ def update_project(
 
 
 @router.delete("/projects/{project_id}")
-def archive_project(
+def delete_project(
     project_id: str,
+    background_tasks: BackgroundTasks,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
-    project = _project_for_user(project_id, user, database)
-    updated = database.update_project(
-        project_id, str(project["name"]), str(project.get("description") or ""), "archived"
+    _project_for_user(project_id, user, database)
+
+    # 1. 异步清理 HugeGraph 图数据库中属于该项目的静态架构节点与动态日志/故障节点
+    background_tasks.add_task(
+        ProjectScopedGraphClient(project_id).clear_project_graph
     )
-    return {"message": "project_archived", "project": _public_project(updated)}
+
+    # 2. 物理删除 SQLite 系统数据库中的项目及级联关联数据
+    success = database.delete_project(project_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+
+    # 3. 彻底物理删除该项目在磁盘 backend/data/projects/<project_id> 中的所有架构、日志与 RCA 文件目录
+    project_dir = Path(get_settings().app_data_root) / "projects" / project_id
+    if project_dir.exists():
+        try:
+            shutil.rmtree(project_dir, ignore_errors=True)
+        except Exception as exc:
+            logger.warning(f"物理删除项目磁盘目录 {project_dir} 异常: {exc}")
+
+    return {"message": "project_deleted", "project_id": project_id}
 
 
 @router.get("/projects/{project_id}/dashboard")
@@ -276,7 +612,43 @@ def list_architectures(
     }
 
 
-@router.post("/projects/{project_id}/architectures/import", status_code=201)
+async def _run_architecture_import_task(
+    item_id: str,
+    project_id: str,
+    text: str,
+    filename: str,
+    employee_id: str,
+) -> None:
+    database = get_system_db()
+    scoped = ProjectScopedGraphClient(project_id)
+
+    def _on_progress(pct: int, msg: str) -> None:
+        database.update_architecture_progress(item_id, pct, msg)
+
+    try:
+        _on_progress(10, "启动 LLM 大模型抽取引擎...")
+        builder = GraphBuilderService(scoped, employee_id=employee_id)
+        extracted, logs = await run_in_threadpool(
+            builder.build_ontology_graph,
+            text,
+            filename,
+            progress_callback=_on_progress,
+        )
+        _on_progress(92, "正在从 HugeGraph 读取最新架构拓扑快照...")
+        graph = await run_in_threadpool(scoped.read_architecture_graph, 3000)
+        database.complete_architecture_import(
+            item_id,
+            len(extracted.get("services") or []),
+            len(extracted.get("calls") or []),
+            json.dumps(logs, ensure_ascii=False),
+            json.dumps(graph.model_dump(), ensure_ascii=False),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Architecture import task failed project=%s item_id=%s", project_id, item_id)
+        database.fail_architecture_import(item_id, str(exc))
+
+
+@router.post("/projects/{project_id}/architectures/import", status_code=202)
 async def import_architecture(
     project_id: str,
     file: UploadFile = File(...),
@@ -285,6 +657,9 @@ async def import_architecture(
 ) -> dict[str, Any]:
     database = get_system_db()
     _project_for_user(project_id, user, database)
+    employee_id = str(user.get("employee_id") or "").strip()
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="当前账号未设置工号，请先在个人账号设置中补充")
     raw = await _read_upload(file)
     filename = _clean_name(file.filename, "architecture.md")
     text = raw.decode("utf-8", errors="replace").strip()
@@ -297,33 +672,23 @@ async def import_architecture(
         text,
         str(user["id"]),
     )
-    scoped = ProjectScopedGraphClient(project_id)
-    try:
-        extracted, logs = await run_in_threadpool(
-            GraphBuilderService(scoped).build_ontology_graph,
+    asyncio.create_task(
+        _run_architecture_import_task(
+            str(item["id"]),
+            project_id,
             text,
             filename,
+            employee_id,
         )
-        graph = await run_in_threadpool(scoped.read_architecture_graph, 3000)
-        database.complete_architecture_import(
-            str(item["id"]),
-            len(extracted.get("services") or []),
-            len(extracted.get("calls") or []),
-            json.dumps(logs, ensure_ascii=False),
-            json.dumps(graph.model_dump(), ensure_ascii=False),
-        )
-        completed = database.get_architecture_import(str(item["id"])) or item
-        return {
-            "message": "architecture_imported",
-            "architecture": _architecture_result(completed),
-            "extracted": extracted,
-            "execution_logs": logs,
-            "graph": graph.model_dump(),
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Architecture import failed project=%s", project_id)
-        database.fail_architecture_import(str(item["id"]), str(exc))
-        raise HTTPException(status_code=500, detail=f"架构导入失败：{exc}") from exc
+    )
+    return {
+        "message": "architecture_import_started",
+        "task_id": str(item["id"]),
+        "architecture": _architecture_result(item),
+        "status": "processing",
+        "progress": 5,
+        "progress_message": "文件已接收，准备大模型抽取...",
+    }
 
 
 @router.get("/projects/{project_id}/graph")
@@ -352,7 +717,7 @@ def create_graph_node(
     }
 
 
-@router.put("/projects/{project_id}/graph/nodes/{name}")
+@router.put("/projects/{project_id}/graph/nodes/{name:path}")
 def update_graph_node(
     project_id: str,
     name: str,
@@ -374,7 +739,7 @@ def update_graph_node(
     }
 
 
-@router.delete("/projects/{project_id}/graph/nodes/{name}")
+@router.delete("/projects/{project_id}/graph/nodes/{name:path}")
 def delete_graph_node(
     project_id: str,
     name: str,
@@ -446,6 +811,125 @@ def delete_graph_edge(
     return {"deleted": deleted, "graph": client.read_architecture_graph(1500).model_dump()}
 
 
+@router.get("/projects/{project_id}/graph/export")
+def export_architecture_graph(
+    project_id: str,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    graph = client.read_architecture_graph(5000)
+    return {
+        "project_id": project_id,
+        "nodes": [
+            {
+                "name": n.name,
+                "layer": n.layer,
+                "kind": n.kind,
+                "description": n.description,
+                "source_file": n.source_file,
+                "meta": n.meta,
+            }
+            for n in graph.nodes
+        ],
+        "edges": [
+            {
+                "source": e.source,
+                "target": e.target,
+                "type": e.type,
+                "description": e.description,
+                "meta": e.meta,
+            }
+            for e in getattr(graph, "edges", [])
+        ],
+    }
+
+
+@router.post("/projects/{project_id}/graph/import")
+def import_architecture_graph_data(
+    project_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+
+    # 直接保存节点与依赖边，跳过大模型抽出步
+    raw_nodes = payload.get("nodes") or []
+    raw_edges = payload.get("edges") or []
+
+    imported_nodes = 0
+    imported_edges = 0
+
+    for n in raw_nodes:
+        name = str(n.get("name") or "").strip()
+        if name:
+            client.upsert_node(
+                name=name,
+                layer=str(n.get("layer") or "Component层"),
+                kind=str(n.get("kind") or "Component"),
+                description=str(n.get("description") or ""),
+                source_file=str(n.get("source_file") or "manual_import"),
+                meta=n.get("meta") if isinstance(n.get("meta"), dict) else {},
+            )
+            imported_nodes += 1
+
+    for e in raw_edges:
+        src = str(e.get("source") or "").strip()
+        tgt = str(e.get("target") or "").strip()
+        rel = str(e.get("type") or "CALLS").strip()
+        if src and tgt:
+            client.add_edge_by_names(
+                source_name=src,
+                target_name=tgt,
+                relation_type=rel,
+                description=str(e.get("description") or ""),
+                meta=e.get("meta") if isinstance(e.get("meta"), dict) else {},
+            )
+            imported_edges += 1
+
+    return {
+        "message": "architecture_graph_imported",
+        "imported_nodes": imported_nodes,
+        "imported_edges": imported_edges,
+        "graph": client.read_architecture_graph(1500).model_dump(),
+    }
+
+
+@router.post("/projects/{project_id}/graph/nodes/batch-delete")
+def batch_delete_graph_nodes(
+    project_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    names = payload.get("names") or []
+    res = client.batch_delete_nodes(names)
+    return {
+        "message": "batch_nodes_deleted",
+        **res,
+        "graph": client.read_architecture_graph(1500).model_dump(),
+    }
+
+
+@router.post("/projects/{project_id}/graph/edges/batch-delete")
+def batch_delete_graph_edges(
+    project_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _project_for_user(project_id, user)
+    client = ProjectScopedGraphClient(project_id)
+    edges = payload.get("edges") or []
+    res = client.batch_delete_edges(edges)
+    return {
+        "message": "batch_edges_deleted",
+        **res,
+        "graph": client.read_architecture_graph(1500).model_dump(),
+    }
+
+
 @router.post("/projects/{project_id}/graph/clear")
 def clear_project_graph(
     project_id: str,
@@ -499,7 +983,21 @@ def _persist_incidents(
         analysis = by_external.get(external, {})
         hypotheses = analysis.get("hypotheses") or []
         top = hypotheses[0] if hypotheses else {}
-        confidence = float(top.get("confidence") or 0)
+        decision = analysis.get("llm_decision") if isinstance(analysis.get("llm_decision"), dict) else {}
+        model_path = [
+            str(item.get("node") or "").strip()
+            for item in (decision.get("propagation_path") or decision.get("display_chain") or [])
+            if isinstance(item, dict) and str(item.get("node") or "").strip()
+        ]
+        model_grounded = bool(
+            str(decision.get("source") or "").lower() == "llm"
+            and decision.get("selected_node_id")
+            and model_path
+        )
+        confidence = float(
+            decision.get("confidence") if model_grounded and decision.get("confidence") is not None
+            else top.get("confidence") or 0
+        )
         severity = "critical" if confidence >= 0.9 else "high" if confidence >= 0.75 else "medium" if confidence >= 0.5 else "low"
         root_service = str(detail.get("root_service_candidate") or "未知服务")
         root_cause = str(detail.get("root_cause_candidate") or "未提取到明确异常")
@@ -512,10 +1010,16 @@ def _persist_incidents(
                 "graph_incident_id": graph_id,
                 "title": f"{root_service}：{root_cause[:100]}",
                 "severity": severity,
-                "root_candidate": str(top.get("candidate") or root_service),
+                "root_candidate": str(
+                    decision.get("selected_candidate") if model_grounded
+                    else top.get("candidate") or root_service
+                ),
                 "root_confidence": confidence,
-                "fault_mode": str(top.get("fault_mode") or ""),
-                "chain_json": json.dumps(top.get("chain") or [], ensure_ascii=False),
+                "fault_mode": str(
+                    decision.get("selected_fault_mode") if model_grounded
+                    else top.get("fault_mode") or ""
+                ),
+                "chain_json": json.dumps(model_path if model_grounded else top.get("chain") or [], ensure_ascii=False),
                 "analysis_json": json.dumps(analysis, ensure_ascii=False),
                 "detail_json": json.dumps(detail, ensure_ascii=False),
             }
@@ -525,16 +1029,86 @@ def _persist_incidents(
     return saved
 
 
-@router.post("/projects/{project_id}/logs/analyze", status_code=201)
+async def _run_log_analysis_task(
+    batch_id: str,
+    project_id: str,
+    user_id: str,
+    employee_id: str,
+    input_path: Path,
+    output_dir: Path,
+    train_path: Path | None,
+    total_t0: float,
+) -> None:
+    database = get_system_db()
+    try:
+        database.update_log_batch_progress(
+            batch_id,
+            percent=20,
+            stage="log_parsing",
+            message="正在进行日志结构化解析与滑动窗口异常挖掘...",
+        )
+        runner = LogFaultRunner()
+        summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
+
+        database.update_log_batch_progress(
+            batch_id,
+            percent=65,
+            stage="graph_rca",
+            message="正在结合 HugeGraph 拓扑做图谱 RCA 根因推理...",
+        )
+        scoped = ProjectScopedGraphClient(project_id)
+        imported = await run_in_threadpool(
+            IncidentGraphIntegrator(scoped, employee_id=employee_id).import_path,
+            output_dir,
+            input_path.name,
+            batch_id[:12],
+        )
+        import_data = imported.model_dump()
+
+        database.update_log_batch_progress(
+            batch_id,
+            percent=88,
+            stage="persisting_results",
+            message="持久化故障事件与 RCA 诊断结论...",
+        )
+        await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
+        details = _load_details(output_dir)
+        _persist_incidents(
+            database,
+            project_id,
+            batch_id,
+            user_id,
+            details,
+            import_data.get("rca") or [],
+        )
+
+        total_duration = round(time.perf_counter() - total_t0, 2)
+        if isinstance(summary, dict):
+            summary["duration_seconds"] = total_duration
+
+        database.complete_log_batch(
+            batch_id,
+            json.dumps(summary, ensure_ascii=False),
+            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)
+        database.fail_log_batch(batch_id, str(exc))
+
+
+@router.post("/projects/{project_id}/logs/analyze", status_code=202)
 async def analyze_project_logs(
     project_id: str,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     train_file: UploadFile | None = File(None),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
+    total_t0 = time.perf_counter()
     database = get_system_db()
     _project_for_user(project_id, user, database)
+    employee_id = str(user.get("employee_id") or "").strip()
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="当前账号未设置工号，请先在个人账号设置中补充")
     raw = await _read_upload(file)
     train_raw = await _read_upload(train_file) if train_file is not None else None
 
@@ -558,110 +1132,37 @@ async def analyze_project_logs(
         str(user["id"]),
         batch_id=batch_id,
     )
-    database.update_log_batch_progress(batch_id, percent=6, stage="queued", message="日志包已保存，等待后台分析")
-    background_tasks.add_task(
-        _run_log_analysis_batch,
-        project_id,
-        batch_id,
-        str(input_path),
-        str(train_path) if train_path else "",
-        str(output_dir),
-        input_path.name,
-        str(user["id"]),
-    )
-    started = database.get_log_batch(batch_id) or batch
-    return {"message": "log_analysis_started", "batch": _batch_result(started)}
-    try:
-        runner = LogFaultRunner()
-        summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
-        scoped = ProjectScopedGraphClient(project_id)
-        imported = await run_in_threadpool(
-            IncidentGraphIntegrator(scoped).import_path,
-            output_dir,
-            input_path.name,
-            batch_id[:12],
-        )
-        import_data = imported.model_dump()
-        await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
-        details = _load_details(output_dir)
-        incidents = _persist_incidents(
-            database,
-            project_id,
+    asyncio.create_task(
+        _run_log_analysis_task(
             batch_id,
+            project_id,
             str(user["id"]),
-            details,
-            import_data.get("rca") or [],
-        )
-        database.complete_log_batch(
-            batch_id,
-            json.dumps(summary, ensure_ascii=False),
-            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
-        )
-        completed = database.get_log_batch(batch_id) or batch
-        return {
-            "message": "log_analyzed",
-            "batch": _batch_result(completed),
-            "summary": summary,
-            "incidents": incidents,
-            "integration": {
-                key: value for key, value in import_data.items() if key != "rca"
-            },
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Log analysis failed project=%s batch=%s", project_id, batch_id)
-        database.fail_log_batch(batch_id, str(exc))
-        raise HTTPException(status_code=500, detail=f"日志分析失败：{exc}") from exc
-
-
-def _run_log_analysis_batch(
-    project_id: str,
-    batch_id: str,
-    input_path_text: str,
-    train_path_text: str,
-    output_dir_text: str,
-    input_name: str,
-    actor_id: str,
-) -> None:
-    database = get_system_db()
-    input_path = Path(input_path_text)
-    train_path = Path(train_path_text) if train_path_text else None
-    output_dir = Path(output_dir_text)
-    try:
-        database.update_log_batch_progress(batch_id, percent=12, stage="pipeline", message="正在运行滑动窗口日志检测")
-        runner = LogFaultRunner()
-        summary = runner._run_pipeline(input_path, output_dir, train_path)
-        database.update_log_batch_progress(batch_id, percent=45, stage="graph", message="正在把异常链路写入项目图谱")
-        imported = IncidentGraphIntegrator(ProjectScopedGraphClient(project_id)).import_path(
+            employee_id,
+            input_path,
             output_dir,
-            input_name,
-            batch_id[:12],
+            train_path,
+            total_t0,
         )
-        import_data = imported.model_dump()
-        database.update_log_batch_progress(batch_id, percent=72, stage="artifacts", message="正在生成 RCA 报告和结果文件")
-        runner._write_rca_artifacts(output_dir, import_data.get("rca") or [])
-        database.update_log_batch_progress(batch_id, percent=86, stage="incidents", message="正在保存故障记录")
-        _persist_incidents(
-            database,
-            project_id,
-            batch_id,
-            actor_id,
-            _load_details(output_dir),
-            import_data.get("rca") or [],
-        )
-        summary = {
-            **(summary if isinstance(summary, dict) else {}),
-            "progress_percent": 100,
-            "progress_stage": "completed",
-            "progress_message": "分析完成",
-        }
-        database.complete_log_batch(
-            batch_id,
-            json.dumps(summary, ensure_ascii=False),
-            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Log analysis failed project=%s batch=%s", project_id, batch_id)
-        database.fail_log_batch(batch_id, str(exc))
+    )
+    return {
+        "message": "log_analysis_started",
+        "task_id": batch_id,
+        "batch": _batch_result(batch),
+        "status": "processing",
+        "progress": 5,
+        "progress_message": "日志包接收完成，准备执行分析...",
+    }
+
+
+@router.get("/projects/{project_id}/tasks/active")
+def get_active_tasks(
+    project_id: str,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    _project_for_user(project_id, user, database)
+    tasks = database.get_active_tasks(project_id)
+    return {"active_tasks": tasks}
 
 
 @router.get("/projects/{project_id}/logs/{batch_id}")
@@ -680,6 +1181,63 @@ def get_log_batch(
     return {"batch": result}
 
 
+def _clean_batch_disk_files(project_id: str, batch_id: str, batch: dict[str, Any] | None = None) -> None:
+    """彻底物理清除日志批次对应的所有磁盘文件与目录。"""
+    try:
+        settings = get_settings()
+        root_path = getattr(settings, "app_data_root", None) or getattr(settings, "data_dir", None)
+        if not root_path:
+            return
+        data_dir = Path(root_path).expanduser().resolve()
+        logs_root = data_dir / "projects" / project_id / "logs"
+
+        # 1. 直接删除专属子目录 projects/<project_id>/logs/<batch_id>/
+        batch_dir = logs_root / batch_id
+        if batch_dir.exists():
+            if batch_dir.is_dir():
+                shutil.rmtree(batch_dir, ignore_errors=True)
+            else:
+                batch_dir.unlink(missing_ok=True)
+
+        # 2. 如果批次对象里记录了具体的 input_path, output_path 或 train_path
+        if batch:
+            for key in ("input_path", "output_path", "train_path"):
+                raw = batch.get(key)
+                if not raw:
+                    continue
+                p = Path(str(raw)).expanduser().resolve()
+                if p.exists():
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink(missing_ok=True)
+                        if p.parent.exists() and p.parent != logs_root and p.parent.is_relative_to(logs_root):
+                            try:
+                                if not any(p.parent.iterdir()):
+                                    shutil.rmtree(p.parent, ignore_errors=True)
+                            except Exception:
+                                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("清理日志批次磁盘文件异常 batch=%s: %s", batch_id, exc)
+
+
+def _async_clean_batch_resources(project_id: str, batch_id: str, batch: dict[str, Any], app_data_root: str) -> None:
+    """在后台异步擦除 HugeGraph 图数据库中的 300+ 节点及残余磁盘文件，带 3 次重试防护。"""
+    del app_data_root
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = ProjectScopedGraphClient(project_id).delete_incident_batch(batch_id[:12])
+            logger.info("Async graph cleanup success for batch=%s (attempt %d): %s", batch_id, attempt, res)
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Async graph cleanup attempt %d/%d failed for batch=%s: %s", attempt, max_retries, batch_id, exc)
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+
+    _clean_batch_disk_files(project_id, batch_id, batch)
+
+
 @router.delete("/projects/{project_id}/logs/{batch_id}")
 def delete_log_batch(
     project_id: str,
@@ -691,93 +1249,41 @@ def delete_log_batch(
     _project_for_user(project_id, user, database)
     batch = database.get_log_batch(batch_id)
     if not batch or batch.get("project_id") != project_id:
-        raise HTTPException(status_code=404, detail="日志批次不存在")
+        # 即便数据库记录已不在，也强制尝试清理磁盘
+        _clean_batch_disk_files(project_id, batch_id, None)
+        return {
+            "message": "log_batch_deleted",
+            "deleted": True,
+            "graph_cleanup": {},
+            "warnings": [],
+            "recoverable": False,
+        }
 
-    if str(batch.get("status") or "") == "deleting":
-        return {"message": "log_batch_delete_already_started", "batch": _batch_result(batch), "deleted": False}
-    database.update_log_batch_progress(batch_id, status="deleting", percent=8, stage="delete_queued", message="删除任务已开始")
-    background_tasks.add_task(_delete_log_batch_background, project_id, batch_id)
-    queued = database.get_log_batch(batch_id) or batch
-    return {"message": "log_batch_delete_started", "batch": _batch_result(queued), "deleted": False}
+    # 1. 立即同步从磁盘擦除对应的 logs/<batch_id> 文件夹与日志文件
+    _clean_batch_disk_files(project_id, batch_id, batch)
 
-    warnings: list[str] = []
-    graph_cleanup: dict[str, int] = {}
-    try:
-        graph_cleanup = ProjectScopedGraphClient(project_id).delete_incident_batch(
-            batch_id[:12]
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to clean graph for deleted batch=%s", batch_id)
-        warnings.append(f"日志记录已删除，但图谱清理失败：{exc}")
+    # 2. 在 SQLite 数据库中完成记录擦除
+    database.delete_log_batch(batch_id)
 
-    logs_root = (
-        Path(get_settings().app_data_root).expanduser().resolve()
-        / "projects"
-        / project_id
-        / "logs"
-    ).resolve()
-    batch_dir = Path(str(batch.get("input_path") or "")).expanduser().resolve().parent
-    if (
-        batch_dir.name == batch_id
-        and batch_dir.is_relative_to(logs_root)
-        and batch_dir.is_dir()
-    ):
-        shutil.rmtree(batch_dir)
-    elif batch_dir.exists():
-        raise HTTPException(status_code=500, detail="日志批次目录校验失败，未删除磁盘文件")
+    # 3. 将 HugeGraph 图节点 REST 清理异步移交给后台 BackgroundTasks 任务
+    settings = get_settings()
+    root_str = str(getattr(settings, "app_data_root", None) or getattr(settings, "data_dir", ""))
+    background_tasks.add_task(
+        _async_clean_batch_resources,
+        project_id,
+        batch_id,
+        batch,
+        root_str,
+    )
 
-    if not database.delete_log_batch(batch_id):
-        raise HTTPException(status_code=404, detail="日志批次不存在")
+    # 3. 毫秒级直接响应 HTTP 200 返回前端，彻底消除悬停“删除中...”
     return {
         "message": "log_batch_deleted",
         "deleted": True,
-        "graph_cleanup": graph_cleanup,
-        "warnings": warnings,
+        "graph_cleanup": {"async": True},
+        "warnings": [],
         "recoverable": False,
     }
-
-
-def _delete_log_batch_background(project_id: str, batch_id: str) -> None:
-    database = get_system_db()
-    batch = database.get_log_batch(batch_id)
-    if not batch or batch.get("project_id") != project_id:
-        return
-
-    warnings: list[str] = []
-    graph_cleanup: dict[str, int] = {}
-    try:
-        database.update_log_batch_progress(batch_id, status="deleting", percent=22, stage="graph_cleanup", message="正在清理动态图谱节点和关系")
-        graph_cleanup = ProjectScopedGraphClient(project_id).delete_incident_batch(
-            batch_id[:12]
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to clean graph for deleted batch=%s", batch_id)
-        warnings.append(f"日志记录将继续删除，但图谱清理失败：{exc}")
-
-    logs_root = (
-        Path(get_settings().app_data_root).expanduser().resolve()
-        / "projects"
-        / project_id
-        / "logs"
-    ).resolve()
-    batch_dir = Path(str(batch.get("input_path") or "")).expanduser().resolve().parent
-    try:
-        database.update_log_batch_progress(batch_id, status="deleting", percent=68, stage="files", message="正在删除日志输入和分析产物")
-        if (
-            batch_dir.name == batch_id
-            and batch_dir.is_relative_to(logs_root)
-            and batch_dir.is_dir()
-        ):
-            shutil.rmtree(batch_dir)
-        elif batch_dir.exists():
-            raise RuntimeError("日志批次目录校验失败，未删除磁盘文件")
-
-        database.update_log_batch_progress(batch_id, status="deleting", percent=92, stage="records", message="正在删除批次和关联故障记录")
-        if not database.delete_log_batch(batch_id):
-            logger.warning("Log batch disappeared during delete batch=%s warnings=%s cleanup=%s", batch_id, warnings, graph_cleanup)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Log batch delete failed project=%s batch=%s", project_id, batch_id)
-        database.fail_log_batch(batch_id, str(exc))
 
 
 @router.get("/projects/{project_id}/logs/{batch_id}/artifacts/{filename}")

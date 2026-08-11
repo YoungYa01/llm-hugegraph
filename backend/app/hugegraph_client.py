@@ -315,15 +315,38 @@ class HugeGraphRestClient:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.ensure_schema()
+        # PRIMARY_KEY vertex labels reject a second POST for the same name.
+        # Resolve the exact vertex first so manual creation and repeated imports
+        # behave as a real upsert instead of relying on server-specific errors.
+        existing = self.find_node_by_name(name)
+        if existing:
+            return self.update_node_by_id(
+                str(existing.get("id") or ""),
+                name,
+                layer,
+                kind,
+                description,
+                source_file,
+                meta,
+            )
+
         payload = self._node_payload(name, layer, kind, description, source_file, meta)
         try:
             return self._request("POST", "graph/vertices", json_body=payload, expected=(200, 201, 202))
-        except HugeGraphRestError as exc:
-            msg = str(exc).lower()
-            if "exist" in msg or "duplicate" in msg or "already" in msg:
-                existing = self.find_node_by_name(name)
-                if existing:
-                    return self.update_node_by_id(str(existing.get("id") or ""), name, layer, kind, description, source_file, meta)
+        except HugeGraphRestError:
+            # A concurrent writer may have inserted the same primary key after
+            # our pre-check. Re-resolve it before surfacing the create error.
+            existing = self.find_node_by_name(name)
+            if existing:
+                return self.update_node_by_id(
+                    str(existing.get("id") or ""),
+                    name,
+                    layer,
+                    kind,
+                    description,
+                    source_file,
+                    meta,
+                )
             raise
 
     def upsert_nodes_bulk(self, nodes: list[dict[str, Any]]) -> int:
@@ -343,14 +366,37 @@ class HugeGraphRestClient:
     def _encoded_id_candidates(self, vertex_id: str) -> list[str]:
         if not vertex_id:
             return []
-        candidates = [
-            urllib.parse.quote(vertex_id, safe=""),
-            urllib.parse.quote(json.dumps(vertex_id, ensure_ascii=False), safe=""),
-        ]
-        # HugeGraph primary-key id is often like 1:name. Some versions expect the
-        # quoted URL form exactly for string IDs.
-        if not (vertex_id.startswith('"') and vertex_id.endswith('"')):
-            candidates.append(urllib.parse.quote(f'"{vertex_id}"', safe=""))
+        raw_id = str(vertex_id).strip()
+        # Some proxies/logs hand the id back in its JSON-quoted or URL-encoded
+        # representation. Normalize it once before applying HugeGraph's type
+        # syntax; otherwise `%22` becomes `%2522` and the server sees percent
+        # text instead of a String id.
+        for _ in range(2):
+            lowered = raw_id.lower()
+            if not (
+                (lowered.startswith("%22") and lowered.endswith("%22"))
+                or (lowered.startswith("%2522") and lowered.endswith("%2522"))
+            ):
+                break
+            decoded = urllib.parse.unquote(raw_id)
+            if decoded == raw_id:
+                break
+            raw_id = decoded
+        if raw_id.startswith('"') and raw_id.endswith('"'):
+            try:
+                decoded_json = json.loads(raw_id)
+                if isinstance(decoded_json, str):
+                    raw_id = decoded_json
+            except Exception:
+                raw_id = raw_id[1:-1]
+
+        # LogSysNode uses PRIMARY_KEY, therefore its REST id is a JSON String
+        # enclosed in quotes. Encode that typed value exactly once as required
+        # by HugeGraph. For ids containing '/', keep only the slash protected
+        # for one extra routing decode; never double-encode the whole id.
+        canonical = urllib.parse.quote(json.dumps(raw_id, ensure_ascii=False), safe="")
+        slash_protected = canonical.replace("%2F", "%252F").replace("%2f", "%252F")
+        candidates = [slash_protected, canonical]
         deduped: list[str] = []
         for item in candidates:
             if item not in deduped:
@@ -410,15 +456,27 @@ class HugeGraphRestClient:
 
     def delete_node_by_name(self, name: str) -> bool:
         self.ensure_schema()
+        clean_name = name.split("::")[-1] if "::" in name else name
+        scoped_name = name.startswith("project::")
         existing = self.find_node_by_name(name)
+        if not existing and not scoped_name:
+            existing = self.find_node_by_name(clean_name)
+
         if not existing:
             return False
+
         vertex_id = str(existing.get("id") or "")
-        # HugeGraph normally refuses deleting a vertex that still has adjacent
-        # edges. Remove incident KG edges first so the UI delete action works.
+        if not vertex_id:
+            return False
+
+        # 清理与该节点相连的所有依赖边
         for edge in self.list_edges(limit=10000):
             if str(edge.get("outV") or "") == vertex_id or str(edge.get("inV") or "") == vertex_id:
-                self.delete_edge_by_id(str(edge.get("id") or ""))
+                try:
+                    self.delete_edge_by_id(str(edge.get("id") or ""))
+                except Exception:
+                    pass
+
         for encoded in self._encoded_id_candidates(vertex_id):
             try:
                 self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
@@ -428,8 +486,24 @@ class HugeGraphRestClient:
         return False
 
     def find_node_by_name(self, name: str) -> dict[str, Any] | None:
-        for vertex in self.list_vertices(limit=10000):
-            if (vertex.get("properties") or {}).get(self.pk_name) == name:
+        vertices = self.list_vertices(limit=10000)
+        # A scoped name such as project::p1::order must never fall back to the
+        # display name "order", otherwise it can resolve project::p2::order.
+        scoped_name = name.startswith("project::")
+        for vertex in vertices:
+            v_id = str(vertex.get("id") or "")
+            props = vertex.get("properties") or {}
+            v_name = str(props.get(self.pk_name) or "")
+            if name in (v_name, v_id):
+                return vertex
+        if scoped_name:
+            return None
+
+        for vertex in vertices:
+            props = vertex.get("properties") or {}
+            meta = _json_dict(props.get(self.pk_meta))
+            display_name = str(meta.get("display_name") or "")
+            if name and name == display_name:
                 return vertex
         return None
 

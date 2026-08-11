@@ -105,6 +105,54 @@ def test_auth_project_and_dashboard_api(tmp_path, monkeypatch) -> None:
     assert client.get("/api/projects").status_code == 401
 
 
+def test_log_batch_report_api_returns_node_frequency(tmp_path, monkeypatch) -> None:
+    database = SystemDatabase(tmp_path / "api-report.db")
+    monkeypatch.setattr(system_api, "get_system_db", lambda: database)
+    operator = database.create_user("operator", "hash", "Operator", "EMP-001")
+    project = database.create_project(operator["id"], "Order Platform", "production")
+    batch = database.create_log_batch(
+        project["id"],
+        "logs.zip",
+        "/tmp/logs.zip",
+        "",
+        "",
+        "/tmp/output",
+        operator["id"],
+        batch_id="batch-001",
+    )
+    database.upsert_incident(
+        {
+            "project_id": project["id"],
+            "log_batch_id": batch["id"],
+            "external_incident_id": "I00001",
+            "graph_incident_id": "batch-001:I00001",
+            "title": "Redis timeout",
+            "severity": "high",
+            "root_candidate": "redis-2",
+            "root_confidence": 0.91,
+            "fault_mode": "REDIS_TIMEOUT",
+            "chain_json": json.dumps(["redis-2", "gateway"]),
+            "analysis_json": "{}",
+            "detail_json": "{}",
+        }
+    )
+    database.complete_log_batch(batch["id"], json.dumps({"events": 40, "windows": 6}), json.dumps([]))
+
+    app = FastAPI()
+    app.include_router(system_api.router)
+    app.dependency_overrides[auth.require_user] = lambda: operator
+    client = TestClient(app)
+
+    response = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
+
+    assert response.status_code == 200
+    report = response.json()["report"]
+    assert report["summary"]["incident_count"] == 1
+    assert report["summary"]["event_count"] == 40
+    assert report["node_frequencies"][0]["node"] == "redis-2"
+    assert report["node_frequencies"][0]["root_hits"] == 1
+
+
 def test_registration_requires_non_blank_employee_id(tmp_path, monkeypatch) -> None:
     database = SystemDatabase(tmp_path / "api.db")
     monkeypatch.setattr(system_api, "get_system_db", lambda: database)

@@ -28,6 +28,7 @@ from .auth import (
 from .config import get_settings
 from .graph_admin import GraphAdminService
 from .hugegraph_client import HugeGraphRestClient, HugeGraphRestError
+from .log_reports import build_log_batch_report
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
     EdgeDeleteRequest,
@@ -134,7 +135,7 @@ def _batch_result(item: dict[str, Any]) -> dict[str, Any]:
     result = {
         key: value
         for key, value in item.items()
-        if key not in {"input_path", "train_path", "rca_json"}
+        if key not in {"input_path", "train_path", "rca_json", "report_json"}
     }
     result["summary"] = _json(result.pop("summary_json", "{}"), {})
     # severity_dist 和 resolved_count 由 list_log_batches 附加，直接透传
@@ -1029,6 +1030,25 @@ def _persist_incidents(
     return saved
 
 
+def _list_batch_incidents(
+    database: SystemDatabase,
+    project_id: str,
+    batch_id: str,
+) -> list[dict[str, Any]]:
+    rows = database.query_all(
+        """
+        SELECT id, project_id, log_batch_id, external_incident_id, graph_incident_id, title,
+               severity, status, root_candidate, root_confidence, fault_mode, chain_json,
+               resolution_note, resolved_at, created_at, updated_at
+        FROM incidents
+        WHERE project_id = ? AND log_batch_id = ?
+        ORDER BY created_at ASC
+        """,
+        (project_id, batch_id),
+    )
+    return [_incident_result(item) for item in rows]
+
+
 async def _run_log_analysis_task(
     batch_id: str,
     project_id: str,
@@ -1073,7 +1093,7 @@ async def _run_log_analysis_task(
         )
         await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
         details = _load_details(output_dir)
-        _persist_incidents(
+        saved_incidents = _persist_incidents(
             database,
             project_id,
             batch_id,
@@ -1085,11 +1105,30 @@ async def _run_log_analysis_task(
         total_duration = round(time.perf_counter() - total_t0, 2)
         if isinstance(summary, dict):
             summary["duration_seconds"] = total_duration
+        else:
+            summary = {"duration_seconds": total_duration}
+
+        report = build_log_batch_report(
+            batch={
+                **(database.get_log_batch(batch_id) or {}),
+                "summary": summary,
+            },
+            incidents=saved_incidents,
+        )
+        report_json = json.dumps(report, ensure_ascii=False)
+        try:
+            (output_dir / "comprehensive_diagnostic_report.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write diagnostic report artifact batch=%s: %s", batch_id, exc)
 
         database.complete_log_batch(
             batch_id,
             json.dumps(summary, ensure_ascii=False),
             json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+            report_json,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)
@@ -1179,6 +1218,28 @@ def get_log_batch(
     result = _batch_result(item)
     result["rca"] = _json(item.get("rca_json"), [])
     return {"batch": result}
+
+
+@router.get("/projects/{project_id}/logs/{batch_id}/report")
+def get_log_batch_report(
+    project_id: str,
+    batch_id: str,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    _project_for_user(project_id, user, database)
+    item = database.get_log_batch(batch_id)
+    if not item or item.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="log batch not found")
+
+    batch = _batch_result(item)
+    report = _json(item.get("report_json"), {})
+    if not isinstance(report, dict) or not report.get("summary"):
+        incidents = _list_batch_incidents(database, project_id, batch_id)
+        report = build_log_batch_report(batch=batch, incidents=incidents)
+        if item.get("status") == "completed":
+            database.update_log_batch_report(batch_id, json.dumps(report, ensure_ascii=False))
+    return {"batch": batch, "report": report}
 
 
 def _clean_batch_disk_files(project_id: str, batch_id: str, batch: dict[str, Any] | None = None) -> None:
@@ -1305,6 +1366,7 @@ def download_log_artifact(
         "root_cause_report.md",
         "kg_rca_report.md",
         "rca_results.json",
+        "comprehensive_diagnostic_report.json",
         "anomaly_windows.csv",
     }
     safe = Path(filename).name

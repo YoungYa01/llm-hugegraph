@@ -103,6 +103,7 @@ export const api = {
   logs: (id) => request(`/projects/${id}/logs`),
   analyzeLogs: (id, form) => request(`/projects/${id}/logs/analyze`, { method: "POST", body: form }),
   batch: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}`),
+  logReport: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}/report`),
   deleteBatch: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}`, { method: "DELETE" }),
 
   incidents: (id, filters = {}) => {

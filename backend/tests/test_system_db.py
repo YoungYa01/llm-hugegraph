@@ -128,6 +128,24 @@ def test_log_batch_progress_is_stored_in_summary_json(tmp_path) -> None:
     assert legacy_summary["progress_message"] == "正在执行图谱 RCA 根因推理"
 
 
+def test_log_batch_completion_persists_report_json(tmp_path) -> None:
+    database = SystemDatabase(tmp_path / "report.db")
+    user = database.create_user("operator", "hash", "Operator", "EMP-001")
+    project = database.create_project(user["id"], "Order", "")
+    batch = database.create_log_batch(project["id"], "logs.zip", "/tmp/logs.zip", "", "", "/tmp/out", user["id"])
+
+    database.complete_log_batch(
+        batch["id"],
+        json.dumps({"events": 12}),
+        json.dumps([{"incident_id": "I00001"}]),
+        json.dumps({"summary": {"incident_count": 1}}),
+    )
+
+    item = database.get_log_batch(batch["id"])
+    assert item["status"] == "completed"
+    assert json.loads(item["report_json"])["summary"]["incident_count"] == 1
+
+
 def test_existing_database_adds_employee_id_column(tmp_path) -> None:
     path = tmp_path / "legacy.db"
     with sqlite3.connect(path) as connection:

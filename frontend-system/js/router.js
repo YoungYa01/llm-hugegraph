@@ -9,6 +9,7 @@ export function route() {
   const params = { projectId: parts[1] };
   if (!parts[2] || parts[2] === "overview") return { name: "overview", params };
   if (parts[2] === "architecture") return { name: "architecture", params };
+  if (parts[2] === "logs" && parts[3]) return { name: "log-report", params: { ...params, batchId: parts[3] } };
   if (parts[2] === "logs") return { name: "logs", params };
   if (parts[2] === "incidents" && parts[3]) return { name: "incident-detail", params: { ...params, incidentId: parts[3] } };
   if (parts[2] === "incidents") return { name: "incidents", params };

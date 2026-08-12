@@ -949,10 +949,13 @@ def clear_project_graph(
 @router.get("/projects/{project_id}/logs")
 def list_log_batches(
     project_id: str,
+    response: Response,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
     _project_for_user(project_id, user, database)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {"items": [_batch_result(item) for item in database.list_log_batches(project_id)]}
 
 
@@ -1224,21 +1227,24 @@ def get_log_batch(
 def get_log_batch_report(
     project_id: str,
     batch_id: str,
+    response: Response,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
     _project_for_user(project_id, user, database)
     item = database.get_log_batch(batch_id)
     if not item or item.get("project_id") != project_id:
-        raise HTTPException(status_code=404, detail="log batch not found")
+        raise HTTPException(status_code=404, detail="日志批次不存在")
 
     batch = _batch_result(item)
-    report = _json(item.get("report_json"), {})
-    if not isinstance(report, dict) or not report.get("summary"):
-        incidents = _list_batch_incidents(database, project_id, batch_id)
-        report = build_log_batch_report(batch=batch, incidents=incidents)
-        if item.get("status") == "completed":
-            database.update_log_batch_report(batch_id, json.dumps(report, ensure_ascii=False))
+    # Resolution status is mutable after analysis completes. Rebuild from live
+    # incident rows so counts and detail statuses never come from stale report_json.
+    incidents = _list_batch_incidents(database, project_id, batch_id)
+    report = build_log_batch_report(batch=batch, incidents=incidents)
+    if item.get("status") == "completed":
+        database.update_log_batch_report(batch_id, json.dumps(report, ensure_ascii=False))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {"batch": batch, "report": report}
 
 
@@ -1384,6 +1390,7 @@ def download_log_artifact(
 @router.get("/projects/{project_id}/incidents")
 def list_incidents(
     project_id: str,
+    response: Response,
     incident_status: str = Query("", alias="status"),
     severity: str = Query(""),
     user: dict[str, Any] = Depends(require_user),
@@ -1394,6 +1401,8 @@ def list_incidents(
     valid_severity = {"", "low", "medium", "high", "critical"}
     if incident_status not in valid_status or severity not in valid_severity:
         raise HTTPException(status_code=400, detail="筛选条件无效")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {
         "items": [
             _incident_result(item)
@@ -1406,12 +1415,15 @@ def list_incidents(
 def get_incident(
     project_id: str,
     incident_id: str,
+    response: Response,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
     item = _incident_for_user(project_id, incident_id, user, database)
     result = _incident_result(item, detailed=True)
     result["actions"] = database.list_incident_actions(incident_id)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {"incident": result}
 
 
@@ -1453,6 +1465,19 @@ def change_incident_status(
     updated = database.update_incident_status(
         incident_id, payload.status, note, str(user["id"])
     )
+    batch_id = str(updated.get("log_batch_id") or "")
+    if batch_id:
+        batch = database.get_log_batch(batch_id)
+        if batch and batch.get("project_id") == project_id:
+            incidents = _list_batch_incidents(database, project_id, batch_id)
+            report = build_log_batch_report(
+                batch=_batch_result(batch),
+                incidents=incidents,
+            )
+            database.update_log_batch_report(
+                batch_id,
+                json.dumps(report, ensure_ascii=False),
+            )
     result = _incident_result(updated, detailed=True)
     result["actions"] = database.list_incident_actions(incident_id)
     return {"message": "incident_status_updated", "incident": result}

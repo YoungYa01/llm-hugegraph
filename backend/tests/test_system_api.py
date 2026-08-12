@@ -146,11 +146,37 @@ def test_log_batch_report_api_returns_node_frequency(tmp_path, monkeypatch) -> N
     response = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
 
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
     report = response.json()["report"]
     assert report["summary"]["incident_count"] == 1
     assert report["summary"]["event_count"] == 40
     assert report["node_frequencies"][0]["node"] == "redis-2"
     assert report["node_frequencies"][0]["root_hits"] == 1
+
+    incident_id = report["incidents"][0]["id"]
+    database.execute(
+        "UPDATE incidents SET title = ?, root_candidate = ? WHERE id = ?",
+        ("Redis 节点人工修正", "redis-primary", incident_id),
+    )
+    detail = client.get(f"/api/projects/{project['id']}/incidents/{incident_id}")
+    assert detail.status_code == 200
+    assert detail.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    assert detail.json()["incident"]["title"] == "Redis 节点人工修正"
+    assert detail.json()["incident"]["root_candidate"] == "redis-primary"
+
+    resolved = client.patch(
+        f"/api/projects/{project['id']}/incidents/{incident_id}/status",
+        json={"status": "resolved", "resolution_note": "Redis 节点恢复"},
+    )
+    refreshed = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
+
+    assert resolved.status_code == 200
+    assert refreshed.status_code == 200
+    assert refreshed.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    refreshed_report = refreshed.json()["report"]
+    assert refreshed_report["summary"]["resolved_count"] == 1
+    assert refreshed_report["summary"]["open_count"] == 0
+    assert refreshed_report["incidents"][0]["status"] == "resolved"
 
 
 def test_registration_requires_non_blank_employee_id(tmp_path, monkeypatch) -> None:

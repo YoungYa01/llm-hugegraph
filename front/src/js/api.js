@@ -25,13 +25,22 @@ export async function request(path, options = {}) {
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const body = options.body;
+  const method = String(options.method || "GET").toUpperCase();
   if (body && !(body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
+  }
+  if (method === "GET") {
+    headers.set("Cache-Control", "no-cache");
+    headers.set("Pragma", "no-cache");
   }
 
   let response;
   try {
-    response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      cache: method === "GET" ? "no-store" : options.cache,
+      headers,
+    });
   } catch (error) {
     throw new ApiError(`无法连接后端 ${API_BASE}，请确认 FastAPI 已启动`, 0, error);
   }
@@ -107,6 +116,10 @@ export const api = {
   logs: (id) => request(`/projects/${id}/logs`),
   analyzeLogs: (id, form) => request(`/projects/${id}/logs/analyze`, { method: "POST", body: form }),
   batch: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}`),
+  logReport: (projectId, batchId) => request(
+    `/projects/${projectId}/logs/${batchId}/report?refresh=${Date.now()}`,
+    { cache: "no-store" },
+  ),
   deleteBatch: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}`, { method: "DELETE" }),
 
   incidents: (id, filters = {}) => {

@@ -166,9 +166,9 @@ def _batch_row(batch: dict[str, Any]) -> dict[str, Any]:
 
 
 def _severity_dist(batch: dict[str, Any], incidents: list[dict[str, Any]]) -> dict[str, int]:
-    dist = batch.get("severity_dist")
-    if isinstance(dist, dict):
-        return {key: int(dist.get(key) or 0) for key in SEVERITIES}
+    # Incident severity can change after the batch report was generated. Always
+    # aggregate the live incident rows instead of trusting a batch snapshot.
+    del batch
     values = {key: 0 for key in SEVERITIES}
     for incident in incidents:
         severity = str(incident.get("severity") or "medium")
@@ -177,8 +177,9 @@ def _severity_dist(batch: dict[str, Any], incidents: list[dict[str, Any]]) -> di
 
 
 def _resolved_count(batch: dict[str, Any], incidents: list[dict[str, Any]]) -> int:
-    if batch.get("resolved_count") is not None:
-        return int(batch.get("resolved_count") or 0)
+    # Batch-level resolved_count is only a list-page convenience field and may
+    # be absent or stale for a single batch query.
+    del batch
     return sum(1 for item in incidents if item.get("status") == "resolved")
 
 

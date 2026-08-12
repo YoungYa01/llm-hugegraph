@@ -57,7 +57,9 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
       top.chain || incident.chain || [],
     );
     const chain = displayChain.length ? displayChain : (top.chain || incident.chain || []);
-    const llmCandidate = llmDecision.selected_candidate || top.candidate || "尚未形成判断";
+    // Scalar incident columns are the current, operator-editable canonical
+    // values. analysis/detail JSON remains the source for narrative evidence.
+    const llmCandidate = incident.root_candidate || llmDecision.selected_candidate || top.candidate || "尚未形成判断";
     const llmReasons = normalizedReasonItems(
       llmDecision.most_likely_reasons,
       llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因",
@@ -89,6 +91,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           </p>
         </div>
         <div class="page-actions" style="display:flex;align-items:center;gap:8px">
+          ${incident.log_batch_id ? `<a class="button button-secondary button-small" href="#/projects/${project.id}/logs/${incident.log_batch_id}">本批次综合报告</a>` : ""}
           ${badge(incident.severity, "severity")}
           ${badge(incident.status)}
         </div>

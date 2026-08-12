@@ -33,6 +33,7 @@ export async function renderLogReportPage(root, project, batchId) {
           </p>
         </div>
         <div class="page-actions">
+          <button class="button button-secondary" id="refresh-log-report" type="button">刷新统计</button>
           <a class="button button-secondary" href="#/projects/${project.id}/incidents?batch=${encodeURIComponent(batchId)}">查看关联故障</a>
         </div>
       </div>
@@ -45,12 +46,7 @@ export async function renderLogReportPage(root, project, batchId) {
       </div>
 
       <section class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div>
-            <h2>批次概览</h2>
-            <p>自动汇总该批次的 RCA 结果、严重度分布和处理状态。</p>
-          </div>
-        </div>
+        <div class="card-header"><div><h2>批次概览</h2><p>自动汇总该批次的 RCA 结果、严重度分布和处理状态。</p></div></div>
         <div class="card-body">
           <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px" class="hero-grid-responsive">
             ${metricBlock("生成时间", formatDate(report.generated_at))}
@@ -67,25 +63,16 @@ export async function renderLogReportPage(root, project, batchId) {
       </section>
 
       <section class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div>
-            <h2>节点故障频次</h2>
-            <p>根因命中表示节点被判定为最可能根因；链路出现表示节点参与故障传播链。</p>
-          </div>
-        </div>
+        <div class="card-header"><div><h2>节点故障频次</h2><p>根因命中表示节点被判定为最可能根因；链路出现表示节点参与故障传播链。</p></div></div>
         <div class="card-body flush">${nodeTable(nodes)}</div>
       </section>
 
       <section class="card">
-        <div class="card-header">
-          <div>
-            <h2>关联故障明细</h2>
-            <p>保留每个异常段的根因候选、传播链和评分，便于回溯。</p>
-          </div>
-        </div>
+        <div class="card-header"><div><h2>关联故障明细</h2><p>保留每个异常段的根因候选、传播链和评分，便于回溯。</p></div></div>
         <div class="card-body flush">${incidentTable(incidents, project.id)}</div>
       </section>
     `;
+    content.querySelector("#refresh-log-report")?.addEventListener("click", load);
   }
 
   await load();
@@ -96,48 +83,21 @@ function stat(label, value, hint) {
 }
 
 function metricBlock(label, value) {
-  return `<div style="background:var(--surface-soft);border:1px solid var(--border);border-radius:8px;padding:12px">
-    <div class="stat-label">${escapeHtml(label)}</div>
-    <div style="font-size:14px;font-weight:700;color:var(--ink-800);margin-top:4px">${escapeHtml(String(value || "—"))}</div>
-  </div>`;
+  return `<div style="background:var(--surface-soft);border:1px solid var(--border);border-radius:8px;padding:12px"><div class="stat-label">${escapeHtml(label)}</div><div style="font-size:14px;font-weight:700;color:var(--ink-800);margin-top:4px">${escapeHtml(String(value || "—"))}</div></div>`;
 }
 
 function severityMetric(label, value, color) {
-  return `<div style="border:1px solid ${color}33;background:${color}0d;border-radius:8px;padding:10px;text-align:center">
-    <div style="font-size:12px;font-weight:700;color:${color}">${escapeHtml(label)}</div>
-    <div style="font-size:22px;font-weight:800;color:${color}">${escapeHtml(String(value))}</div>
-  </div>`;
+  return `<div style="border:1px solid ${color}33;background:${color}0d;border-radius:8px;padding:10px;text-align:center"><div style="font-size:12px;font-weight:700;color:${color}">${escapeHtml(label)}</div><div style="font-size:22px;font-weight:800;color:${color}">${escapeHtml(String(value))}</div></div>`;
 }
 
 function nodeTable(nodes) {
   if (!nodes.length) return emptyState("暂无节点频次", "本批次尚未形成可统计的根因节点或传播链节点。");
-  return `<div class="table-wrap"><table class="table">
-    <thead><tr><th>节点</th><th>总频次</th><th>根因命中</th><th>链路出现</th><th>关联故障数</th><th>最近出现</th></tr></thead>
-    <tbody>${nodes.map((item) => `<tr>
-      <td><strong>${escapeHtml(item.node)}</strong></td>
-      <td><span style="font-weight:800;color:var(--brand)">${escapeHtml(String(item.total_hits || 0))}</span></td>
-      <td>${escapeHtml(String(item.root_hits || 0))}</td>
-      <td>${escapeHtml(String(item.chain_hits || 0))}</td>
-      <td>${escapeHtml(String(item.incident_count || 0))}</td>
-      <td>${formatDate(item.latest_incident_at)}</td>
-    </tr>`).join("")}</tbody>
-  </table></div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>节点</th><th>总频次</th><th>根因命中</th><th>链路出现</th><th>关联故障数</th><th>最近出现</th></tr></thead><tbody>${nodes.map((item) => `<tr><td><strong>${escapeHtml(item.node)}</strong></td><td><span style="font-weight:800;color:var(--brand)">${escapeHtml(String(item.total_hits || 0))}</span></td><td>${escapeHtml(String(item.root_hits || 0))}</td><td>${escapeHtml(String(item.chain_hits || 0))}</td><td>${escapeHtml(String(item.incident_count || 0))}</td><td>${formatDate(item.latest_incident_at)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function incidentTable(items, projectId) {
   if (!items.length) return emptyState("暂无故障明细", "该批次还没有可展示的 RCA 故障记录。");
-  return `<div class="table-wrap"><table class="table">
-    <thead><tr><th>故障</th><th>根因候选</th><th>传播链</th><th>等级</th><th>状态</th><th>评分</th><th>时间</th></tr></thead>
-    <tbody>${items.map((item) => `<tr>
-      <td><a class="table-title" href="#/projects/${projectId}/incidents/${item.id}">${escapeHtml(item.title || item.external_incident_id)}</a><span class="table-subtitle">${escapeHtml(item.external_incident_id || item.id)}</span></td>
-      <td><strong>${escapeHtml(item.root_candidate || "—")}</strong></td>
-      <td><span class="table-subtitle" style="max-width:320px">${escapeHtml((item.chain || []).join(" → ") || "—")}</span></td>
-      <td>${badge(item.severity, "severity")}</td>
-      <td>${badge(item.status)}</td>
-      <td><strong>${formatConfidence(item.root_confidence)}</strong></td>
-      <td>${formatDate(item.created_at)}</td>
-    </tr>`).join("")}</tbody>
-  </table></div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>故障</th><th>根因候选</th><th>传播链</th><th>等级</th><th>状态</th><th>评分</th><th>时间</th></tr></thead><tbody>${items.map((item) => `<tr><td><a class="table-title" href="#/projects/${projectId}/incidents/${item.id}">${escapeHtml(item.title || item.external_incident_id)}</a><span class="table-subtitle">${escapeHtml(item.external_incident_id || item.id)}</span></td><td><strong>${escapeHtml(item.root_candidate || "—")}</strong></td><td><span class="table-subtitle" style="max-width:320px">${escapeHtml((item.chain || []).join(" → ") || "—")}</span></td><td>${badge(item.severity, "severity")}</td><td>${badge(item.status)}</td><td><strong>${formatConfidence(item.root_confidence)}</strong></td><td>${formatDate(item.created_at)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function duration(seconds) {

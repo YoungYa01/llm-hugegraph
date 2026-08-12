@@ -152,6 +152,13 @@ def test_log_batch_report_api_returns_node_frequency(tmp_path, monkeypatch) -> N
     assert report["summary"]["event_count"] == 40
     assert report["node_frequencies"][0]["node"] == "redis-2"
     assert report["node_frequencies"][0]["root_hits"] == 1
+    assert report["node_frequencies"][0]["chain_hits"] == 1
+    assert report["fault_modes"][0]["label"] == "Redis 访问超时"
+    assert report["fault_modes"][0]["count"] == 1
+    assert report["propagation_paths"][0]["path"] == ["redis-2", "gateway"]
+    assert report["focus_nodes"][0]["node"] == "redis-2"
+    assert any("redis-2" in item for item in report["executive_conclusions"])
+    assert report["governance_recommendations"][0]["nodes"] == ["redis-2"]
 
     incident_id = report["incidents"][0]["id"]
     database.execute(

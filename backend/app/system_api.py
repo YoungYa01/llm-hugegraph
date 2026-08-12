@@ -1042,14 +1042,16 @@ def _list_batch_incidents(
         """
         SELECT id, project_id, log_batch_id, external_incident_id, graph_incident_id, title,
                severity, status, root_candidate, root_confidence, fault_mode, chain_json,
-               resolution_note, resolved_at, created_at, updated_at
+               analysis_json, detail_json, resolution_note, resolved_at, created_at, updated_at
         FROM incidents
         WHERE project_id = ? AND log_batch_id = ?
         ORDER BY created_at ASC
         """,
         (project_id, batch_id),
     )
-    return [_incident_result(item) for item in rows]
+    # 报告聚合需要读取已经持久化的 LLM 判定、证据与排查步骤；这里不返回给
+    # 普通列表接口，只在服务端构建批次报告时使用。
+    return [_incident_result(item, detailed=True) for item in rows]
 
 
 async def _run_log_analysis_task(

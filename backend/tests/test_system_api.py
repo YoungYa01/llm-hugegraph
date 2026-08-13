@@ -12,6 +12,40 @@ from app.rca_decision import RcaDecisionService
 from app.system_db import SystemDatabase
 
 
+def test_orphan_delete_preview_uses_server_side_operation_name(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeGraphAdminService:
+        def preview_operation(self, **kwargs) -> dict:
+            captured.update(kwargs)
+            return {"id": "preview-1", "action": kwargs["action"]}
+
+    monkeypatch.setattr(
+        system_api, "_graph_admin_service", lambda: FakeGraphAdminService()
+    )
+    app = FastAPI()
+    app.include_router(system_api.router)
+    app.dependency_overrides[auth.require_user] = lambda: {
+        "id": "admin-1",
+        "role": "admin",
+    }
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/admin/graph/orphan-nodes/operations/preview",
+        json={"project_id": "project-1", "target_names": ["isolated-service"]},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["operation"]["action"] == "delete_orphan_nodes"
+    assert captured == {
+        "actor_id": "admin-1",
+        "action": "delete_orphan_nodes",
+        "project_id": "project-1",
+        "target_names": ["isolated-service"],
+    }
+
+
 def test_auth_project_and_dashboard_api(tmp_path, monkeypatch) -> None:
     database = SystemDatabase(tmp_path / "api.db")
     monkeypatch.setattr(system_api, "get_system_db", lambda: database)
@@ -69,6 +103,87 @@ def test_auth_project_and_dashboard_api(tmp_path, monkeypatch) -> None:
     assert len(empty_list.json()["items"]) == 0
 
     assert client.get("/api/projects").status_code == 401
+
+
+def test_log_batch_report_api_returns_node_frequency(tmp_path, monkeypatch) -> None:
+    database = SystemDatabase(tmp_path / "api-report.db")
+    monkeypatch.setattr(system_api, "get_system_db", lambda: database)
+    operator = database.create_user("operator", "hash", "Operator", "EMP-001")
+    project = database.create_project(operator["id"], "Order Platform", "production")
+    batch = database.create_log_batch(
+        project["id"],
+        "logs.zip",
+        "/tmp/logs.zip",
+        "",
+        "",
+        "/tmp/output",
+        operator["id"],
+        batch_id="batch-001",
+    )
+    database.upsert_incident(
+        {
+            "project_id": project["id"],
+            "log_batch_id": batch["id"],
+            "external_incident_id": "I00001",
+            "graph_incident_id": "batch-001:I00001",
+            "title": "Redis timeout",
+            "severity": "high",
+            "root_candidate": "redis-2",
+            "root_confidence": 0.91,
+            "fault_mode": "REDIS_TIMEOUT",
+            "chain_json": json.dumps(["redis-2", "gateway"]),
+            "analysis_json": "{}",
+            "detail_json": "{}",
+        }
+    )
+    database.complete_log_batch(batch["id"], json.dumps({"events": 40, "windows": 6}), json.dumps([]))
+
+    app = FastAPI()
+    app.include_router(system_api.router)
+    app.dependency_overrides[auth.require_user] = lambda: operator
+    client = TestClient(app)
+
+    response = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    report = response.json()["report"]
+    assert report["summary"]["incident_count"] == 1
+    assert report["summary"]["event_count"] == 40
+    assert report["node_frequencies"][0]["node"] == "redis-2"
+    assert report["node_frequencies"][0]["root_hits"] == 1
+    assert report["node_frequencies"][0]["chain_hits"] == 1
+    assert report["fault_modes"][0]["label"] == "Redis 访问超时"
+    assert report["fault_modes"][0]["count"] == 1
+    assert report["propagation_paths"][0]["path"] == ["redis-2", "gateway"]
+    assert report["focus_nodes"][0]["node"] == "redis-2"
+    assert any("redis-2" in item for item in report["executive_conclusions"])
+    assert report["governance_recommendations"][0]["nodes"] == ["redis-2"]
+
+    incident_id = report["incidents"][0]["id"]
+    database.execute(
+        "UPDATE incidents SET title = ?, root_candidate = ? WHERE id = ?",
+        ("Redis 节点人工修正", "redis-primary", incident_id),
+    )
+    detail = client.get(f"/api/projects/{project['id']}/incidents/{incident_id}")
+    assert detail.status_code == 200
+    assert detail.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    assert detail.json()["incident"]["title"] == "Redis 节点人工修正"
+    assert detail.json()["incident"]["root_candidate"] == "redis-primary"
+
+    resolved = client.patch(
+        f"/api/projects/{project['id']}/incidents/{incident_id}/status",
+        json={"status": "resolved", "resolution_note": "Redis 节点恢复"},
+    )
+    refreshed = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
+
+    assert resolved.status_code == 200
+    assert refreshed.status_code == 200
+    assert refreshed.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    refreshed_report = refreshed.json()["report"]
+    assert refreshed_report["summary"]["resolved_count"] == 1
+    assert refreshed_report["summary"]["open_count"] == 0
+    assert refreshed_report["incidents"][0]["status"] == "resolved"
 
 
 def test_registration_requires_non_blank_employee_id(tmp_path, monkeypatch) -> None:

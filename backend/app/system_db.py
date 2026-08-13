@@ -91,6 +91,7 @@ class SystemDatabase:
                     status TEXT NOT NULL DEFAULT 'processing',
                     summary_json TEXT NOT NULL DEFAULT '{}',
                     rca_json TEXT NOT NULL DEFAULT '[]',
+                    report_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
                     created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL,
@@ -165,6 +166,8 @@ class SystemDatabase:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
                 if "progress_message" not in cols:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
+                if table == "log_batches" and "report_json" not in cols:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN report_json TEXT NOT NULL DEFAULT '{{}}'")
 
     # Graph administration and audit
     def create_graph_admin_operation(
@@ -604,10 +607,16 @@ class SystemDatabase:
                 row["resolved_count"] = int(agg.get("cnt_resolved") or 0)
         return rows
 
-    def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str) -> None:
+    def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str, report_json: str = "{}") -> None:
         self.execute(
-            "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, completed_at = ? WHERE id = ?",
-            (summary_json, rca_json, utc_now(), batch_id),
+            "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, report_json = ?, completed_at = ? WHERE id = ?",
+            (summary_json, rca_json, report_json, utc_now(), batch_id),
+        )
+
+    def update_log_batch_report(self, batch_id: str, report_json: str) -> None:
+        self.execute(
+            "UPDATE log_batches SET report_json = ? WHERE id = ?",
+            (report_json, batch_id),
         )
 
     def update_log_batch_progress(

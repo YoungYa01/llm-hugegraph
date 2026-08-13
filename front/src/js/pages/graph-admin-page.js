@@ -378,7 +378,10 @@ async function openOperationModal(content, action, project, selectedNames = []) 
       setBusy(button, true, "扫描中…");
       try {
         const targetId = body.querySelector("#operation-target")?.value || "";
-        const { operation } = await api.previewAdminGraphOperation({ action, project_id: project.id, target_id: targetId, target_names: selectedNames });
+        const response = action === "delete_orphan_nodes"
+          ? await api.previewDeleteOrphanNodes(project.id, selectedNames)
+          : await api.previewAdminGraphOperation({ action, project_id: project.id, target_id: targetId });
+        const { operation } = response;
         renderConfirmation(body, operation, close, content);
       } catch (error) {
         toast(error.message, "error");

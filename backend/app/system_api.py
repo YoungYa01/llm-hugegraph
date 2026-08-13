@@ -28,6 +28,7 @@ from .auth import (
 from .config import get_settings
 from .graph_admin import GraphAdminService
 from .hugegraph_client import HugeGraphRestClient, HugeGraphRestError
+from .log_reports import build_log_batch_report
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
     EdgeDeleteRequest,
@@ -134,7 +135,7 @@ def _batch_result(item: dict[str, Any]) -> dict[str, Any]:
     result = {
         key: value
         for key, value in item.items()
-        if key not in {"input_path", "train_path", "rca_json"}
+        if key not in {"input_path", "train_path", "rca_json", "report_json"}
     }
     result["summary"] = _json(result.pop("summary_json", "{}"), {})
     # severity_dist 和 resolved_count 由 list_log_batches 附加，直接透传
@@ -331,6 +332,11 @@ class GraphOperationPreviewRequest(BaseModel):
     target_names: list[str] = Field(default_factory=list, max_length=200)
 
 
+class DeleteOrphanNodesPreviewRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=80)
+    target_names: list[str] = Field(..., max_length=200)
+
+
 class GraphOperationExecuteRequest(BaseModel):
     confirmation_text: str = Field(..., min_length=1, max_length=200)
 
@@ -463,6 +469,25 @@ def preview_admin_graph_operation(
             action=payload.action,
             project_id=payload.project_id,
             target_id=payload.target_id,
+            target_names=payload.target_names,
+        )
+        return {"operation": operation}
+    except Exception as exc:
+        raise _graph_service_error(exc) from exc
+
+
+@router.post("/admin/graph/orphan-nodes/operations/preview", status_code=201)
+def preview_delete_orphan_nodes_operation(
+    payload: DeleteOrphanNodesPreviewRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    """Preview orphan deletion without trusting a client-provided action name."""
+    _require_admin(user)
+    try:
+        operation = _graph_admin_service().preview_operation(
+            actor_id=str(user["id"]),
+            action="delete_orphan_nodes",
+            project_id=payload.project_id,
             target_names=payload.target_names,
         )
         return {"operation": operation}
@@ -924,10 +949,13 @@ def clear_project_graph(
 @router.get("/projects/{project_id}/logs")
 def list_log_batches(
     project_id: str,
+    response: Response,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
     _project_for_user(project_id, user, database)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {"items": [_batch_result(item) for item in database.list_log_batches(project_id)]}
 
 
@@ -1005,6 +1033,27 @@ def _persist_incidents(
     return saved
 
 
+def _list_batch_incidents(
+    database: SystemDatabase,
+    project_id: str,
+    batch_id: str,
+) -> list[dict[str, Any]]:
+    rows = database.query_all(
+        """
+        SELECT id, project_id, log_batch_id, external_incident_id, graph_incident_id, title,
+               severity, status, root_candidate, root_confidence, fault_mode, chain_json,
+               analysis_json, detail_json, resolution_note, resolved_at, created_at, updated_at
+        FROM incidents
+        WHERE project_id = ? AND log_batch_id = ?
+        ORDER BY created_at ASC
+        """,
+        (project_id, batch_id),
+    )
+    # 报告聚合需要读取已经持久化的 LLM 判定、证据与排查步骤；这里不返回给
+    # 普通列表接口，只在服务端构建批次报告时使用。
+    return [_incident_result(item, detailed=True) for item in rows]
+
+
 async def _run_log_analysis_task(
     batch_id: str,
     project_id: str,
@@ -1049,7 +1098,7 @@ async def _run_log_analysis_task(
         )
         await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
         details = _load_details(output_dir)
-        _persist_incidents(
+        saved_incidents = _persist_incidents(
             database,
             project_id,
             batch_id,
@@ -1061,11 +1110,30 @@ async def _run_log_analysis_task(
         total_duration = round(time.perf_counter() - total_t0, 2)
         if isinstance(summary, dict):
             summary["duration_seconds"] = total_duration
+        else:
+            summary = {"duration_seconds": total_duration}
+
+        report = build_log_batch_report(
+            batch={
+                **(database.get_log_batch(batch_id) or {}),
+                "summary": summary,
+            },
+            incidents=saved_incidents,
+        )
+        report_json = json.dumps(report, ensure_ascii=False)
+        try:
+            (output_dir / "comprehensive_diagnostic_report.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write diagnostic report artifact batch=%s: %s", batch_id, exc)
 
         database.complete_log_batch(
             batch_id,
             json.dumps(summary, ensure_ascii=False),
             json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+            report_json,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)
@@ -1155,6 +1223,31 @@ def get_log_batch(
     result = _batch_result(item)
     result["rca"] = _json(item.get("rca_json"), [])
     return {"batch": result}
+
+
+@router.get("/projects/{project_id}/logs/{batch_id}/report")
+def get_log_batch_report(
+    project_id: str,
+    batch_id: str,
+    response: Response,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    _project_for_user(project_id, user, database)
+    item = database.get_log_batch(batch_id)
+    if not item or item.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="日志批次不存在")
+
+    batch = _batch_result(item)
+    # Resolution status is mutable after analysis completes. Rebuild from live
+    # incident rows so counts and detail statuses never come from stale report_json.
+    incidents = _list_batch_incidents(database, project_id, batch_id)
+    report = build_log_batch_report(batch=batch, incidents=incidents)
+    if item.get("status") == "completed":
+        database.update_log_batch_report(batch_id, json.dumps(report, ensure_ascii=False))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return {"batch": batch, "report": report}
 
 
 def _clean_batch_disk_files(project_id: str, batch_id: str, batch: dict[str, Any] | None = None) -> None:
@@ -1433,6 +1526,7 @@ def download_log_artifact(
         "root_cause_report.md",
         "kg_rca_report.md",
         "rca_results.json",
+        "comprehensive_diagnostic_report.json",
         "anomaly_windows.csv",
     }
     safe = Path(filename).name
@@ -1450,6 +1544,7 @@ def download_log_artifact(
 @router.get("/projects/{project_id}/incidents")
 def list_incidents(
     project_id: str,
+    response: Response,
     incident_status: str = Query("", alias="status"),
     severity: str = Query(""),
     user: dict[str, Any] = Depends(require_user),
@@ -1460,6 +1555,8 @@ def list_incidents(
     valid_severity = {"", "low", "medium", "high", "critical"}
     if incident_status not in valid_status or severity not in valid_severity:
         raise HTTPException(status_code=400, detail="筛选条件无效")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {
         "items": [
             _incident_result(item)
@@ -1472,12 +1569,15 @@ def list_incidents(
 def get_incident(
     project_id: str,
     incident_id: str,
+    response: Response,
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
     item = _incident_for_user(project_id, incident_id, user, database)
     result = _incident_result(item, detailed=True)
     result["actions"] = database.list_incident_actions(incident_id)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return {"incident": result}
 
 
@@ -1519,6 +1619,19 @@ def change_incident_status(
     updated = database.update_incident_status(
         incident_id, payload.status, note, str(user["id"])
     )
+    batch_id = str(updated.get("log_batch_id") or "")
+    if batch_id:
+        batch = database.get_log_batch(batch_id)
+        if batch and batch.get("project_id") == project_id:
+            incidents = _list_batch_incidents(database, project_id, batch_id)
+            report = build_log_batch_report(
+                batch=_batch_result(batch),
+                incidents=incidents,
+            )
+            database.update_log_batch_report(
+                batch_id,
+                json.dumps(report, ensure_ascii=False),
+            )
     result = _incident_result(updated, detailed=True)
     result["actions"] = database.list_incident_actions(incident_id)
     return {"message": "incident_status_updated", "incident": result}

@@ -60,7 +60,7 @@ export async function renderLogsPage(root, project) {
       const items = (await api.logs(project.id)).items || [];
       logCache[project.id] = items;
       const hasFileSelected = content.querySelector('input[name="file"]')?.files?.length > 0;
-      if (items.length !== batches.length && !hasFileSelected) {
+      if (!hasFileSelected) {
         batches = items;
         paint();
       }
@@ -225,7 +225,6 @@ export async function renderLogsPage(root, project) {
 
 
 function batchesTable(items, projectId) {
-  void projectId;
   if (!items.length) return emptyState("还没有日志批次", "上传 Spring 日志后，分析记录会出现在这里。");
 
   // 统计同名文件，同名时需要在文件名下显示上传时间加以区分
@@ -251,7 +250,7 @@ function batchesTable(items, projectId) {
 
     // 同名文件加时间副标题
     const showTimeSub = nameCounts[item.filename] > 1;
-    const fileCell = `<a class="table-title" href="#/projects/${projectId}/incidents?batch=${item.id}" title="点击直达此批次故障根因">${escapeHtml(item.filename)}</a>${showTimeSub ? `<span class="table-subtitle">${formatDate(item.created_at)}</span>` : ""}${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}`;
+    const fileCell = `<a class="table-title" href="#/projects/${projectId}/logs/${item.id}" title="点击查看此批次综合诊断报告">${escapeHtml(item.filename)}</a>${showTimeSub ? `<span class="table-subtitle">${formatDate(item.created_at)}</span>` : ""}${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}`;
 
     return `<tr>
       <td>${fileCell}</td>
@@ -259,7 +258,10 @@ function batchesTable(items, projectId) {
       <td>${incidentsLink}</td>
       <td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td>
       <td>${formatDate(item.completed_at || item.created_at)}</td>
-      <td><button class="button button-danger button-small" data-delete-batch="${index}">删除</button></td>
+      <td><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        ${item.status === "completed" ? `<a class="button button-secondary button-small" href="#/projects/${projectId}/logs/${item.id}" title="查看本批次的综合诊断统计">综合报告</a>` : ""}
+        <button class="button button-danger button-small" data-delete-batch="${index}">删除</button>
+      </div></td>
     </tr>`;
   }).join("")}</tbody></table></div>`;
 }

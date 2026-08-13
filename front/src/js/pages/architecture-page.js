@@ -14,6 +14,7 @@ export async function renderArchitecturePage(root, project) {
   let selectedNode = null;
   let selectedEdge = null;
   let controller = null;
+  let graphViewMode = "force";
 
   let selectedNodeNames = new Set();
   let selectedEdgeKeys = new Set();
@@ -148,12 +149,6 @@ export async function renderArchitecturePage(root, project) {
     content.innerHTML = `
       <div class="page-header">
         <div><h1>系统架构拓扑</h1><p>这里只展示静态系统架构；故障、日志事件和 RCA 节点仅在具体故障详情中融合展示。</p></div>
-        <div class="page-actions" style="gap:8px;display:flex;flex-wrap:wrap">
-          <button class="button button-secondary" id="export-graph-json"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>导出架构数据</button>
-          <label class="button button-secondary" style="margin:0;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>导入图谱数据<input type="file" id="import-json-file" accept=".json" style="display:none" /></label>
-          <button class="button button-secondary" id="add-node">＋ 新增节点</button>
-          <button class="button button-primary" id="add-edge">＋ 新增关系</button>
-        </div>
       </div>
 
       <details class="card architecture-import" style="margin-bottom:20px" ${graph.nodes.length === 0 || taskManager.hasActiveTask("architecture") ? "open" : ""}>
@@ -168,11 +163,32 @@ export async function renderArchitecturePage(root, project) {
       </details>
 
       <section class="card architecture-graph-card" style="margin-bottom:20px">
-        <div class="card-header"><div><h2>架构拓扑</h2><p>${graph.nodes.length} 个架构节点 · ${graph.edges.length} 条架构关系；点击节点或连线可直接管理。</p></div><button class="button button-secondary button-small" id="refresh-graph">刷新</button></div>
+        <div class="card-header architecture-graph-header">
+          <div><h2>架构拓扑</h2><p>${graph.nodes.length} 个架构节点 · ${graph.edges.length} 条架构关系；点击节点或连线可直接管理。</p></div>
+          <div class="architecture-card-actions">
+            <button class="button button-secondary button-small" id="export-graph-json"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>导出</button>
+            <label class="button button-secondary button-small" style="margin:0;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>导入<input type="file" id="import-json-file" accept=".json" style="display:none" /></label>
+            <button class="button button-secondary button-small" id="add-node">＋ 节点</button>
+            <button class="button button-primary button-small" id="add-edge">＋ 关系</button>
+            <button class="button button-secondary button-small" id="refresh">↻ 刷新</button>
+          </div>
+        </div>
         <div class="card-body">
           ${graph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(graph.warnings.join("；"))}</div>` : ""}
+          ${graph.nodes.length ? `<div class="architecture-graph-controls">
+            <div class="graph-view-switch" role="group" aria-label="图谱展示方式">
+              <button type="button" class="graph-view-option${graphViewMode === "force" ? " active" : ""}" data-graph-view="force"><strong>关系图</strong><small>自由拓扑</small></button>
+              <button type="button" class="graph-view-option${graphViewMode === "swimlane" ? " active" : ""}" data-graph-view="swimlane"><strong>泳道图</strong><small>按资源域</small></button>
+            </div>
+            <form class="graph-node-search" id="graph-node-search" role="search">
+              <span class="graph-node-search-icon" aria-hidden="true">⌕</span>
+              <input id="graph-node-search-input" list="graph-node-options" autocomplete="off" placeholder="搜索节点名称、类型或架构层…" aria-label="搜索架构节点" />
+              <datalist id="graph-node-options">${graph.nodes.map((node) => `<option value="${escapeHtml(node.name)}">${escapeHtml(node.kind || "Component")} · ${escapeHtml(node.layer || "未分层")}</option>`).join("")}</datalist>
+              <button class="button button-primary button-small" type="submit">定位节点</button>
+            </form>
+          </div>` : ""}
           ${graph.nodes.length ? `<div class="architecture-canvas-layout">
-            <div class="graph-shell graph-shell-primary" id="graph-shell-wrapper"><div id="graph-canvas"></div><div class="graph-quick-actions" id="graph-quick-actions"><strong>点选节点或关系</strong><span>选中后可在这里直接编辑、删除</span></div><div class="graph-toolbar"><button class="button button-ghost button-small" id="toggle-fullscreen" title="全屏查看图谱">⛶ 全屏</button><button class="button button-ghost button-small" id="zoom-out">−</button><button class="button button-ghost button-small" id="zoom-reset">复位</button><button class="button button-ghost button-small" id="zoom-in">＋</button></div><div class="graph-legend">${graphLegend(false)}</div></div>
+            <div class="graph-shell graph-shell-primary" id="graph-shell-wrapper" data-layout-mode="${graphViewMode}"><div id="graph-canvas"></div><div class="graph-toolbar"><button class="button button-ghost button-small" id="toggle-fullscreen" title="全屏查看图谱">⛶ 全屏</button><button class="button button-ghost button-small" id="graph-relayout" title="重新计算节点布局">重新布局</button><button class="button button-ghost button-small" id="zoom-out" title="缩小">−</button><button class="button button-ghost button-small" id="zoom-reset">适配画布</button><button class="button button-ghost button-small" id="zoom-in" title="放大">＋</button></div><div class="graph-legend">${graphLegend(false)}</div></div>
             <aside class="graph-selection-panel"><div id="selection-inspector">${selectionHtml()}</div></aside>
           </div>` : emptyState("架构图谱还是空的", "导入架构描述，或手工新增第一个架构节点。", '<button class="button button-primary" id="empty-add-node">新增节点</button>')}
         </div>
@@ -206,22 +222,31 @@ export async function renderArchitecturePage(root, project) {
 
     bind();
     if (graph.nodes.length) {
-      controller = renderGraph(content.querySelector("#graph-canvas"), graph, {
-        mode: "architecture",
-        onSelect: (node, edges) => {
-          selectedNode = node;
-          selectedEdge = null;
-          updateInspector(nodeInspectorHtml(node, edges));
-          updateQuickActions("node", node);
-        },
-        onSelectEdge: (edge) => {
-          selectedNode = null;
-          selectedEdge = edge;
-          updateInspector(edgeInspectorHtml(edge));
-          updateQuickActions("edge", edge);
-        },
-      });
+      mountArchitectureGraph();
     }
+  }
+
+  function mountArchitectureGraph(focusName = "") {
+    const canvas = content.querySelector("#graph-canvas");
+    if (!canvas) return;
+    controller?.destroy();
+    controller = renderGraph(canvas, graph, {
+      mode: "architecture",
+      layoutMode: graphViewMode,
+      onSelect: (node, edges) => {
+        selectedNode = node;
+        selectedEdge = null;
+        updateInspector(nodeInspectorHtml(node, edges));
+      },
+      onSelectEdge: (edge) => {
+        selectedNode = null;
+        selectedEdge = edge;
+        updateInspector(edgeInspectorHtml(edge));
+      },
+    });
+    const shell = content.querySelector("#graph-shell-wrapper");
+    if (shell) shell.dataset.layoutMode = graphViewMode;
+    if (focusName) requestAnimationFrame(() => controller?.focusNode(focusName));
   }
 
   function updateInspector(html) {
@@ -231,24 +256,11 @@ export async function renderArchitecturePage(root, project) {
     bindInspector(inspector);
   }
 
-  function updateQuickActions(type, item) {
-    const actions = content.querySelector("#graph-quick-actions");
-    if (!actions) return;
-    if (type === "node") {
-      actions.innerHTML = `<div><small>已选择架构节点</small><strong>${escapeHtml(item.name)}</strong></div><div class="row-actions"><button class="button button-secondary button-small" id="quick-edit-node">编辑</button><button class="button button-danger button-small" id="quick-delete-node">删除</button></div>`;
-      actions.querySelector("#quick-edit-node")?.addEventListener("click", () => showNodeModal(selectedNode));
-      actions.querySelector("#quick-delete-node")?.addEventListener("click", () => deleteNode(selectedNode));
-    } else {
-      actions.innerHTML = `<div><small>已选择架构关系</small><strong>${escapeHtml(item.source)} —[${escapeHtml(item.type)}]→ ${escapeHtml(item.target)}</strong></div><div class="row-actions"><button class="button button-secondary button-small" id="quick-edit-edge">编辑</button><button class="button button-danger button-small" id="quick-delete-edge">删除</button></div>`;
-      actions.querySelector("#quick-edit-edge")?.addEventListener("click", () => showEdgeModal(selectedEdge));
-      actions.querySelector("#quick-delete-edge")?.addEventListener("click", () => deleteEdge(selectedEdge));
-    }
-  }
-
   function bind() {
     content.querySelector("#zoom-in")?.addEventListener("click", () => controller?.zoomIn());
     content.querySelector("#zoom-out")?.addEventListener("click", () => controller?.zoomOut());
     content.querySelector("#zoom-reset")?.addEventListener("click", () => controller?.reset());
+    content.querySelector("#graph-relayout")?.addEventListener("click", () => controller?.relayout());
     
     // 全屏大图模式切换 (支持 HTML5 原生 Fullscreen API + 动态内联式强制覆写 + 退出双向平移归位)
     const handleExitFullscreen = () => {
@@ -317,9 +329,45 @@ export async function renderArchitecturePage(root, project) {
       }
     });
 
-    content.querySelector("#refresh-graph")?.addEventListener("click", load);
-    content.querySelector("#zoom-out")?.addEventListener("click", () => controller?.zoomOut());
-    content.querySelector("#zoom-reset")?.addEventListener("click", () => controller?.reset());
+    content.querySelector("#refresh")?.addEventListener("click", load);
+    content.querySelectorAll("[data-graph-view]").forEach((button) => button.addEventListener("click", () => {
+      const nextMode = button.dataset.graphView;
+      if (!["force", "swimlane"].includes(nextMode) || nextMode === graphViewMode) return;
+      graphViewMode = nextMode;
+      content.querySelectorAll("[data-graph-view]").forEach((item) => {
+        item.classList.toggle("active", item.dataset.graphView === graphViewMode);
+      });
+      mountArchitectureGraph(selectedNode?.name || "");
+    }));
+    content.querySelector("#graph-node-search")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = content.querySelector("#graph-node-search-input");
+      const query = String(input?.value || "").trim();
+      if (!query) {
+        controller?.clearFocus();
+        toast("请输入节点名称或关键词", "info");
+        return;
+      }
+      const normalized = query.toLocaleLowerCase();
+      const rank = (node) => {
+        const name = String(node.name || "").toLocaleLowerCase();
+        const searchable = [node.name, node.kind, node.layer, node.description].join(" ").toLocaleLowerCase();
+        if (name === normalized) return 0;
+        if (name.startsWith(normalized)) return 1;
+        if (name.includes(normalized)) return 2;
+        return searchable.includes(normalized) ? 3 : 99;
+      };
+      const match = [...graph.nodes]
+        .map((node) => ({ node, rank: rank(node) }))
+        .filter((item) => item.rank < 99)
+        .sort((left, right) => left.rank - right.rank || left.node.name.localeCompare(right.node.name, "zh-CN"))[0]?.node;
+      if (!match || !controller?.focusNode(match.name)) {
+        toast(`没有找到与“${query}”匹配的架构节点`, "error");
+        return;
+      }
+      if (input) input.value = match.name;
+      toast(`已定位“${match.name}”，并高亮其直接关联关系`, "info");
+    });
     content.querySelectorAll("#add-node, #table-add-node, #empty-add-node").forEach((button) => button.addEventListener("click", () => showNodeModal()));
     content.querySelectorAll("#add-edge, #table-add-edge").forEach((button) => button.addEventListener("click", () => showEdgeModal()));
 

@@ -86,7 +86,7 @@ export async function renderOverviewPage(root, project) {
                 ${batches.slice(0, 5).map((b) => `
                   <tr>
                     <td>
-                      <a class="table-title" href="#/projects/${project.id}/incidents?batch=${b.id}">${escapeHtml(b.filename)}</a>
+                      <a class="table-title" href="#/projects/${project.id}/logs/${b.id}" title="查看综合诊断报告">${escapeHtml(b.filename)}</a>
                       <span class="table-subtitle">${formatDate(b.created_at)}</span>
                     </td>
                     <td>
@@ -98,6 +98,7 @@ export async function renderOverviewPage(root, project) {
                         ${b.summary?.incidents ?? 0} 段异常
                       </a>
                     </td>
+                    <td><a class="button button-secondary button-small" href="#/projects/${project.id}/logs/${b.id}">综合报告</a></td>
                   </tr>
                 `).join("")}
               </tbody></table></div>

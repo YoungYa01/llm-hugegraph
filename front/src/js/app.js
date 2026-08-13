@@ -9,6 +9,7 @@ import { renderProjectsPage } from "./pages/projects-page.js";
 import { renderOverviewPage } from "./pages/overview-page.js";
 import { renderArchitecturePage } from "./pages/architecture-page.js";
 import { renderLogsPage } from "./pages/logs-page.js";
+import { renderLogReportPage } from "./pages/log-report-page.js";
 import { renderIncidentsPage } from "./pages/incidents-page.js";
 import { renderIncidentDetailPage } from "./pages/incident-detail-page.js";
 
@@ -41,6 +42,7 @@ async function render(nextRoute = route()) {
     if (nextRoute.name === "overview") await renderOverviewPage(root, project);
     else if (nextRoute.name === "architecture") await renderArchitecturePage(root, project);
     else if (nextRoute.name === "logs") await renderLogsPage(root, project);
+    else if (nextRoute.name === "log-report") await renderLogReportPage(root, project, nextRoute.params.batchId);
     else if (nextRoute.name === "incidents") await renderIncidentsPage(root, project);
     else if (nextRoute.name === "incident-detail") await renderIncidentDetailPage(root, project, nextRoute.params.incidentId);
     if (version === renderVersion) bindShell({ onLogout: logout });

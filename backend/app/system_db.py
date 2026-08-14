@@ -166,8 +166,13 @@ class SystemDatabase:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
                 if "progress_message" not in cols:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
-                if table == "log_batches" and "report_json" not in cols:
-                    connection.execute(f"ALTER TABLE {table} ADD COLUMN report_json TEXT NOT NULL DEFAULT '{{}}'")
+                if table == "log_batches":
+                    if "report_json" not in cols:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN report_json TEXT NOT NULL DEFAULT '{{}}'")
+                    if "log_start_time" not in cols:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN log_start_time TEXT NOT NULL DEFAULT ''")
+                    if "log_end_time" not in cols:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN log_end_time TEXT NOT NULL DEFAULT ''")
 
     # Graph administration and audit
     def create_graph_admin_operation(
@@ -571,7 +576,7 @@ class SystemDatabase:
         rows = self.query_all(
             """
             SELECT id, project_id, filename, train_filename, output_path, status, progress, progress_message, summary_json,
-                   error_message, created_by, created_at, completed_at
+                   log_start_time, log_end_time, error_message, created_by, created_at, completed_at
             FROM log_batches WHERE project_id = ? ORDER BY created_at DESC
             """,
             (project_id,),
@@ -607,10 +612,84 @@ class SystemDatabase:
                 row["resolved_count"] = int(agg.get("cnt_resolved") or 0)
         return rows
 
-    def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str, report_json: str = "{}") -> None:
+    def get_project_completed_time_ranges(self, project_id: str, exclude_batch_id: str = "") -> list[tuple[str, str]]:
+        """Return (log_start_time, log_end_time) tuples for all completed batches in project,
+
+        with auto-repair fallback for legacy batches whose log_start_time is empty.
+        """
+        rows = self.query_all(
+            """
+            SELECT id, log_start_time, log_end_time, summary_json, report_json, input_path
+            FROM log_batches
+            WHERE project_id = ? AND status = 'completed'
+            """,
+            (project_id,),
+        )
+        ranges: list[tuple[str, str]] = []
+        for r in rows:
+            bid = str(r.get("id") or "")
+            if exclude_batch_id and bid == exclude_batch_id:
+                continue
+            s, e = str(r.get("log_start_time") or ""), str(r.get("log_end_time") or "")
+
+            # If empty, attempt fallback extraction from summary_json / report_json or input_path
+            if not (s and e):
+                try:
+                    summary = json.loads(str(r.get("summary_json") or "{}"))
+                    ingestion = summary.get("ingestion_summary") if isinstance(summary.get("ingestion_summary"), dict) else {}
+                    s = str(ingestion.get("log_start_time") or "")
+                    e = str(ingestion.get("log_end_time") or "")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if not (s and e) and r.get("input_path") and Path(str(r["input_path"])).exists():
+                try:
+                    from .log_filter import filter_logs_in_directory
+                    ipath = Path(str(r["input_path"]))
+                    if ipath.is_file() and ipath.suffix.lower() == ".zip":
+                        import tempfile, zipfile
+                        with tempfile.TemporaryDirectory(prefix="logsys-repair-") as tmpd:
+                            tmp_p = Path(tmpd)
+                            with zipfile.ZipFile(ipath, "r") as zf:
+                                zf.extractall(tmp_p)
+                            res = filter_logs_in_directory(tmp_p, [])
+                            s = str(res.get("log_start_time") or "")
+                            e = str(res.get("log_end_time") or "")
+                    elif ipath.is_dir():
+                        res = filter_logs_in_directory(ipath, [])
+                        s = str(res.get("log_start_time") or "")
+                        e = str(res.get("log_end_time") or "")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if s and e:
+                ranges.append((s, e))
+                # Auto-repair DB row if it was previously empty
+                if not (r.get("log_start_time") and r.get("log_end_time")):
+                    self.execute(
+                        "UPDATE log_batches SET log_start_time = ?, log_end_time = ? WHERE id = ?",
+                        (s, e, bid),
+                    )
+        return ranges
+
+    def complete_log_batch(
+        self,
+        batch_id: str,
+        summary_json: str,
+        rca_json: str,
+        report_json: str = "{}",
+        log_start_time: str = "",
+        log_end_time: str = "",
+    ) -> None:
         self.execute(
-            "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, report_json = ?, completed_at = ? WHERE id = ?",
-            (summary_json, rca_json, report_json, utc_now(), batch_id),
+            """
+            UPDATE log_batches
+            SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成',
+                summary_json = ?, rca_json = ?, report_json = ?,
+                log_start_time = ?, log_end_time = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (summary_json, rca_json, report_json, log_start_time, log_end_time, utc_now(), batch_id),
         )
 
     def update_log_batch_report(self, batch_id: str, report_json: str) -> None:

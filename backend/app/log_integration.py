@@ -944,7 +944,67 @@ class LogFaultRunner:
         finally:
             temp.cleanup()
 
-    def _run_pipeline(self, input_path: Path, output_dir: Path, train_path: Path | None) -> dict[str, Any]:
+    def _run_pipeline(
+        self,
+        input_path: Path,
+        output_dir: Path,
+        train_path: Path | None,
+        historical_ranges: list[tuple[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        from .log_filter import filter_logs_in_directory
+
+        # Create a working directory for pre-filtering
+        ingestion_summary: dict[str, Any] = {}
+        processed_input_path = input_path
+
+        if input_path.is_file() and input_path.suffix.lower() == ".zip":
+            filter_work_dir = output_dir / "_filter_temp"
+            filter_work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(input_path, "r") as zf:
+                    zf.extractall(filter_work_dir)
+                ingestion_summary = filter_logs_in_directory(
+                    filter_work_dir,
+                    historical_ranges or [],
+                )
+                # Re-zip processed input for logfault pipeline consumption
+                filtered_zip_path = output_dir / f"filtered_{input_path.name}"
+                with zipfile.ZipFile(filtered_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for file_p in filter_work_dir.rglob("*"):
+                        if file_p.is_file():
+                            zf.write(file_p, file_p.relative_to(filter_work_dir))
+                processed_input_path = filtered_zip_path
+            except Exception:  # noqa: BLE001
+                processed_input_path = input_path
+        elif input_path.is_dir():
+            ingestion_summary = filter_logs_in_directory(
+                input_path,
+                historical_ranges or [],
+            )
+
+        # If 100% of logs in current batch were duplicates of historical batches,
+        # short-circuit gracefully instead of failing in sliding window algorithm on empty files.
+        if (
+            ingestion_summary
+            and int(ingestion_summary.get("filtered_lines") or 0) > 0
+            and int(ingestion_summary.get("analyzed_lines") or 0) == 0
+        ):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "incident_details.json").write_text(
+                json.dumps({"incidents": []}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return {
+                "events": 0,
+                "event_count": 0,
+                "windows": 0,
+                "window_count": 0,
+                "duration_seconds": 0.05,
+                "ingestion_summary": ingestion_summary,
+                "is_fully_deduplicated": True,
+                "message": "当前批次所有日志均已在历史批次中分析过，已自动全部去重过滤，未生成新的故障。",
+            }
+
         project: Path | None = None
         if self.settings.logfault_project_path:
             project = Path(self.settings.logfault_project_path).expanduser().resolve()
@@ -965,12 +1025,15 @@ class LogFaultRunner:
             ) from exc
         config_path = self.settings.logfault_config_path or None
         run_pipeline = getattr(module, "run_pipeline")
-        return run_pipeline(
-            input_path=input_path,
+        summary = run_pipeline(
+            input_path=processed_input_path,
             output_dir=output_dir,
             config_path=config_path,
             train_input=train_path,
         )
+        if isinstance(summary, dict) and ingestion_summary:
+            summary["ingestion_summary"] = ingestion_summary
+        return summary if isinstance(summary, dict) else {"ingestion_summary": ingestion_summary}
 
     def _write_rca_artifacts(self, output_dir: Path, analyses: list[dict[str, Any]]) -> None:
         (output_dir / "rca_results.json").write_text(

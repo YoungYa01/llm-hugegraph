@@ -1070,10 +1070,13 @@ async def _run_log_analysis_task(
             batch_id,
             percent=20,
             stage="log_parsing",
-            message="正在进行日志结构化解析与滑动窗口异常挖掘...",
+            message="正在读取日志时间戳，剔除历史批次重复日志并挖掘滑动窗口异常...",
         )
+        historical_ranges = database.get_project_completed_time_ranges(project_id, exclude_batch_id=batch_id)
         runner = LogFaultRunner()
-        summary = await run_in_threadpool(runner._run_pipeline, input_path, output_dir, train_path)
+        summary = await run_in_threadpool(
+            runner._run_pipeline, input_path, output_dir, train_path, historical_ranges
+        )
 
         database.update_log_batch_progress(
             batch_id,
@@ -1113,9 +1116,15 @@ async def _run_log_analysis_task(
         else:
             summary = {"duration_seconds": total_duration}
 
+        ingestion_info = summary.get("ingestion_summary") if isinstance(summary, dict) and isinstance(summary.get("ingestion_summary"), dict) else {}
+        log_start_time = str(ingestion_info.get("log_start_time") or "")
+        log_end_time = str(ingestion_info.get("log_end_time") or "")
+
         report = build_log_batch_report(
             batch={
                 **(database.get_log_batch(batch_id) or {}),
+                "log_start_time": log_start_time,
+                "log_end_time": log_end_time,
                 "summary": summary,
             },
             incidents=saved_incidents,
@@ -1134,6 +1143,8 @@ async def _run_log_analysis_task(
             json.dumps(summary, ensure_ascii=False),
             json.dumps(import_data.get("rca") or [], ensure_ascii=False),
             report_json,
+            log_start_time=log_start_time,
+            log_end_time=log_end_time,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)

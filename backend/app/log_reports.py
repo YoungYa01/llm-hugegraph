@@ -46,6 +46,7 @@ def build_log_batch_report(
         else 0
     )
 
+    ingestion_info = summary_data.get("ingestion_summary") if isinstance(summary_data.get("ingestion_summary"), dict) else {}
     report_summary = {
         "incident_count": incident_count,
         "root_node_count": len({item["root_candidate"] for item in normalized_incidents if item["root_candidate"]}),
@@ -62,6 +63,18 @@ def build_log_batch_report(
         "top_node": node_frequencies[0] if node_frequencies else None,
         "top_fault_mode": fault_modes[0] if fault_modes else None,
         "top_path": propagation_paths[0] if propagation_paths else None,
+        "ingestion_summary": {
+            "total_lines": int(ingestion_info.get("total_lines") or 0),
+            "filtered_lines": int(ingestion_info.get("filtered_lines") or 0),
+            "analyzed_lines": int(ingestion_info.get("analyzed_lines") or 0),
+            "deduplication_ratio": str(ingestion_info.get("deduplication_ratio") or "0%"),
+            "log_start_time": str(ingestion_info.get("raw_start_time") or ingestion_info.get("log_start_time") or batch.get("log_start_time") or ""),
+            "log_end_time": str(ingestion_info.get("raw_end_time") or ingestion_info.get("log_end_time") or batch.get("log_end_time") or ""),
+            "raw_start_time": str(ingestion_info.get("raw_start_time") or ingestion_info.get("log_start_time") or batch.get("log_start_time") or ""),
+            "raw_end_time": str(ingestion_info.get("raw_end_time") or ingestion_info.get("log_end_time") or batch.get("log_end_time") or ""),
+            "valid_start_time": str(ingestion_info.get("valid_start_time") or ""),
+            "valid_end_time": str(ingestion_info.get("valid_end_time") or ""),
+        },
     }
     conclusions = _executive_conclusions(
         report_summary,
@@ -248,6 +261,7 @@ def _executive_conclusions(
     count = int(summary["incident_count"])
     if not count:
         return ["本批次未形成可汇总的 RCA 故障记录。"]
+
     conclusions = [
         f"本批次共形成 {count} 个 RCA 故障结论，涉及 {summary['root_node_count']} 个根因节点和 {summary['node_count']} 个传播节点。"
     ]

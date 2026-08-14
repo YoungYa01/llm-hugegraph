@@ -21,6 +21,16 @@ export async function renderLogReportPage(root, project, batchId) {
     const summary = report.summary || {};
     const incidents = report.incidents || [];
     const nodes = report.node_frequencies || [];
+    const ingestion = summary.ingestion_summary || {};
+
+    const origStartStr = (ingestion.raw_start_time || ingestion.log_start_time || batch.log_start_time || "").replace("T", " ").substring(0, 19);
+    const origEndStr = (ingestion.raw_end_time || ingestion.log_end_time || batch.log_end_time || "").replace("T", " ").substring(0, 19);
+    const validStartStr = (ingestion.valid_start_time || "").replace("T", " ").substring(0, 19);
+    const validEndStr = (ingestion.valid_end_time || "").replace("T", " ").substring(0, 19);
+    const filteredCount = Number(ingestion.filtered_lines || 0);
+
+    // Calculate actual analyzed time range if deduplication took place
+    const validTimeLabel = (filteredCount > 0 && validStartStr) ? `${validStartStr} ~ ${validEndStr}` : "同原始时域";
 
     content.innerHTML = `
       <div class="batch-report-page">
@@ -42,17 +52,27 @@ export async function renderLogReportPage(root, project, batchId) {
           ${metaItem("完成时间", formatDate(batch.completed_at || batch.created_at))}
           ${metaItem("报告生成", formatDate(report.generated_at))}
           ${metaItem("日志规模", `${summary.event_count ?? 0} 条事件 / ${summary.window_count ?? 0} 个窗口`)}
+          ${metaItem("原始时域覆盖", origStartStr ? `${origStartStr} ~ ${origEndStr}` : "未解析出时间范围")}
+          ${metaItem("去重后有效时域", validTimeLabel)}
+          ${metaItem("历史去重提纯", ingestion.deduplication_ratio ? `${ingestion.deduplication_ratio} (剔除 ${filteredCount} 行)` : "0% (剔除 0 行)")}
+          ${metaItem("有效分析日志", `${ingestion.analyzed_lines ?? summary.event_count ?? 0} 行增量 / ${ingestion.total_lines ?? 0} 行原始`)}
         </section>
 
         <section class="batch-report-figures" aria-label="批次关键统计">
           ${figure("RCA 故障", summary.incident_count ?? 0, "本批次形成的根因结论")}
           ${figure("根因节点", summary.root_node_count ?? 0, `传播涉及 ${summary.node_count ?? 0} 个节点`)}
+          ${figure("日志历史去重", ingestion.deduplication_ratio || "0%", `自动扣除 ${filteredCount} 行 / 分析 ${ingestion.analyzed_lines ?? summary.event_count ?? 0} 行`)}
           ${figure("平均置信度", formatConfidence(summary.average_confidence), "全部 RCA 结论平均值")}
           ${figure("治理闭环", `${summary.resolved_count ?? 0} / ${summary.incident_count ?? 0}`, `${Math.round(Number(summary.resolution_rate || 0) * 100)}% 已解决`)}
         </section>
 
         <section class="batch-report-section batch-report-conclusion">
           ${sectionHeading("01", "本批次综合结论", "所有数量由已持久化的 RCA 结果实时统计，描述不会改变根因判定。")}
+          ${filteredCount > 0 ? `
+            <div class="batch-report-dedup-card">
+              <strong>历史重叠日志自动过滤：</strong> 本批次原始日志共 <strong>${ingestion.total_lines || 0}</strong> 行，系统已自动拦截过滤与历史批次重叠的 <strong>${filteredCount}</strong> 行数据（去重率 <strong>${ingestion.deduplication_ratio}</strong>），实际针对 <strong>${validStartStr} ~ ${validEndStr}</strong> 范围内的 <strong>${ingestion.analyzed_lines}</strong> 行增量日志完成了精准诊断。
+            </div>
+          ` : ""}
           ${conclusionList(report.executive_conclusions || [])}
           <div class="batch-report-status-strip">
             ${severityChip("严重", summary.severity_dist?.critical || 0, "critical")}

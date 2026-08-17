@@ -842,6 +842,72 @@ class SystemDatabase:
             params,
         )
 
+    def paginate_incidents(
+        self,
+        project_id: str,
+        *,
+        status: str = "",
+        severity: str = "",
+        batch_id: str = "",
+        query: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        clauses = ["i.project_id = ?"]
+        params: list[Any] = [project_id]
+        if status:
+            clauses.append("i.status = ?")
+            params.append(status)
+        if severity:
+            clauses.append("i.severity = ?")
+            params.append(severity)
+        if batch_id:
+            clauses.append("i.log_batch_id = ?")
+            params.append(batch_id)
+        if query.strip():
+            pattern = f"%{query.strip()}%"
+            clauses.append(
+                "(i.title LIKE ? OR i.root_candidate LIKE ? OR i.fault_mode LIKE ? "
+                "OR i.external_incident_id LIKE ? OR b.filename LIKE ?)"
+            )
+            params.extend([pattern] * 5)
+
+        where_sql = " AND ".join(clauses)
+        count_row = self.query_one(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM incidents i
+            LEFT JOIN log_batches b ON b.id = i.log_batch_id
+            WHERE {where_sql}
+            """,
+            params,
+        ) or {}
+        total = int(count_row.get("total") or 0)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        current_page = min(max(1, page), total_pages)
+        offset = (current_page - 1) * page_size
+        items = self.query_all(
+            f"""
+            SELECT i.id, i.project_id, i.log_batch_id, i.external_incident_id,
+                   i.graph_incident_id, i.title, i.severity, i.status,
+                   i.root_candidate, i.root_confidence, i.fault_mode, i.chain_json,
+                   i.resolution_note, i.resolved_at, i.created_at, i.updated_at
+            FROM incidents i
+            LEFT JOIN log_batches b ON b.id = i.log_batch_id
+            WHERE {where_sql}
+            ORDER BY i.created_at DESC, i.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, offset],
+        )
+        return {
+            "items": items,
+            "page": current_page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+        }
+
     def get_incident(self, incident_id: str) -> dict[str, Any] | None:
         return self.query_one("SELECT * FROM incidents WHERE id = ?", (incident_id,))
 

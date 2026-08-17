@@ -664,6 +664,10 @@
 .report-center-summary b { margin-left: 4px; color: var(--ink-950); font-size: 14px; }
 .report-status-spinner { width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 .report-processing-copy { color: var(--brand); font-size: 11px; white-space: nowrap; }
+.incident-pagination { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; color: var(--ink-500); font-size: 12px; }
+.incident-pagination-controls { display: flex; align-items: center; justify-content: flex-end; gap: 5px; flex-wrap: wrap; }
+.incident-pagination-controls label { display: flex; align-items: center; gap: 6px; margin-right: 5px; }
+.incident-pagination-controls .select { width: auto; min-width: 66px; min-height: 31px; padding: 4px 8px; }
 .batch-report-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 2px 2px 12px; border-bottom: 1px solid var(--line); }
 .batch-report-header h1 { margin: 2px 0 7px; font-size: clamp(27px, 3vw, 36px); }
 .batch-report-header p { max-width: 760px; margin: 0; color: var(--ink-600); }
@@ -764,6 +768,8 @@
   .batch-report-meta > div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
 }
 @media (max-width: 760px) {
+  .incident-pagination { align-items: flex-start; flex-direction: column; }
+  .incident-pagination-controls { justify-content: flex-start; }
   .report-generation-guide { grid-template-columns: 1fr; }
   .report-generation-guide > i { display: none; }
   .overview-workflow-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }

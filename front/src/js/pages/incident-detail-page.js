@@ -13,6 +13,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
   let includeEvents = false;
   let chainExpanded = false;
   let graphController = null;
+  const returnPath = incidentListReturnPath(project.id);
 
   async function load() {
     try {
@@ -79,7 +80,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
     content.innerHTML = `
       <div class="page-header">
         <div>
-          <a class="link" href="#/projects/${project.id}/incidents" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:8px;font-size:13px">
+          <a class="link" href="#${escapeHtml(returnPath)}" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:8px;font-size:13px">
             ← 返回故障列表
           </a>
           <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -372,6 +373,14 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
   }
 
   await load();
+}
+
+function incidentListReturnPath(projectId) {
+  const fallback = `/projects/${encodeURIComponent(projectId)}/incidents?page=1&page_size=20`;
+  const query = new URLSearchParams(window.location.hash.split("?")[1] || "");
+  const requested = query.get("return") || "";
+  const expected = `/projects/${encodeURIComponent(projectId)}/incidents`;
+  return requested === expected || requested.startsWith(`${expected}?`) ? requested : fallback;
 }
 
 function selected(value, current) { return value === current ? "selected" : ""; }

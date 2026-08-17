@@ -128,6 +128,40 @@ def test_log_batch_progress_is_stored_in_summary_json(tmp_path) -> None:
     assert legacy_summary["progress_message"] == "正在执行图谱 RCA 根因推理"
 
 
+def test_incidents_are_paginated_and_filtered_in_database(tmp_path) -> None:
+    database = SystemDatabase(tmp_path / "incident-pages.db")
+    user = database.create_user("operator", "hash", "Operator", "EMP-001")
+    project = database.create_project(user["id"], "Order", "")
+    batch = database.create_log_batch(
+        project["id"], "logs.zip", "/tmp/logs.zip", "", "", "/tmp/out", user["id"]
+    )
+    for index in range(23):
+        database.upsert_incident(
+            {
+                "project_id": project["id"],
+                "log_batch_id": batch["id"],
+                "external_incident_id": f"I{index:05d}",
+                "graph_incident_id": f"batch:I{index:05d}",
+                "title": f"故障 {index}",
+                "severity": "high" if index % 2 == 0 else "medium",
+                "root_candidate": "redis-primary" if index % 2 == 0 else "api-gateway",
+            }
+        )
+
+    second_page = database.paginate_incidents(project["id"], page=2, page_size=10)
+    assert second_page["total"] == 23
+    assert second_page["total_pages"] == 3
+    assert second_page["page"] == 2
+    assert len(second_page["items"]) == 10
+
+    filtered = database.paginate_incidents(
+        project["id"], severity="high", query="redis", page=1, page_size=10
+    )
+    assert filtered["total"] == 12
+    assert len(filtered["items"]) == 10
+    assert all(item["severity"] == "high" for item in filtered["items"])
+
+
 def test_log_batch_report_requires_explicit_generation(tmp_path) -> None:
     database = SystemDatabase(tmp_path / "report.db")
     user = database.create_user("operator", "hash", "Operator", "EMP-001")

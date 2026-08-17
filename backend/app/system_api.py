@@ -1432,6 +1432,10 @@ def list_incidents(
     response: Response,
     incident_status: str = Query("", alias="status"),
     severity: str = Query(""),
+    batch_id: str = Query(""),
+    query: str = Query("", alias="q", max_length=200),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     database = get_system_db()
@@ -1442,12 +1446,17 @@ def list_incidents(
         raise HTTPException(status_code=400, detail="筛选条件无效")
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
-    return {
-        "items": [
-            _incident_result(item)
-            for item in database.list_incidents(project_id, incident_status, severity)
-        ]
-    }
+    result = database.paginate_incidents(
+        project_id,
+        status=incident_status,
+        severity=severity,
+        batch_id=batch_id.strip(),
+        query=query,
+        page=page,
+        page_size=page_size,
+    )
+    result["items"] = [_incident_result(item) for item in result["items"]]
+    return result
 
 
 @router.get("/projects/{project_id}/incidents/{incident_id}")

@@ -127,6 +127,10 @@ export const api = {
     const params = new URLSearchParams();
     if (filters.status) params.set("status", filters.status);
     if (filters.severity) params.set("severity", filters.severity);
+    if (filters.batch_id) params.set("batch_id", filters.batch_id);
+    if (filters.q) params.set("q", filters.q);
+    params.set("page", String(filters.page || 1));
+    params.set("page_size", String(filters.page_size || 20));
     const query = params.toString();
     return request(`/projects/${id}/incidents${query ? `?${query}` : ""}`);
   },

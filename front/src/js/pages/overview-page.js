@@ -36,16 +36,17 @@ export async function renderOverviewPage(root, project) {
         ${stat("故障解决率", `${dashboard.incidents ? Math.round(((dashboard.status_dist?.resolved || 0) / dashboard.incidents) * 100) : 0}%`, `累计故障 ${dashboard.incidents || 0} 起 (${dashboard.status_dist?.resolved || 0} 已闭环)`)}
       </div>
 
-      <!-- 推荐工作流：顶部横向平铺三步引导条 (消除原本左侧的大量留白) -->
+      <!-- 推荐工作流：架构、日志、根因、综合报告四步闭环 -->
       <section class="card" style="margin-bottom:20px;padding:16px 20px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
           <h2 style="font-size:14px;font-weight:700;margin:0;color:var(--ink-800)">推荐分析工作流</h2>
-          <span style="font-size:12px;color:var(--ink-500)">三步快速完成根因定位与推理</span>
+          <span style="font-size:12px;color:var(--ink-500)">四步完成根因定位、验证与综合分析</span>
         </div>
-        <div style="display:grid;grid-template-columns: repeat(3, 1fr);gap:16px">
+        <div style="display:grid;grid-template-columns: repeat(4, 1fr);gap:12px" class="overview-workflow-grid">
           ${horizontalStep(project.id, "01", "导入架构描述", "由大模型抽取节点与服务依赖", "architecture")}
           ${horizontalStep(project.id, "02", "日志解析检测", "滑动窗口检测日志并提取证据", "logs")}
           ${horizontalStep(project.id, "03", "验证根因与链路", "结合图谱联合推理定位根因", "incidents")}
+          ${horizontalStep(project.id, "04", "生成综合报告", "汇总节点频次、传播路径与治理建议", "reports")}
         </div>
       </section>
 
@@ -86,7 +87,7 @@ export async function renderOverviewPage(root, project) {
                 ${batches.slice(0, 5).map((b) => `
                   <tr>
                     <td>
-                      <a class="table-title" href="#/projects/${project.id}/logs/${b.id}" title="查看综合诊断报告">${escapeHtml(b.filename)}</a>
+                      <span class="table-title">${escapeHtml(b.filename)}</span>
                       <span class="table-subtitle">${formatDate(b.created_at)}</span>
                     </td>
                     <td>
@@ -98,7 +99,7 @@ export async function renderOverviewPage(root, project) {
                         ${b.summary?.incidents ?? 0} 段异常
                       </a>
                     </td>
-                    <td><a class="button button-secondary button-small" href="#/projects/${project.id}/logs/${b.id}">综合报告</a></td>
+                    <td><a class="button button-secondary button-small" href="#/projects/${project.id}/incidents?batch=${b.id}">查看故障</a></td>
                   </tr>
                 `).join("")}
               </tbody></table></div>

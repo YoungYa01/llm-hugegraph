@@ -1,46 +1,26 @@
 import { user } from "./auth.js";
 import { APP_VERSION } from "./config.js";
+import { bindNavigationTransitions, renderSidebarContext, renderSidebarNavigation } from "./navigation.js";
 import { escapeHtml } from "./ui.js";
 import { taskManager } from "./taskManager.js";
 
-const icons = {
-  overview: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>`,
-  architecture: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>`,
-  logs: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>`,
-  incidents: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>`,
-};
-
 const navItems = [
-  ["overview", "总览"],
+  ["overview", "项目总览"],
   ["architecture", "系统架构拓扑"],
   ["logs", "日志解析检测"],
   ["incidents", "故障根因定位"],
+  ["reports", "综合分析报告"],
 ];
 
 export function projectShell(project, current, content) {
   const account = user() || {};
   const initial = (account.display_name || account.username || "U").slice(0, 1).toUpperCase();
-  const navigation = navItems.map(([key, label]) => {
-    const suffix = key === "overview" ? "overview" : key;
-    return `<a class="nav-link ${key === current ? "active" : ""}" href="#/projects/${encodeURIComponent(project.id)}/${suffix}">
-      <span class="nav-icon">${icons[key]}</span><span>${label}</span>
-    </a>`;
-  }).join("");
 
   return `<div class="app-shell" id="app-shell">
     <aside class="sidebar">
       <a class="brand" href="#/projects"><span class="brand-mark">L</span><span>LogScope RCA <small class="brand-version">${escapeHtml(APP_VERSION)}</small></span></a>
-      
-      <!-- 项目选择与切回项目列表 (专属项目层级) -->
-      <a class="project-switcher" href="#/projects" title="点击返回所有项目列表" style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;margin-bottom:14px">
-        <div>
-          <small style="display:block;font-size:11px;color:rgba(255,255,255,0.6)">当前项目 · 点击切换</small>
-          <strong style="font-size:13px;color:#ffffff">${escapeHtml(project.name)}</strong>
-        </div>
-        <span style="font-size:11px;padding:3px 7px;border-radius:4px;background:rgba(255,255,255,0.12);color:rgba(255,255,255,0.85);white-space:nowrap">所有项目 ‹</span>
-      </a>
-
-      <nav class="nav">${navigation}</nav>
+      ${renderSidebarContext(project)}
+      <nav class="sidebar-navigation" aria-label="主导航">${renderSidebarNavigation({ project, current, isAdmin: account.role === "admin" })}</nav>
 
       <!-- 底部账号与安全区 (专属账号退出层级) -->
       <div class="sidebar-footer" style="padding-top:14px;border-top:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:space-between">
@@ -60,7 +40,7 @@ export function projectShell(project, current, content) {
       <header class="topbar">
         <div style="display:flex;align-items:center;gap:10px">
           <button class="button button-ghost mobile-menu" id="mobile-menu" aria-label="打开菜单">☰</button>
-          <div class="breadcrumb"><strong>${escapeHtml(project.name)}</strong> / ${escapeHtml(navItems.find(([key]) => key === current)?.[1] || "项目")}</div>
+          <div class="breadcrumb">项目工作台 / <strong>${escapeHtml(project.name)}</strong> / ${escapeHtml(navItems.find(([key]) => key === current)?.[1] || "项目")}</div>
         </div>
         <span class="badge badge-${escapeHtml(project.status)}">${project.status === "active" ? "运行中" : escapeHtml(project.status)}</span>
       </header>
@@ -137,6 +117,7 @@ function updateGlobalTaskWidget() {
 let isShellBound = false;
 
 export function bindShell({ onLogout }) {
+  bindNavigationTransitions(document);
   document.querySelector("#mobile-menu")?.addEventListener("click", () => {
     document.querySelector("#app-shell")?.classList.toggle("menu-open");
   });

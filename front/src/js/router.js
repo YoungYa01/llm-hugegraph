@@ -2,10 +2,11 @@ const listeners = new Set();
 
 export function route() {
   const raw = location.hash.replace(/^#/, "") || "/projects";
-  const path = raw.split("?")[0];
+  const [path, queryString = ""] = raw.split("?", 2);
+  const query = new URLSearchParams(queryString);
   const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
   if (parts[0] !== "projects") return { name: "projects", params: {} };
-  if (!parts[1]) return { name: "projects", params: {} };
+  if (!parts[1]) return { name: "projects", params: { tab: query.get("tab") || "projects" } };
   const params = { projectId: parts[1] };
   if (!parts[2] || parts[2] === "overview") return { name: "overview", params };
   if (parts[2] === "architecture") return { name: "architecture", params };
@@ -13,6 +14,8 @@ export function route() {
   if (parts[2] === "logs") return { name: "logs", params };
   if (parts[2] === "incidents" && parts[3]) return { name: "incident-detail", params: { ...params, incidentId: parts[3] } };
   if (parts[2] === "incidents") return { name: "incidents", params };
+  if (parts[2] === "reports" && parts[3]) return { name: "log-report", params: { ...params, batchId: parts[3] } };
+  if (parts[2] === "reports") return { name: "reports", params };
   return { name: "overview", params };
 }
 

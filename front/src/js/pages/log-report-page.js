@@ -4,7 +4,7 @@ import { projectShell } from "../shell.js";
 import { badge, emptyState, errorState, escapeHtml, formatConfidence, formatDate, loading } from "../ui.js";
 
 export async function renderLogReportPage(root, project, batchId) {
-  root.innerHTML = projectShell(project, "logs", `<div id="page-content">${loading("正在生成批次 RCA 综合报告…")}</div>`);
+  root.innerHTML = projectShell(project, "reports", `<div id="page-content">${loading("正在读取批次 RCA 综合报告…")}</div>`);
   const content = root.querySelector("#page-content");
 
   async function load() {
@@ -26,7 +26,7 @@ export async function renderLogReportPage(root, project, batchId) {
       <div class="batch-report-page">
         <header class="batch-report-header">
           <div>
-            <a class="batch-report-back" href="#/projects/${project.id}/logs">← 返回日志批次</a>
+            <a class="batch-report-back" href="#/projects/${project.id}/reports">← 返回综合分析报告</a>
             <div class="batch-report-kicker">BATCH RCA REPORT</div>
             <h1>综合诊断报告</h1>
             <p>汇总本批次已经完成根因分析的故障结论，定位高频故障节点、共性模式与治理优先级。</p>
@@ -52,7 +52,7 @@ export async function renderLogReportPage(root, project, batchId) {
         </section>
 
         <section class="batch-report-section batch-report-conclusion">
-          ${sectionHeading("01", "本批次综合结论", "所有数量由已持久化的 RCA 结果实时统计，描述不会改变根因判定。")}
+          ${sectionHeading("01", "本批次综合结论", "")}
           ${conclusionList(report.executive_conclusions || [])}
           <div class="batch-report-status-strip">
             ${severityChip("严重", summary.severity_dist?.critical || 0, "critical")}
@@ -68,7 +68,7 @@ export async function renderLogReportPage(root, project, batchId) {
         </section>
 
         <section class="batch-report-section">
-          ${sectionHeading("02", "节点故障频次", "根因命中和传播链出现采用两个独立口径，避免把不同含义的次数简单相加。")}
+          ${sectionHeading("02", "节点故障频次", "")}
           <div class="batch-report-legend"><span><i class="legend-root"></i>根因命中</span><span><i class="legend-chain"></i>传播链出现</span></div>
           <div class="report-chart report-chart-wide" id="report-node-chart"></div>
           ${nodeTable(nodes)}
@@ -76,7 +76,7 @@ export async function renderLogReportPage(root, project, batchId) {
 
         <div class="batch-report-two-column">
           <section class="batch-report-section">
-            ${sectionHeading("03", "故障模式分布", "将底层故障码归一为用户可理解的故障类型。")}
+            ${sectionHeading("03", "故障模式分布", "")}
             <div class="report-chart" id="report-mode-chart"></div>
             ${faultModeList(report.fault_modes || [])}
           </section>
@@ -88,18 +88,13 @@ export async function renderLogReportPage(root, project, batchId) {
         </div>
 
         <section class="batch-report-section">
-          ${sectionHeading("05", "重点故障节点分析", "聚焦本批次根因命中最高的节点，并给出可回溯的代表证据。")}
+          ${sectionHeading("05", "重点故障节点分析", "")}
           ${focusNodeCards(report.focus_nodes || [], project.id)}
         </section>
 
         <section class="batch-report-section">
           ${sectionHeading("06", "高频故障传播路径", "按完整传播链聚合排名；点击路径可查看其代表故障。")}
           <div class="report-chart report-chart-wide" id="report-path-chart"></div>
-        </section>
-
-        <section class="batch-report-section batch-report-detail-section">
-          ${sectionHeading("07", "RCA 结论审计明细", "保留每个异常窗口的根因、模式、传播路径、状态和评分，便于逐条核验。")}
-          ${incidentTable(incidents, project.id)}
         </section>
       </div>
     `;

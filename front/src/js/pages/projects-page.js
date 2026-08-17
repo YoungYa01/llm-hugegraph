@@ -1,5 +1,7 @@
 import { api } from "../api.js";
 import { setUser, user } from "../auth.js";
+import { APP_VERSION } from "../config.js";
+import { bindNavigationTransitions, renderSidebarContext, renderSidebarNavigation } from "../navigation.js";
 import { cacheProject } from "../state.js";
 import { badge, emptyState, errorState, escapeHtml, formatDate, loading, setBusy, toast } from "../ui.js";
 import { renderGraphAdminContent } from "./graph-admin-page.js";
@@ -13,44 +15,24 @@ const SVG = {
   plus: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`,
 };
 
-export async function renderProjectsPage(root, { onLogout }) {
+export async function renderProjectsPage(root, { onLogout, initialTab = "projects" }) {
   const account = user() || {};
   const isAdmin = account.role === "admin";
   const initial = (account.display_name || account.username || "U").slice(0, 1).toUpperCase();
-  let currentTab = "projects"; // "projects" | "users" | "graph"
+  const allowedTabs = isAdmin ? ["projects", "users", "graph"] : ["projects"];
+  const currentTab = allowedTabs.includes(initialTab) ? initialTab : "projects";
 
   function renderShell() {
     root.innerHTML = `
       <div class="app-shell" id="app-shell">
         <aside class="sidebar">
-          <a class="brand" href="#/projects" style="margin-bottom:18px;text-decoration:none">
+          <a class="brand" href="#/projects">
             <span class="brand-mark">L</span>
-            <span>LogScope RCA <small class="brand-version">v2.0</small></span>
+            <span>LogScope RCA <small class="brand-version">${escapeHtml(APP_VERSION)}</small></span>
           </a>
 
-          <div style="padding:10px 12px;margin-bottom:16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
-            <small style="display:block;font-size:11px;color:rgba(255,255,255,0.5)">控制台与项目空间</small>
-            <strong style="font-size:13px;color:#ffffff;display:flex;align-items:center;gap:6px;margin-top:2px">
-              数据管理中心
-              <span style="font-size:10px;padding:1px 6px;border-radius:4px;background:${isAdmin ? '#2563eb' : 'rgba(255,255,255,0.15)'};color:#fff;font-weight:600">
-                ${isAdmin ? '管理员' : '普通用户'}
-              </span>
-            </strong>
-          </div>
-
-          <nav class="nav">
-            <a class="nav-link ${currentTab === "projects" ? "active" : ""}" id="tab-projects-btn" href="javascript:void(0)">
-              <span class="nav-icon">${SVG.projects}</span><span>项目列表</span>
-            </a>
-            ${isAdmin ? `
-              <a class="nav-link ${currentTab === "users" ? "active" : ""}" id="tab-users-btn" href="javascript:void(0)">
-                <span class="nav-icon">${SVG.users}</span><span>用户与权限管理</span>
-              </a>
-              <a class="nav-link ${currentTab === "graph" ? "active" : ""}" id="tab-graph-btn" href="javascript:void(0)">
-                <span class="nav-icon">${SVG.graph}</span><span>图谱管理</span>
-              </a>
-            ` : ""}
-          </nav>
+          ${renderSidebarContext()}
+          <nav class="sidebar-navigation" aria-label="主导航">${renderSidebarNavigation({ current: currentTab, isAdmin })}</nav>
 
           <!-- 底部账号与退出登录 -->
           <div class="sidebar-footer" style="padding-top:14px;border-top:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:space-between">
@@ -70,8 +52,9 @@ export async function renderProjectsPage(root, { onLogout }) {
         <section class="workspace">
           <header class="topbar">
             <div style="display:flex;align-items:center;gap:10px">
+              <button class="button button-ghost mobile-menu" id="mobile-menu" aria-label="打开菜单">☰</button>
               <span style="font-size:14px;font-weight:700;color:var(--ink-900)">
-                ${{ projects: "项目空间", users: "全站用户与权限管理", graph: "HugeGraph 图谱管理" }[currentTab]}
+                ${{ projects: "项目空间 / 项目列表", users: "系统管理 / 用户与权限管理", graph: "系统管理 / 图谱管理" }[currentTab]}
               </span>
             </div>
             <div style="display:flex;align-items:center;gap:12px">
@@ -91,35 +74,17 @@ export async function renderProjectsPage(root, { onLogout }) {
     root.querySelector("#logout-button")?.addEventListener("click", onLogout);
     root.querySelector("#open-my-profile")?.addEventListener("click", () => showProfileModal(root));
     root.querySelector("#topbar-my-profile")?.addEventListener("click", () => showProfileModal(root));
-
-    root.querySelector("#tab-projects-btn")?.addEventListener("click", async () => {
-      if (currentTab !== "projects") {
-        currentTab = "projects";
-        renderShell();
-        await loadProjectsTab();
-      }
-    });
-
-    root.querySelector("#tab-users-btn")?.addEventListener("click", async () => {
-      if (currentTab !== "users") {
-        currentTab = "users";
-        renderShell();
-        await loadUsersTab();
-      }
-    });
-
-    root.querySelector("#tab-graph-btn")?.addEventListener("click", async () => {
-      if (currentTab !== "graph") {
-        currentTab = "graph";
-        renderShell();
-        const content = root.querySelector("#main-workspace-content");
-        if (content) await renderGraphAdminContent(content);
-      }
-    });
+    bindNavigationTransitions(root);
+    root.querySelector("#mobile-menu")?.addEventListener("click", () => root.querySelector("#app-shell")?.classList.toggle("menu-open"));
+    root.querySelectorAll(".nav-link").forEach((link) => link.addEventListener("click", () => root.querySelector("#app-shell")?.classList.remove("menu-open")));
   }
 
   renderShell();
-  await loadProjectsTab();
+  if (currentTab === "users") await loadUsersTab();
+  else if (currentTab === "graph") {
+    const content = root.querySelector("#main-workspace-content");
+    if (content) await renderGraphAdminContent(content);
+  } else await loadProjectsTab();
 
   // 1. 加载项目列表视图
   async function loadProjectsTab() {

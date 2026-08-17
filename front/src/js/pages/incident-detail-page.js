@@ -91,7 +91,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           </p>
         </div>
         <div class="page-actions" style="display:flex;align-items:center;gap:8px">
-          ${incident.log_batch_id ? `<a class="button button-secondary button-small" href="#/projects/${project.id}/logs/${incident.log_batch_id}">本批次综合报告</a>` : ""}
+          ${incident.log_batch_id ? `<a class="button button-secondary button-small" href="#/projects/${project.id}/reports">进入综合报告中心</a>` : ""}
           ${badge(incident.severity, "severity")}
           ${badge(incident.status)}
         </div>

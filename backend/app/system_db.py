@@ -92,6 +92,11 @@ class SystemDatabase:
                     summary_json TEXT NOT NULL DEFAULT '{}',
                     rca_json TEXT NOT NULL DEFAULT '[]',
                     report_json TEXT NOT NULL DEFAULT '{}',
+                    report_status TEXT NOT NULL DEFAULT 'not_generated',
+                    report_requested_by TEXT REFERENCES users(id),
+                    report_requested_at TEXT,
+                    report_generated_at TEXT,
+                    report_error_message TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL,
@@ -168,6 +173,16 @@ class SystemDatabase:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
                 if table == "log_batches" and "report_json" not in cols:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN report_json TEXT NOT NULL DEFAULT '{{}}'")
+                if table == "log_batches" and "report_status" not in cols:
+                    connection.execute("ALTER TABLE log_batches ADD COLUMN report_status TEXT NOT NULL DEFAULT 'not_generated'")
+                if table == "log_batches" and "report_requested_by" not in cols:
+                    connection.execute("ALTER TABLE log_batches ADD COLUMN report_requested_by TEXT")
+                if table == "log_batches" and "report_requested_at" not in cols:
+                    connection.execute("ALTER TABLE log_batches ADD COLUMN report_requested_at TEXT")
+                if table == "log_batches" and "report_generated_at" not in cols:
+                    connection.execute("ALTER TABLE log_batches ADD COLUMN report_generated_at TEXT")
+                if table == "log_batches" and "report_error_message" not in cols:
+                    connection.execute("ALTER TABLE log_batches ADD COLUMN report_error_message TEXT NOT NULL DEFAULT ''")
 
     # Graph administration and audit
     def create_graph_admin_operation(
@@ -571,7 +586,8 @@ class SystemDatabase:
         rows = self.query_all(
             """
             SELECT id, project_id, filename, train_filename, output_path, status, progress, progress_message, summary_json,
-                   error_message, created_by, created_at, completed_at
+                   report_status, report_requested_by, report_requested_at, report_generated_at,
+                   report_error_message, error_message, created_by, created_at, completed_at
             FROM log_batches WHERE project_id = ? ORDER BY created_at DESC
             """,
             (project_id,),
@@ -608,15 +624,48 @@ class SystemDatabase:
         return rows
 
     def complete_log_batch(self, batch_id: str, summary_json: str, rca_json: str, report_json: str = "{}") -> None:
+        del report_json  # 报告必须由用户在 RCA 完成后显式发起生成。
         self.execute(
-            "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, report_json = ?, completed_at = ? WHERE id = ?",
-            (summary_json, rca_json, report_json, utc_now(), batch_id),
+            "UPDATE log_batches SET status = 'completed', progress = 100, progress_message = '日志解析与 RCA 诊断完成', summary_json = ?, rca_json = ?, report_json = '{}', report_status = 'not_generated', report_requested_by = NULL, report_requested_at = NULL, report_generated_at = NULL, report_error_message = '', completed_at = ? WHERE id = ?",
+            (summary_json, rca_json, utc_now(), batch_id),
         )
 
     def update_log_batch_report(self, batch_id: str, report_json: str) -> None:
         self.execute(
             "UPDATE log_batches SET report_json = ? WHERE id = ?",
             (report_json, batch_id),
+        )
+
+    def start_log_batch_report(self, batch_id: str, requested_by: str) -> dict[str, Any] | None:
+        self.execute(
+            """
+            UPDATE log_batches
+            SET report_status = 'processing', report_requested_by = ?, report_requested_at = ?,
+                report_generated_at = NULL, report_error_message = '', report_json = '{}'
+            WHERE id = ?
+            """,
+            (requested_by, utc_now(), batch_id),
+        )
+        return self.get_log_batch(batch_id)
+
+    def complete_log_batch_report(self, batch_id: str, report_json: str) -> None:
+        self.execute(
+            """
+            UPDATE log_batches
+            SET report_status = 'completed', report_json = ?, report_generated_at = ?, report_error_message = ''
+            WHERE id = ?
+            """,
+            (report_json, utc_now(), batch_id),
+        )
+
+    def fail_log_batch_report(self, batch_id: str, error_message: str) -> None:
+        self.execute(
+            """
+            UPDATE log_batches
+            SET report_status = 'failed', report_error_message = ?
+            WHERE id = ?
+            """,
+            (str(error_message)[:4000], batch_id),
         )
 
     def update_log_batch_progress(

@@ -177,8 +177,8 @@ export async function renderArchitecturePage(root, project) {
           ${graph.warnings?.length ? `<div class="notice notice-warning" style="margin-bottom:12px">${escapeHtml(graph.warnings.join("；"))}</div>` : ""}
           ${graph.nodes.length ? `<div class="architecture-graph-controls">
             <div class="graph-view-switch" role="group" aria-label="图谱展示方式">
-              <button type="button" class="graph-view-option${graphViewMode === "force" ? " active" : ""}" data-graph-view="force"><strong>关系图</strong><small>自由拓扑</small></button>
-              <button type="button" class="graph-view-option${graphViewMode === "swimlane" ? " active" : ""}" data-graph-view="swimlane"><strong>泳道图</strong><small>按资源域</small></button>
+              <button type="button" class="graph-view-option${graphViewMode === "force" ? " active" : ""}" data-graph-view="force">关系图</button>
+              <button type="button" class="graph-view-option${graphViewMode === "swimlane" ? " active" : ""}" data-graph-view="swimlane">泳道图</button>
             </div>
             <form class="graph-node-search" id="graph-node-search" role="search">
               <span class="graph-node-search-icon" aria-hidden="true">⌕</span>

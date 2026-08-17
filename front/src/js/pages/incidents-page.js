@@ -53,7 +53,7 @@ export async function renderIncidentsPage(root, project) {
     const selectedBatch = batchMap[filters.batch_id];
 
     content.innerHTML = `
-      <div class="page-header"><div><h1>故障根因定位</h1><p>日志证据、架构路径和处理闭环都保留在同一个故障记录中。</p></div><div class="page-actions">${selectedBatch ? `<a class="button button-secondary" href="#/projects/${project.id}/logs/${selectedBatch.id}">查看当前批次综合报告</a>` : ""}<a class="button button-primary" href="#/projects/${project.id}/logs">＋ 分析新日志</a></div></div>
+      <div class="page-header"><div><h1>故障根因定位</h1><p>日志证据、架构路径和处理闭环都保留在同一个故障记录中。</p></div><div class="page-actions">${selectedBatch ? `<a class="button button-secondary" href="#/projects/${project.id}/reports">进入综合报告中心</a>` : ""}<a class="button button-primary" href="#/projects/${project.id}/logs">＋ 分析新日志</a></div></div>
       <div class="toolbar">
         <div class="filters">
           <input class="input" id="incident-search" value="${escapeHtml(query)}" placeholder="搜索标题、候选或故障模式" style="min-width:240px" />

@@ -120,6 +120,7 @@ export const api = {
     `/projects/${projectId}/logs/${batchId}/report?refresh=${Date.now()}`,
     { cache: "no-store" },
   ),
+  generateLogReport: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}/report/generate`, { method: "POST" }),
   deleteBatch: (projectId, batchId) => request(`/projects/${projectId}/logs/${batchId}`, { method: "DELETE" }),
 
   incidents: (id, filters = {}) => {

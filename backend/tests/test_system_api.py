@@ -143,6 +143,20 @@ def test_log_batch_report_api_returns_node_frequency(tmp_path, monkeypatch) -> N
     app.dependency_overrides[auth.require_user] = lambda: operator
     client = TestClient(app)
 
+    unavailable = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
+    assert unavailable.status_code == 409
+
+    generated = client.post(f"/api/projects/{project['id']}/logs/{batch['id']}/report/generate")
+    assert generated.status_code == 202
+    assert generated.json()["message"] == "report_analysis_started"
+    assert generated.json()["batch"]["report_status"] == "processing"
+
+    stored_batch = database.get_log_batch(batch["id"])
+    assert stored_batch["report_status"] == "completed"
+    assert stored_batch["report_requested_by"] == operator["id"]
+    assert stored_batch["report_requested_at"]
+    assert stored_batch["report_generated_at"]
+
     response = client.get(f"/api/projects/{project['id']}/logs/{batch['id']}/report")
 
     assert response.status_code == 200

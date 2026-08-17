@@ -1098,7 +1098,7 @@ async def _run_log_analysis_task(
         )
         await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
         details = _load_details(output_dir)
-        saved_incidents = _persist_incidents(
+        _persist_incidents(
             database,
             project_id,
             batch_id,
@@ -1113,27 +1113,10 @@ async def _run_log_analysis_task(
         else:
             summary = {"duration_seconds": total_duration}
 
-        report = build_log_batch_report(
-            batch={
-                **(database.get_log_batch(batch_id) or {}),
-                "summary": summary,
-            },
-            incidents=saved_incidents,
-        )
-        report_json = json.dumps(report, ensure_ascii=False)
-        try:
-            (output_dir / "comprehensive_diagnostic_report.json").write_text(
-                json.dumps(report, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to write diagnostic report artifact batch=%s: %s", batch_id, exc)
-
         database.complete_log_batch(
             batch_id,
             json.dumps(summary, ensure_ascii=False),
             json.dumps(import_data.get("rca") or [], ensure_ascii=False),
-            report_json,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)
@@ -1225,6 +1208,59 @@ def get_log_batch(
     return {"batch": result}
 
 
+async def _run_log_report_task(batch_id: str, project_id: str) -> None:
+    database = get_system_db()
+    try:
+        item = database.get_log_batch(batch_id)
+        if not item or item.get("project_id") != project_id:
+            raise RuntimeError("日志批次不存在")
+        batch = _batch_result(item)
+        incidents = _list_batch_incidents(database, project_id, batch_id)
+        report = await run_in_threadpool(
+            lambda: build_log_batch_report(batch=batch, incidents=incidents)
+        )
+        report_json = json.dumps(report, ensure_ascii=False)
+        raw_output_path = str(item.get("output_path") or "").strip()
+        if raw_output_path:
+            try:
+                output_path = Path(raw_output_path)
+                if output_path.exists() and output_path.is_dir():
+                    (output_path / "comprehensive_diagnostic_report.json").write_text(
+                        json.dumps(report, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to write diagnostic report artifact batch=%s: %s", batch_id, exc)
+        database.complete_log_batch_report(batch_id, report_json)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Log report generation failed project=%s batch=%s", project_id, batch_id)
+        database.fail_log_batch_report(batch_id, str(exc))
+
+
+@router.post("/projects/{project_id}/logs/{batch_id}/report/generate", status_code=202)
+async def generate_log_batch_report(
+    project_id: str,
+    batch_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    database = get_system_db()
+    _project_for_user(project_id, user, database)
+    item = database.get_log_batch(batch_id)
+    if not item or item.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="日志批次不存在")
+    if item.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="日志根因分析完成后才能生成综合报告")
+    report_status = str(item.get("report_status") or "not_generated")
+    if report_status == "processing":
+        return {"message": "report_analysis_in_progress", "batch": _batch_result(item)}
+    if report_status == "completed":
+        return {"message": "report_already_generated", "batch": _batch_result(item)}
+    started = database.start_log_batch_report(batch_id, str(user["id"])) or item
+    background_tasks.add_task(_run_log_report_task, batch_id, project_id)
+    return {"message": "report_analysis_started", "batch": _batch_result(started)}
+
+
 @router.get("/projects/{project_id}/logs/{batch_id}/report")
 def get_log_batch_report(
     project_id: str,
@@ -1237,14 +1273,15 @@ def get_log_batch_report(
     item = database.get_log_batch(batch_id)
     if not item or item.get("project_id") != project_id:
         raise HTTPException(status_code=404, detail="日志批次不存在")
+    if str(item.get("report_status") or "not_generated") != "completed":
+        raise HTTPException(status_code=409, detail="综合分析报告尚未生成，请先在综合分析报告页面发起智能分析")
 
     batch = _batch_result(item)
     # Resolution status is mutable after analysis completes. Rebuild from live
     # incident rows so counts and detail statuses never come from stale report_json.
     incidents = _list_batch_incidents(database, project_id, batch_id)
     report = build_log_batch_report(batch=batch, incidents=incidents)
-    if item.get("status") == "completed":
-        database.update_log_batch_report(batch_id, json.dumps(report, ensure_ascii=False))
+    database.update_log_batch_report(batch_id, json.dumps(report, ensure_ascii=False))
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return {"batch": batch, "report": report}
@@ -1470,7 +1507,7 @@ def change_incident_status(
     batch_id = str(updated.get("log_batch_id") or "")
     if batch_id:
         batch = database.get_log_batch(batch_id)
-        if batch and batch.get("project_id") == project_id:
+        if batch and batch.get("project_id") == project_id and batch.get("report_status") == "completed":
             incidents = _list_batch_incidents(database, project_id, batch_id)
             report = build_log_batch_report(
                 batch=_batch_result(batch),

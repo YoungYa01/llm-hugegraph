@@ -250,7 +250,7 @@ function batchesTable(items, projectId) {
 
     // 同名文件加时间副标题
     const showTimeSub = nameCounts[item.filename] > 1;
-    const fileCell = `<a class="table-title" href="#/projects/${projectId}/logs/${item.id}" title="点击查看此批次综合诊断报告">${escapeHtml(item.filename)}</a>${showTimeSub ? `<span class="table-subtitle">${formatDate(item.created_at)}</span>` : ""}${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}`;
+    const fileCell = `<span class="table-title">${escapeHtml(item.filename)}</span>${showTimeSub ? `<span class="table-subtitle">${formatDate(item.created_at)}</span>` : ""}${item.train_filename ? `<span class="table-subtitle">训练集：${escapeHtml(item.train_filename)}</span>` : ""}${item.error_message ? `<span class="table-subtitle" style="color:var(--danger)">${escapeHtml(item.error_message)}</span>` : ""}`;
 
     return `<tr>
       <td>${fileCell}</td>
@@ -259,7 +259,6 @@ function batchesTable(items, projectId) {
       <td><span class="table-subtitle" style="font-weight:600;color:var(--ink-700)">${durationDisplay}</span></td>
       <td>${formatDate(item.completed_at || item.created_at)}</td>
       <td><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-        ${item.status === "completed" ? `<a class="button button-secondary button-small" href="#/projects/${projectId}/logs/${item.id}" title="查看本批次的综合诊断统计">综合报告</a>` : ""}
         <button class="button button-danger button-small" data-delete-batch="${index}">删除</button>
       </div></td>
     </tr>`;

@@ -221,24 +221,9 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           <section class="card">
             <div class="card-header">
               <div>
-                <h2>根因判定依据与日志证据</h2>
-                <p>综合算法评分、日志异常堆栈及拓扑图距离判定。</p>
+                <h2>关键日志堆栈证据</h2>
+                ${renderFormattedEvidence(decisionEvidence)}
               </div>
-            </div>
-            <div class="card-body">
-              <h3 style="font-size:14px;font-weight:700;margin-bottom:8px;color:var(--ink-700)">📊 根因判定依据</h3>
-              ${listHtml(llmReasons, "暂时没有可展示的根因判定依据。")}
-
-              <h3 style="font-size:14px;font-weight:700;margin-top:20px;margin-bottom:8px;color:var(--ink-700)">🔍 关键日志堆栈证据</h3>
-              ${renderFormattedEvidence(decisionEvidence)}
-
-              <h3 style="font-size:14px;font-weight:700;margin-top:20px;margin-bottom:8px;color:var(--ink-700)">🛠️ 推荐验证项</h3>
-              ${listHtml(llmSteps, "当前结论暂未生成验证建议。")}
-
-              ${evidenceNotes.length ? `
-                <h3 style="font-size:14px;font-weight:700;margin-top:20px;margin-bottom:8px;color:var(--danger)">⚠️ 建议补充的证据与注意事项</h3>
-                <div class="notice notice-warning">${evidenceNotes.map((item) => `<p style="margin:0 0 6px">• ${escapeHtml(item)}</p>`).join("")}</div>
-              ` : ""}
             </div>
           </section>
 

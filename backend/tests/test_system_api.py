@@ -410,19 +410,312 @@ def test_rca_prompt_contains_every_architecture_node_and_edge() -> None:
     )
     architecture = GraphResponse(
         nodes=[
-            GraphNode(id="n1", name="API 网关", kind="Service", meta={"aliases": ["api-gateway"]}),
-            GraphNode(id="n2", name="Redis 集群", kind="Cache"),
+            GraphNode(
+                id="n1",
+                name="API 网关",
+                kind="Service",
+                layer="接入层",
+                meta={"aliases": ["api-gateway"], "ip": "10.10.3.10", "port": 8080},
+            ),
+            GraphNode(
+                id="n2",
+                name="Redis 集群",
+                kind="Cache",
+                meta={"host": "redis-prod", "port": 6379, "password": "must-not-leak"},
+            ),
         ],
         edges=[GraphEdge(source="API 网关", target="Redis 集群", type="DEPENDS_ON")],
     )
 
     prompt, _ = service._build_prompt_with_meta({"timeline": []}, {"hypotheses": []}, architecture)
 
-    assert '"node_id": "n1"' in prompt
-    assert '"node_id": "n2"' in prompt
+    assert '["n1","API 网关","SV"' in prompt
+    assert '["n2","Redis 集群","CA"' in prompt
     assert '"api-gateway"' in prompt
-    assert '"source_node_id": "n1"' in prompt
-    assert '"target_node_id": "n2"' in prompt
+    assert '["n1","n2","D"]' in prompt
+    assert '"ip":["10.10.3.10"]' in prompt
+    assert '"p":[8080]' in prompt
+    assert '接入层' not in prompt
+    assert 'must-not-leak' not in prompt
+    assert '\n  "architecture_graph"' not in prompt
+
+
+def test_rca_structured_checks_use_trusted_node_endpoint_and_reject_invented_command() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    architecture = GraphResponse(
+        nodes=[
+            GraphNode(
+                id="redis-id",
+                name="Redis实例2",
+                kind="Instance",
+                meta={"ip": "10.10.3.22", "port": 6379},
+            )
+        ]
+    )
+    analysis = {"hypotheses": [{"rank": 1, "candidate": "Redis实例2", "chain": ["Redis实例2"]}]}
+    fallback = service._fallback_decision(analysis, source="fallback")
+
+    result = service._normalize_model_result(
+        {
+            "selected_node_id": "redis-id",
+            "most_likely_reasons": ["Redis 集群状态异常"],
+            "checks": [
+                {
+                    "node_id": "redis-id",
+                    "action": "检查集群状态",
+                    "target_fields": ["ip", "p"],
+                    "command_template": "redis-cli -h {ip} -p {port} CLUSTER INFO",
+                    "expected_result": "cluster_state:ok",
+                },
+                {
+                    "node_id": "redis-id",
+                    "action": "检查错误地址",
+                    "command": "redis-cli -h 10.10.3.99 -p 6380 PING",
+                },
+            ],
+            "propagation_path": [{"node_id": "redis-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+    )
+
+    assert result["selected_node_runtime"]["ips"] == ["10.10.3.22"]
+    assert "10.10.3.22:6379" in result["most_likely_reasons"][0]
+    assert "redis-cli -h 10.10.3.22 -p 6379" in result["troubleshooting_methods"][0]
+    assert "10.10.3.99" not in result["troubleshooting_methods"][1]
+    assert any("未登记 IP" in warning for warning in result["path_validation_warnings"])
+
+
+def test_cluster_root_lists_every_real_member_without_inventing_instance_root() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    architecture = GraphResponse(
+        nodes=[
+            GraphNode(id="cluster-id", name="Redis生产集群", kind="Cluster"),
+            GraphNode(
+                id="redis-1-id",
+                name="Redis实例1",
+                kind="Instance",
+                meta={"ip": "10.10.3.21", "port": 6379},
+            ),
+            GraphNode(
+                id="redis-2-id",
+                name="Redis实例2",
+                kind="Instance",
+                meta={"host": "redis-2", "ip": "10.10.3.22", "port": 6379},
+            ),
+            GraphNode(id="redis-3-id", name="Redis实例3", kind="Instance"),
+        ],
+        edges=[
+            GraphEdge(source="Redis生产集群", target="Redis实例1", type="HAS_MEMBER"),
+            GraphEdge(source="Redis生产集群", target="Redis实例2", type="HAS_MEMBER"),
+            GraphEdge(source="Redis生产集群", target="Redis实例3", type="HAS_MEMBER"),
+        ],
+    )
+    analysis = {
+        "hypotheses": [
+            {"rank": 1, "candidate": "Redis生产集群", "chain": ["Redis生产集群"]}
+        ]
+    }
+    fallback = service._fallback_decision(analysis, source="fallback")
+
+    result = service._normalize_model_result(
+        {
+            "selected_node_id": "cluster-id",
+            "most_likely_reasons": ["日志只能确认 Redis 集群异常"],
+            "propagation_path": [{"node_id": "cluster-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+        {"root_evidence": "CLUSTERDOWN The cluster is down", "timeline": []},
+    )
+
+    assert result["selected_node_id"] == "cluster-id"
+    assert result["root_scope"] == "cluster"
+    assert result["instance_resolution"] == "unresolved_members_listed"
+    assert [item["node_id"] for item in result["possible_member_nodes"]] == [
+        "redis-1-id",
+        "redis-2-id",
+        "redis-3-id",
+    ]
+    assert result["possible_member_nodes"][0]["target"] == "10.10.3.21:6379"
+    assert result["possible_member_nodes"][1]["ips"] == ["10.10.3.22"]
+    assert result["possible_member_nodes"][2]["metadata_status"] == "missing_endpoint"
+    assert all(not item["direct_evidence"] for item in result["possible_member_nodes"])
+    assert all(item["status"] == "needs_investigation" for item in result["possible_member_nodes"])
+
+    grounded_fallback = service._ground_fallback_in_architecture(
+        fallback,
+        architecture,
+        {"root_evidence": "CLUSTERDOWN The cluster is down"},
+    )
+    assert grounded_fallback["selected_node_id"] == "cluster-id"
+    assert len(grounded_fallback["possible_member_nodes"]) == 3
+
+    guarded = service._normalize_model_result(
+        {
+            "selected_node_id": "redis-2-id",
+            "most_likely_reasons": ["模型猜测实例2异常"],
+            "propagation_path": [{"node_id": "redis-2-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+        {"root_evidence": "CLUSTERDOWN The cluster is down"},
+    )
+    assert guarded["selected_node_id"] == "cluster-id"
+    assert guarded["selected_candidate"] == "Redis生产集群"
+    assert "模型猜测" not in guarded["most_likely_reason"]
+    assert "不足以确认具体故障实例" in guarded["most_likely_reason"]
+    assert any("缺少实例" in item for item in guarded["path_validation_warnings"])
+
+    instance_grounded = service._normalize_model_result(
+        {
+            "selected_node_id": "redis-2-id",
+            "most_likely_reasons": ["redis-2 节点连接失败"],
+            "propagation_path": [{"node_id": "redis-2-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+        {"root_evidence": "redis-2 connection refused"},
+    )
+    assert instance_grounded["selected_node_id"] == "redis-2-id"
+    assert instance_grounded["root_scope"] == "instance"
+
+
+def test_reverse_membership_edges_still_expand_cluster_candidates() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    architecture = GraphResponse(
+        nodes=[
+            GraphNode(id="limiter-id", name="限流组件组", kind="Component"),
+            GraphNode(
+                id="limiter-1-id",
+                name="限流实例1",
+                kind="Instance",
+                meta={"ip": "10.10.4.11", "port": 8081},
+            ),
+            GraphNode(
+                id="limiter-2-id",
+                name="限流实例2",
+                kind="Instance",
+                meta={"ip": "10.10.4.12", "port": 8081},
+            ),
+        ],
+        edges=[
+            GraphEdge(source="限流实例1", target="限流组件组", type="BELONGS_TO"),
+            GraphEdge(source="限流实例2", target="限流组件组", type="BELONGS_TO"),
+        ],
+    )
+    analysis = {"hypotheses": [{"rank": 1, "candidate": "限流组件组", "chain": ["限流组件组"]}]}
+    fallback = service._fallback_decision(analysis, source="fallback")
+
+    result = service._normalize_model_result(
+        {
+            "selected_node_id": "limiter-id",
+            "most_likely_reasons": ["限流组件异常"],
+            "propagation_path": [{"node_id": "limiter-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+        {"root_evidence": "rate limiter rejected requests"},
+    )
+
+    assert result["selected_node_id"] == "limiter-id"
+    assert [item["target"] for item in result["possible_member_nodes"]] == [
+        "10.10.4.11:8081",
+        "10.10.4.12:8081",
+    ]
+
+
+def test_cluster_without_members_returns_explicit_architecture_warning() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    architecture = GraphResponse(
+        nodes=[GraphNode(id="cluster-id", name="Redis生产集群", kind="Cluster")]
+    )
+    analysis = {"hypotheses": [{"rank": 1, "candidate": "Redis生产集群", "chain": ["Redis生产集群"]}]}
+    fallback = service._fallback_decision(analysis, source="fallback")
+
+    result = service._normalize_model_result(
+        {
+            "selected_node_id": "cluster-id",
+            "most_likely_reasons": ["Redis 集群异常"],
+            "propagation_path": [{"node_id": "cluster-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+        {"root_evidence": "CLUSTERDOWN"},
+    )
+
+    assert result["root_scope"] == "cluster"
+    assert result["instance_resolution"] == "members_missing"
+    assert result["possible_member_nodes"] == []
+    assert "未找到" in result["member_resolution_warning"]
+
+
+def test_virtual_group_with_one_member_resolves_directly_to_instance() -> None:
+    service = RcaDecisionService(settings=SimpleNamespace(llm_disable_env_proxy=True))
+    architecture = GraphResponse(
+        nodes=[
+            GraphNode(id="limiter-id", name="限流逻辑节点", kind="Service"),
+            GraphNode(
+                id="limiter-instance-id",
+                name="限流实例",
+                kind="Instance",
+                meta={"ip": "10.10.4.20", "port": 9090},
+            ),
+        ],
+        edges=[GraphEdge(source="限流逻辑节点", target="限流实例", type="CONTAINS")],
+    )
+    analysis = {"hypotheses": [{"rank": 1, "candidate": "限流逻辑节点", "chain": ["限流逻辑节点"]}]}
+    fallback = service._fallback_decision(analysis, source="fallback")
+
+    result = service._normalize_model_result(
+        {
+            "selected_node_id": "limiter-id",
+            "most_likely_reasons": ["限流逻辑节点持续拒绝请求"],
+            "propagation_path": [{"node_id": "limiter-id"}],
+        },
+        analysis,
+        fallback,
+        architecture,
+        {"root_evidence": "rate limiter rejected requests"},
+    )
+
+    assert result["selected_node_id"] == "limiter-instance-id"
+    assert result["selected_candidate"] == "限流实例"
+    assert result["root_scope"] == "instance"
+    assert result["possible_member_nodes"] == []
+    assert result["selected_node_runtime"]["ips"] == ["10.10.4.20"]
+    assert result["resolved_from_aggregate"]["node_id"] == "limiter-id"
+    assert "10.10.4.20:9090" in result["troubleshooting_methods"][0]
+
+    grounded_fallback = service._ground_fallback_in_architecture(
+        fallback,
+        architecture,
+        {"root_evidence": "rate limiter rejected requests"},
+    )
+    assert grounded_fallback["selected_node_id"] == "limiter-instance-id"
+    assert grounded_fallback["selected_candidate"] == "限流实例"
+
+
+def test_rca_sends_complete_architecture_on_every_conversation_request() -> None:
+    session = _FakeConversationSession(["conversation-1", "conversation-1"])
+    service = RcaDecisionService(settings=_conversation_settings(), session=session)
+    architecture = GraphResponse(nodes=[GraphNode(id="n1", name="API 网关", kind="Service")])
+    detail = {"incident_id": "I1", "timeline": []}
+    analysis = {"incident_id": "I1", "hypotheses": []}
+
+    service.enrich(detail, analysis, architecture)
+    service.enrich({**detail, "incident_id": "I2"}, {**analysis, "incident_id": "I2"}, architecture)
+
+    assert '"n":[["n1","API 网关","SV"]]' in session.calls[0]["json"]["content"]
+    assert '"n":[["n1","API 网关","SV"]]' in session.calls[1]["json"]["content"]
+    assert '"conversation_id":"conversation-1"' not in session.calls[1]["json"]["content"]
+    assert session.calls[1]["json"]["conversation_id"] == "conversation-1"
 
 
 def test_incident_persistence_prefers_grounded_model_root_and_chain(tmp_path) -> None:

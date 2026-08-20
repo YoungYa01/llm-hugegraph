@@ -61,6 +61,13 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
     // Scalar incident columns are the current, operator-editable canonical
     // values. analysis/detail JSON remains the source for narrative evidence.
     const llmCandidate = incident.root_candidate || llmDecision.selected_candidate || top.candidate || "尚未形成判断";
+    const rootRuntimeTarget = runtimeTargetSummary(llmDecision.selected_node_runtime);
+    const possibleMembers = Array.isArray(llmDecision.possible_member_nodes)
+      ? llmDecision.possible_member_nodes
+      : [];
+    const memberResolutionWarning = String(llmDecision.member_resolution_warning || "").trim();
+    const showMemberResolution = possibleMembers.length > 0
+      || llmDecision.instance_resolution === "members_missing";
     const llmReasons = normalizedReasonItems(
       llmDecision.most_likely_reasons,
       llmDecision.most_likely_reason || top.summary || analysis.decision || "暂无可展示的最可能原因",
@@ -111,6 +118,7 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
               <h2 style="margin:0;font-size:22px;color:var(--danger);font-weight:700">${escapeHtml(llmCandidate)}</h2>
               <span class="badge" style="background:rgba(220,38,38,0.1);color:#dc2626;border:1px solid rgba(220,38,38,0.2)">${escapeHtml(top.fault_mode || llmDecision.selected_fault_mode || "故障未知")}</span>
             </div>
+            ${rootRuntimeTarget ? `<div style="margin:-4px 0 12px;color:var(--ink-600);font-size:13px"><strong>运行目标：</strong><code style="background:var(--surface-soft);padding:2px 6px;border-radius:4px">${escapeHtml(rootRuntimeTarget)}</code></div>` : ""}
             <div style="color:var(--ink-700);font-size:14px;line-height:1.6;margin-bottom:14px;background:var(--surface-soft);padding:12px 14px;border-radius:8px;border-left:4px solid var(--brand)">
               <strong style="display:block;margin-bottom:6px;color:var(--ink-800)">根因判断依据</strong>
               ${reasonItemsHtml(llmReasons)}
@@ -133,6 +141,28 @@ export async function renderIncidentDetailPage(root, project, incidentId) {
           </div>
         </div>
       </section>
+
+      ${showMemberResolution ? `
+        <section class="card" style="margin-bottom:20px;border-color:rgba(217,119,6,0.3)">
+          <div class="card-header" style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px">
+            <div>
+              <h2>集群待排查实例</h2>
+              <p>当前日志只能确认集群级异常，无法判定具体故障实例。以下节点全部来自系统架构图谱，仅作为待排查可能性，不代表已确认根因。</p>
+            </div>
+            <span class="badge" style="white-space:nowrap;background:rgba(217,119,6,0.1);color:#b45309;border:1px solid rgba(217,119,6,0.2)">${possibleMembers.length ? `${possibleMembers.length} 个真实成员` : "成员关系缺失"}</span>
+          </div>
+          <div class="card-body">
+            <div class="notice notice-warning" style="margin-bottom:14px">
+              正式根因仍为“${escapeHtml(llmCandidate)}”。请结合实例健康状态、集群角色、网络连通性及节点日志逐一缩小范围。
+            </div>
+            ${possibleMembers.length ? `
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;max-height:440px;overflow:auto;padding-right:4px">
+                ${possibleMembers.map((member) => possibleMemberCard(member)).join("")}
+              </div>
+            ` : `<div class="notice notice-warning">${escapeHtml(memberResolutionWarning || "架构图谱没有维护该聚合节点与实例之间的成员关系，暂时无法列出具体排查节点。")}</div>`}
+          </div>
+        </section>
+      ` : ""}
 
       <!-- 本次故障融合定位拓扑与传播链 -->
       <section class="card fusion-graph-card" style="margin-bottom:20px">
@@ -499,6 +529,51 @@ function normalizedReasonItems(value, fallback) {
   return [...new Set(values
     .map((item) => String(item || "").replace(/^\s*(?:[-*•]|\d+[.)、])\s*/, "").trim())
     .filter(Boolean))].slice(0, 8);
+}
+
+function runtimeTargetSummary(runtime) {
+  if (!runtime || typeof runtime !== "object") return "";
+  const endpoints = Array.isArray(runtime.endpoints) ? runtime.endpoints.filter(Boolean) : [];
+  if (endpoints.length) return endpoints.slice(0, 4).join("、");
+  const hosts = [
+    ...(Array.isArray(runtime.ips) ? runtime.ips : []),
+    ...(Array.isArray(runtime.hostnames) ? runtime.hostnames : []),
+  ].filter(Boolean);
+  const ports = Array.isArray(runtime.ports) ? runtime.ports.filter(Boolean) : [];
+  if (hosts.length && ports.length) return hosts.slice(0, 4).map((host, index) => `${host}:${ports[index] || ports[0]}`).join("、");
+  if (hosts.length) return hosts.slice(0, 4).join("、");
+  for (const key of ["instance_ids", "pods", "clusters", "namespaces", "health_checks"]) {
+    const values = Array.isArray(runtime[key]) ? runtime[key].filter(Boolean) : [];
+    if (values.length) return values.slice(0, 4).join("、");
+  }
+  return "";
+}
+
+function possibleMemberCard(member) {
+  const runtimeTarget = String(member?.target || runtimeTargetSummary(member?.runtime) || "").trim();
+  const directEvidence = Boolean(member?.direct_evidence);
+  const statusLabel = directEvidence ? "日志标识命中 · 优先核查" : "待排查";
+  const statusStyle = directEvidence
+    ? "background:rgba(220,38,38,0.1);color:#b91c1c;border:1px solid rgba(220,38,38,0.2)"
+    : "background:rgba(217,119,6,0.1);color:#b45309;border:1px solid rgba(217,119,6,0.2)";
+  return `
+    <article style="border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--surface);min-width:0">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px">
+        <div style="min-width:0">
+          <strong style="display:block;color:var(--ink-900);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(member?.name || "未知实例")}">${escapeHtml(member?.name || "未知实例")}</strong>
+          <span style="font-size:12px;color:var(--ink-500)">${escapeHtml(member?.kind || "Instance")}</span>
+        </div>
+        <span class="badge" style="${statusStyle};white-space:nowrap">${statusLabel}</span>
+      </div>
+      <div style="font-size:13px;margin-bottom:8px">
+        <span style="color:var(--ink-500)">运行目标：</span>
+        ${runtimeTarget
+          ? `<code style="background:var(--surface-soft);padding:2px 6px;border-radius:4px;word-break:break-all">${escapeHtml(runtimeTarget)}</code>`
+          : `<span style="color:var(--danger)">图谱未维护 IP/端口</span>`}
+      </div>
+      <p style="margin:0;color:var(--ink-600);font-size:12px;line-height:1.6">${escapeHtml(member?.reason || "属于异常集群，当前缺少实例级直接证据。")}</p>
+    </article>
+  `;
 }
 
 function reasonItemsHtml(items) {

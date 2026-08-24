@@ -1,5 +1,5 @@
-import { api } from "./api.js";
-import { toast } from "./ui.js";
+import { api } from "../utils/api.js";
+import { toast } from "../utils/ui.js";
 
 class TaskManager extends EventTarget {
   constructor() {

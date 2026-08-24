@@ -1,0 +1,15 @@
+import React from "react";
+import { IconChevronRight, IconLightningStroked } from "@douyinfe/semi-icons";
+
+export function TechTaskCard({ task, title, steps }) {
+  if (!task) return null;
+  const pct = task.progress || 0;
+  return <div className="tech-task-card" style={{ background: "linear-gradient(135deg, #f8fafc 0%, #edf2f7 100%)", border: "1px solid #cbd5e1", borderLeft: "4px solid #2563eb", borderRadius: 12, padding: "18px 22px", marginBottom: 24, boxShadow: "0 10px 25px -5px rgba(37,99,235,0.1)", position: "relative", overflow: "hidden" }}>
+    <div className="tech-task-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
+      <div className="tech-task-title-group" style={{ display: "flex", alignItems: "center", gap: 12 }}><div style={{ width: 12, height: 12, borderRadius: "50%", background: "#2563eb", boxShadow: "0 0 10px #3b82f6", display: "inline-block", flexShrink: 0 }} /><div><div className="tech-task-title" style={{ fontSize: 15, fontWeight: 700, color: "#0f172a", display: "flex", alignItems: "center", gap: 8 }}>{title}<span className="tech-task-tag" style={{ fontSize: 11, fontWeight: 600, color: "#2563eb", background: "#dbeafe", padding: "2px 8px", borderRadius: 6, border: "1px solid rgba(37,99,235,0.2)" }}>{task.filename || task.task_name}</span></div><div className="tech-task-subtitle" style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>后台线程独立运行中 · 离开本页或切换操作不会中断</div></div></div>
+      <div className="tech-task-percent-badge" style={{ fontFamily: "monospace,Consolas", fontSize: 22, fontWeight: 800, color: "#2563eb" }}>{pct}%</div>
+    </div>
+    <div className="tech-progress-bar-outer" style={{ width: "100%", height: 14, background: "#cbd5e1", borderRadius: 999, padding: 2, overflow: "hidden", marginBottom: 14, boxShadow: "inset 0 1px 3px rgba(0,0,0,0.12)" }}><div className="tech-progress-bar-inner" style={{ height: "100%", width: `${pct}%`, background: "linear-gradient(90deg,#2563eb,#06b6d4)", borderRadius: 999, transition: "width 0.4s ease" }} /></div>
+    <div className="tech-task-footer" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}><div className="tech-task-status-text" style={{ fontSize: 13, color: "#334155", fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}><IconLightningStroked size="small" /><span>{task.progress_message || "正在处理..."}</span></div><div className="tech-task-steps" style={{ display: "flex", alignItems: "center", gap: 6 }}>{steps.map((step, index) => <React.Fragment key={step.label}>{index > 0 ? <IconChevronRight size="extra-small" style={{ color: "#cbd5e1" }} /> : null}<span style={{ fontSize: 11, padding: "3px 8px", borderRadius: 6, background: pct >= step.at ? "#dbeafe" : "#f1f5f9", color: pct >= step.at ? "#1e40af" : "#94a3b8", fontWeight: pct >= step.at ? 600 : 400, border: `1px solid ${pct >= step.at ? "#93c5fd" : "#e2e8f0"}` }}>{index + 1}. {step.label}</span></React.Fragment>)}</div></div>
+  </div>;
+}

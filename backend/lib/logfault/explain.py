@@ -156,6 +156,8 @@ def annotate_windows(
     flags: np.ndarray,
     events: pd.DataFrame,
     explain_config: dict,
+    *,
+    insufficient_model_samples: bool = False,
 ) -> pd.DataFrame:
     """Add explainability metadata and combine model + technical-fault rules.
 
@@ -166,7 +168,17 @@ def annotate_windows(
 
     result = metadata.copy()
     result["anomaly_score"] = scores
-    result["model_is_anomaly"] = np.asarray(flags, dtype=bool)
+    # An unsupervised detector trained on only a handful of target windows has no
+    # usable baseline.  In particular, one window is standardized to the origin
+    # and is then compared with itself, so treating its prediction as evidence is
+    # misleading.  Keep the raw model out of the decision in this mode and let
+    # explicit ERROR events form auditable fallback incidents below.
+    effective_model_flags = (
+        np.zeros(len(flags), dtype=bool)
+        if insufficient_model_samples
+        else np.asarray(flags, dtype=bool)
+    )
+    result["model_is_anomaly"] = effective_model_flags
     top_n = int(explain_config.get("top_templates", 10))
     top_trace_n = int(explain_config.get("top_trace_ids", 10))
     feature_names = feature_matrix.columns.to_numpy()
@@ -224,9 +236,11 @@ def annotate_windows(
         ) if not window_events.empty else 0
 
         reasons: list[str] = []
-        model_flag = bool(flags[position])
+        model_flag = bool(effective_model_flags[position])
         if model_flag:
             reasons.append("model")
+        if insufficient_model_samples and error_count:
+            reasons.append("insufficient_sample_error_rule")
         if protect_all_errors and error_count:
             reasons.append("all_error_rule")
         if protect_technical_errors and technical_error_count:
@@ -516,7 +530,10 @@ def _build_seeds(
         region_events = events.loc[mask]
         levels = region_events["level"].fillna("").astype(str).str.upper()
         error_events = region_events.loc[levels.isin(ERROR_LEVELS)]
-        if not error_events.empty and not seed_all_region_errors:
+        small_sample_fallback = "insufficient_sample_error_rule" in str(
+            region.get("detection_source") or ""
+        )
+        if not error_events.empty and not seed_all_region_errors and not small_sample_fallback:
             eligibility = error_events.apply(_is_technical_error, axis=1)
             if seed_model_business_errors:
                 eligibility = eligibility | error_events.index.to_series().isin(model_supported)

@@ -967,6 +967,50 @@ def _load_details(output_dir: Path) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
+def _resolve_persistable_incident_details(
+    output_dir: Path,
+    imported_details: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    """Return the single incident-detail source used by RCA, SQLite and the UI.
+
+    Older/external logfault versions may emit an empty incident_details.json for
+    a small input while IncidentGraphIntegrator can still build a minimal detail
+    from events.csv.  Persist that exact fallback instead of allowing the LLM and
+    the business database to observe different incident sets.
+    """
+
+    algorithm_details = _load_details(output_dir)
+    if algorithm_details:
+        return algorithm_details, "algorithm"
+
+    fallback = [dict(item) for item in imported_details if isinstance(item, dict)]
+    if not fallback:
+        return [], "none"
+
+    (output_dir / "incident_details.json").write_text(
+        json.dumps(fallback, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return fallback, "events_csv_fallback"
+
+
+def _reconcile_log_summary(
+    summary: dict[str, Any] | Any,
+    details: list[dict[str, Any]],
+    analyses: list[dict[str, Any]],
+    incident_source: str,
+) -> dict[str, Any]:
+    result = dict(summary) if isinstance(summary, dict) else {}
+    algorithm_incidents = int(result.get("incidents") or 0)
+    result["algorithm_incidents"] = algorithm_incidents
+    result["incidents"] = len(details)
+    result["rca_incidents"] = len(analyses)
+    result["incident_source"] = incident_source
+    if incident_source == "events_csv_fallback":
+        result["fallback_incidents"] = len(details)
+    return result
+
+
 def _persist_incidents(
     database: SystemDatabase,
     project_id: str,
@@ -1089,6 +1133,18 @@ async def _run_log_analysis_task(
             batch_id[:12],
         )
         import_data = imported.model_dump()
+        analyses = [
+            item for item in (import_data.get("rca") or []) if isinstance(item, dict)
+        ]
+        details, incident_source = _resolve_persistable_incident_details(
+            output_dir,
+            imported.incident_details,
+        )
+        if len(details) != len(analyses):
+            raise RuntimeError(
+                "日志故障详情与 RCA 结果数量不一致："
+                f"details={len(details)}, rca={len(analyses)}, source={incident_source}"
+            )
 
         database.update_log_batch_progress(
             batch_id,
@@ -1096,27 +1152,41 @@ async def _run_log_analysis_task(
             stage="persisting_results",
             message="持久化故障事件与 RCA 诊断结论...",
         )
-        await run_in_threadpool(runner._write_rca_artifacts, output_dir, import_data.get("rca") or [])
-        details = _load_details(output_dir)
-        _persist_incidents(
+        await run_in_threadpool(runner._write_rca_artifacts, output_dir, analyses)
+        saved_incidents = _persist_incidents(
             database,
             project_id,
             batch_id,
             user_id,
             details,
-            import_data.get("rca") or [],
+            analyses,
         )
+        if len(saved_incidents) != len(details):
+            raise RuntimeError(
+                "日志故障详情与 SQLite 持久化数量不一致："
+                f"details={len(details)}, saved={len(saved_incidents)}"
+            )
 
         total_duration = round(time.perf_counter() - total_t0, 2)
-        if isinstance(summary, dict):
-            summary["duration_seconds"] = total_duration
-        else:
-            summary = {"duration_seconds": total_duration}
+        summary = _reconcile_log_summary(summary, details, analyses, incident_source)
+        summary["duration_seconds"] = total_duration
+        (output_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if incident_source == "events_csv_fallback":
+            logger.warning(
+                "日志算法未生成 Incident，已使用 events.csv ERROR 补偿并统一持久化 "
+                "project=%s batch=%s incidents=%s",
+                project_id,
+                batch_id,
+                len(details),
+            )
 
         database.complete_log_batch(
             batch_id,
             json.dumps(summary, ensure_ascii=False),
-            json.dumps(import_data.get("rca") or [], ensure_ascii=False),
+            json.dumps(analyses, ensure_ascii=False),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Log analysis task failed project=%s batch=%s", project_id, batch_id)

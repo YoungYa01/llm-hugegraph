@@ -3,10 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+import pandas as pd
+
 from app.analyzer import RuleBasedArchitectureExtractor
 from app.log_integration import IncidentGraphIntegrator, LogFaultRunner
 from app.models import GraphEdge, GraphNode, GraphResponse
 from app.rca_engine import RootCauseEngine, hypotheses_from_persisted_graph
+from lib.logfault.explain import annotate_windows, merge_anomaly_windows
 
 
 def architecture_graph() -> GraphResponse:
@@ -51,6 +55,66 @@ def redis_timeout_detail() -> dict:
             {"timestamp": "2026-01-20 14:12:21.255", "service": "api-gateway", "message": "502 Bad Gateway"}
         ],
     }
+
+
+def test_single_generic_error_becomes_incident_when_model_baseline_is_insufficient() -> None:
+    events = pd.DataFrame([{
+        "event_id": "order-service.log:1",
+        "timestamp": pd.Timestamp("2026-07-28 10:00:30"),
+        "level": "ERROR",
+        "service": "order-service",
+        "instance": "order-1",
+        "trace_id": "single-error",
+        "logger": "demo.OrderService",
+        "message": "order rejected by policy",
+        "semantic_message": "order rejected by policy",
+        "exception_class": "com.demo.BusinessException",
+        "root_exception_class": "com.demo.BusinessException",
+        "root_cause": "com.demo.BusinessException: order rejected by policy",
+        "exception_chain": "[]",
+        "template_id": "E00001",
+        "template": "order rejected by policy",
+        "source_file": "order-service.log",
+        "source_line": 1,
+        "raw_block": "order rejected by policy",
+    }])
+    metadata = pd.DataFrame([{
+        "window_start": pd.Timestamp("2026-07-28 10:00:00"),
+        "window_end": pd.Timestamp("2026-07-28 10:05:00"),
+        "event_count": 1,
+    }])
+    features = pd.DataFrame([[1]], columns=["order-service::E00001"])
+
+    annotated = annotate_windows(
+        metadata,
+        features,
+        standardized=np.array([[0.0]]),
+        scores=np.array([0.0]),
+        flags=np.array([False]),
+        events=events,
+        explain_config={},
+        insufficient_model_samples=True,
+    )
+    incidents, details, _, _, unassigned = merge_anomaly_windows(
+        annotated,
+        events,
+        {
+            "merge_gap_minutes": 1,
+            "context_before_seconds": 0,
+            "context_after_seconds": 0,
+            "max_timeline_events": 10,
+            "max_root_candidates": 10,
+        },
+        return_mappings=True,
+    )
+
+    assert not bool(annotated.iloc[0]["model_is_anomaly"])
+    assert bool(annotated.iloc[0]["is_anomaly"])
+    assert annotated.iloc[0]["anomaly_reason"] == "insufficient_sample_error_rule"
+    assert len(incidents) == 1
+    assert len(details) == 1
+    assert details[0]["root_service_candidate"] == "order-service"
+    assert unassigned.empty
 
 
 def test_timeout_stops_at_cluster_without_instance_evidence() -> None:
@@ -134,6 +198,31 @@ def test_incident_import_does_not_overwrite_curated_architecture_nodes() -> None
     assert "Redis生产集群" not in updated_names
     assert "RCAHypothesis:I00001:01" in updated_names
     assert ("Incident:I00001", "Redis生产集群", "SUSPECTED_ROOT_CAUSE") in db.edges
+
+
+def test_events_csv_fallback_is_returned_as_the_effective_incident_detail(tmp_path: Path) -> None:
+    (tmp_path / "incident_details.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "incidents.csv").write_text("incident_id\n", encoding="utf-8")
+    (tmp_path / "events.csv").write_text(
+        "timestamp,level,service,trace_id,root_cause,semantic_message,message\n"
+        "2026-07-28 10:00:30,ERROR,order-service,single-error,,order rejected,order rejected\n",
+        encoding="utf-8",
+    )
+    integrator = IncidentGraphIntegrator(db=SimpleNamespace())  # type: ignore[arg-type]
+    captured: list[dict] = []
+
+    def fake_import(details: list[dict], source_name: str) -> None:
+        captured.extend(details)
+        integrator.rca_results.append({"incident_id": details[0]["incident_id"]})
+
+    integrator._import_details = fake_import  # type: ignore[method-assign]
+
+    result = integrator.import_path(tmp_path, "single.log", "batchprefix")
+
+    assert result.incidents == 1
+    assert result.incident_details[0]["incident_id"] == "I00001"
+    assert result.incident_details[0]["root_service_candidate"] == "order-service"
+    assert captured[0]["incident_id"] == "batchprefix:I00001"
 
 
 def test_grounded_model_path_is_persisted_into_incident_fusion_graph() -> None:

@@ -152,6 +152,12 @@ def run_pipeline(
         pca_config=config["pca"],
     )
 
+    training_window_count = int(
+        len(train_features) if train_features is not None else len(target_windowed.matrix)
+    )
+    minimum_training_windows = max(1, int(config["model"].get("min_training_windows", 30)))
+    insufficient_model_samples = training_window_count < minimum_training_windows
+
     aligned_target_matrix = target_windowed.matrix.reindex(
         columns=detection.artifacts.feature_names, fill_value=0.0
     )
@@ -164,6 +170,7 @@ def run_pipeline(
         flags=detection.is_anomaly,
         events=target_events,
         explain_config=config["explain"],
+        insufficient_model_samples=insufficient_model_samples,
     )
     (
         incidents,
@@ -269,6 +276,13 @@ def run_pipeline(
         "pca_components": detection.embeddings.shape[1],
         "pca_explained_variance": detection.artifacts.explained_variance,
         "model": detection.artifacts.detector_type,
+        "detection_mode": (
+            "insufficient_samples_rule_fallback"
+            if insufficient_model_samples
+            else "model"
+        ),
+        "training_windows": training_window_count,
+        "minimum_training_windows": minimum_training_windows,
     }
     (output / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"

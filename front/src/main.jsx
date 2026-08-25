@@ -1,6 +1,5 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import "@douyinfe/semi-ui/dist/css/semi.min.css";
 import { BrowserRouter } from "react-router-dom";
 import { App } from "./App.jsx";
 import "./styles/base.css";

@@ -29,6 +29,10 @@ class IncidentImportResult:
     edges_written: int
     logs: list[str]
     rca: list[dict[str, Any]] = field(default_factory=list)
+    # The exact details used for RCA, before the optional batch namespace is
+    # added.  This remains an internal hand-off field and is intentionally not
+    # included in model_dump(), which is also returned by legacy HTTP APIs.
+    incident_details: list[dict[str, Any]] = field(default_factory=list)
 
     def model_dump(self) -> dict[str, Any]:
         return {
@@ -145,6 +149,8 @@ class IncidentGraphIntegrator:
             if not details:
                 raise ValueError("没有找到 incident_details.json / incidents.csv / events.csv，无法导入异常链路。")
 
+            resolved_details = [dict(item) for item in details]
+
             # The algorithm restarts identifiers (I00001, I00002...) for every
             # run. Namespace them before writing to one project's shared graph.
             if incident_prefix:
@@ -164,6 +170,7 @@ class IncidentGraphIntegrator:
                 self.edges_written,
                 self.logs,
                 self.rca_results,
+                resolved_details,
             )
         finally:
             if cleanup is not None:

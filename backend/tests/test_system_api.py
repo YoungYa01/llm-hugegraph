@@ -46,6 +46,34 @@ def test_orphan_delete_preview_uses_server_side_operation_name(monkeypatch) -> N
     }
 
 
+def test_events_fallback_reconciles_details_rca_and_summary(tmp_path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "incident_details.json").write_text("[]", encoding="utf-8")
+    fallback = [{
+        "incident_id": "I00001",
+        "root_service_candidate": "order-service",
+        "root_cause_candidate": "order rejected",
+        "timeline": [{"level": "ERROR", "message": "order rejected"}],
+    }]
+    analyses = [{"incident_id": "batchprefix:I00001", "hypotheses": []}]
+
+    details, source = system_api._resolve_persistable_incident_details(output, fallback)
+    summary = system_api._reconcile_log_summary(
+        {"events": 1, "windows": 1, "anomaly_windows": 0, "incidents": 0},
+        details,
+        analyses,
+        source,
+    )
+
+    assert source == "events_csv_fallback"
+    assert json.loads((output / "incident_details.json").read_text(encoding="utf-8")) == fallback
+    assert summary["algorithm_incidents"] == 0
+    assert summary["incidents"] == 1
+    assert summary["rca_incidents"] == 1
+    assert summary["fallback_incidents"] == 1
+
+
 def test_auth_project_and_dashboard_api(tmp_path, monkeypatch) -> None:
     database = SystemDatabase(tmp_path / "api.db")
     monkeypatch.setattr(system_api, "get_system_db", lambda: database)

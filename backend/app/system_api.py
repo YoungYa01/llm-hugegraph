@@ -28,6 +28,7 @@ from .auth import (
 from .config import get_settings
 from .graph_admin import GraphAdminService
 from .hugegraph_client import HugeGraphRestClient, HugeGraphRestError
+from .incident_titles import build_incident_title
 from .log_reports import build_log_batch_report
 from .log_integration import IncidentGraphIntegrator, LogFaultRunner
 from .models import (
@@ -749,7 +750,7 @@ def delete_graph_node(
     _project_for_user(project_id, user)
     client = ProjectScopedGraphClient(project_id)
     deleted = client.delete_node_by_name(unquote(name))
-    return {"deleted": deleted, "graph": client.read_architecture_graph(1500).model_dump()}
+    return _graph_delete_result(client, {"deleted": deleted})
 
 
 @router.post("/projects/{project_id}/graph/edges", status_code=201)
@@ -809,7 +810,7 @@ def delete_graph_edge(
     _project_for_user(project_id, user)
     client = ProjectScopedGraphClient(project_id)
     deleted = client.delete_edge_by_tuple(payload.source, payload.target, payload.type)
-    return {"deleted": deleted, "graph": client.read_architecture_graph(1500).model_dump()}
+    return _graph_delete_result(client, {"deleted": deleted})
 
 
 @router.get("/projects/{project_id}/graph/export")
@@ -897,6 +898,20 @@ def import_architecture_graph_data(
     }
 
 
+def _graph_delete_result(client: ProjectScopedGraphClient, result: dict[str, Any]) -> dict[str, Any]:
+    # A read failure after committed deletes is not a failed delete. Return the
+    # mutation result and let the UI offer a safe read-only refresh, not retry.
+    try:
+        return {**result, "graph": client.read_architecture_graph(1500).model_dump()}
+    except Exception:  # noqa: BLE001
+        logger.exception("Graph deletion completed but refresh failed project=%s", client.project_id)
+        return {
+            **result,
+            "graph": None,
+            "refresh_warning": "删除请求已处理，但读取最新图谱失败，请点击刷新核对结果，不要重复提交删除。",
+        }
+
+
 @router.post("/projects/{project_id}/graph/nodes/batch-delete")
 def batch_delete_graph_nodes(
     project_id: str,
@@ -906,12 +921,19 @@ def batch_delete_graph_nodes(
     _project_for_user(project_id, user)
     client = ProjectScopedGraphClient(project_id)
     names = payload.get("names") or []
-    res = client.batch_delete_nodes(names)
-    return {
+    if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name.strip() for name in names):
+        raise HTTPException(status_code=400, detail="请选择有效的待删除节点")
+    started = time.perf_counter()
+    try:
+        res = client.batch_delete_nodes(names)
+    except HugeGraphRestError as exc:
+        logger.exception("Graph node deletion interrupted project=%s", project_id)
+        raise HTTPException(status_code=502, detail=f"HugeGraph 删除中断：{exc}。请刷新核对是否已有部分删除生效。") from exc
+    logger.info("Graph nodes deleted project=%s requested=%s result=%s duration=%.3fs", project_id, len(names), res, time.perf_counter() - started)
+    return _graph_delete_result(client, {
         "message": "batch_nodes_deleted",
         **res,
-        "graph": client.read_architecture_graph(1500).model_dump(),
-    }
+    })
 
 
 @router.post("/projects/{project_id}/graph/edges/batch-delete")
@@ -923,12 +945,22 @@ def batch_delete_graph_edges(
     _project_for_user(project_id, user)
     client = ProjectScopedGraphClient(project_id)
     edges = payload.get("edges") or []
-    res = client.batch_delete_edges(edges)
-    return {
+    if not isinstance(edges, list) or not edges or any(
+        not isinstance(edge, dict) or any(not isinstance(edge.get(key), str) or not edge[key].strip() for key in ("source", "target"))
+        for edge in edges
+    ):
+        raise HTTPException(status_code=400, detail="请选择有效的待删除关系")
+    started = time.perf_counter()
+    try:
+        res = client.batch_delete_edges(edges)
+    except HugeGraphRestError as exc:
+        logger.exception("Graph edge deletion interrupted project=%s", project_id)
+        raise HTTPException(status_code=502, detail=f"HugeGraph 删除中断：{exc}。请刷新核对是否已有部分删除生效。") from exc
+    logger.info("Graph edges deleted project=%s requested=%s result=%s duration=%.3fs", project_id, len(edges), res, time.perf_counter() - started)
+    return _graph_delete_result(client, {
         "message": "batch_edges_deleted",
         **res,
-        "graph": client.read_architecture_graph(1500).model_dump(),
-    }
+    })
 
 
 @router.post("/projects/{project_id}/graph/clear")
@@ -1048,7 +1080,6 @@ def _persist_incidents(
         )
         severity = "critical" if confidence >= 0.9 else "high" if confidence >= 0.75 else "medium" if confidence >= 0.5 else "low"
         root_service = str(detail.get("root_service_candidate") or "未知服务")
-        root_cause = str(detail.get("root_cause_candidate") or "未提取到明确异常")
         graph_id = str(analysis.get("incident_id") or f"{batch_id[:12]}:{external}")
         item = database.upsert_incident(
             {
@@ -1056,7 +1087,7 @@ def _persist_incidents(
                 "log_batch_id": batch_id,
                 "external_incident_id": external,
                 "graph_incident_id": graph_id,
-                "title": f"{root_service}：{root_cause[:100]}",
+                "title": build_incident_title(detail, decision),
                 "severity": severity,
                 "root_candidate": str(
                     decision.get("selected_candidate") if model_grounded

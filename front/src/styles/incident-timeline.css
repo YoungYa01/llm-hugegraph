@@ -1,0 +1,139 @@
+.incident-timeline {
+	min-width: 0;
+}
+.incident-timeline-overview {
+	margin: 0 0 18px;
+	color: var(--ink-500);
+	font-size: 12px;
+}
+.incident-timeline .timeline-item {
+	min-width: 0;
+}
+.incident-timeline .timeline-item time {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 8px;
+	overflow-wrap: anywhere;
+}
+.incident-timeline-labels {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px 8px;
+	margin-bottom: 6px;
+	font-size: 12px;
+	overflow-wrap: anywhere;
+}
+.incident-timeline-labels .badge {
+	font-size: 10px;
+}
+.incident-timeline-labels > strong {
+	color: var(--ink-800);
+}
+.incident-timeline-labels > span:not(.badge) {
+	color: var(--ink-500);
+}
+.incident-timeline-message {
+	display: block;
+	color: var(--ink-800);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.incident-timeline-source {
+	display: block;
+	color: var(--ink-500);
+	overflow-wrap: anywhere;
+	margin-top: 4px;
+}
+.incident-timeline-group {
+	margin-bottom: 14px;
+	padding: 10px 12px;
+	border: 1px solid var(--line-strong);
+	border-radius: 8px;
+}
+.incident-timeline-group > summary {
+	display: block;
+	cursor: pointer;
+	list-style: none;
+}
+.incident-timeline-group > summary::-webkit-details-marker {
+	display: none;
+}
+.incident-timeline-group > summary:focus-visible,
+.incident-timeline-raw > summary:focus-visible {
+	outline: 2px solid var(--brand);
+	outline-offset: 4px;
+	border-radius: 4px;
+}
+.incident-timeline-group-heading {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 10px;
+	align-items: center;
+	margin-bottom: 8px;
+	font-size: 12px;
+}
+.incident-timeline-group-heading::before {
+	content: "›";
+	font-size: 18px;
+	line-height: 1;
+	color: var(--brand);
+	transition: transform 150ms ease;
+}
+.incident-timeline-group[open]
+	> summary
+	.incident-timeline-group-heading::before {
+	transform: rotate(90deg);
+}
+.incident-timeline-expand,
+.incident-timeline-collapse {
+	color: var(--brand);
+}
+.incident-timeline-collapse,
+.incident-timeline-group[open] > summary .incident-timeline-expand {
+	display: none;
+}
+.incident-timeline-group[open] > summary .incident-timeline-collapse {
+	display: inline;
+}
+.incident-timeline-occurrences {
+	margin-top: 14px;
+	padding-top: 2px;
+	border-top: 1px solid var(--line-strong);
+}
+.incident-timeline-occurrence {
+	padding: 12px 0;
+}
+.incident-timeline-occurrence + .incident-timeline-occurrence {
+	border-top: 1px dashed var(--line-strong);
+}
+.incident-timeline-occurrence-number {
+	display: block;
+	margin-bottom: 4px;
+	font-size: 11px;
+	color: var(--ink-500);
+}
+.incident-timeline-raw {
+	margin-top: 8px;
+}
+.incident-timeline-raw > summary {
+	cursor: pointer;
+	font-size: 12px;
+	color: var(--brand);
+}
+.incident-timeline-raw pre {
+	max-width: 100%;
+	margin: 8px 0 0;
+	padding: 12px;
+	border-radius: 6px;
+	background: #172137;
+	color: #d9e2f7;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	font-size: 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+	.incident-timeline-group-heading::before {
+		transition: none;
+	}
+}

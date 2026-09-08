@@ -1,7 +1,5 @@
 # LogScope RCA — Semi Design + React Router 重构版
 
-本版本已按标准 React 前端工程方式重构，不再保留 `src/js` / `src/react` 双目录，也不再使用原生 Hash Router。
-
 ## 技术栈
 
 - React 18
@@ -111,7 +109,6 @@ D3 不再负责页面 DOM，只通过 React `ref + useEffect` 绘制拓扑/图�
 /projects/:projectId/reports/:batchId
 ```
 
-代码中已移除 `window.location.hash`、`hashchange` 和 `#/...` 手工跳转。
 
 ## 样式策略
 

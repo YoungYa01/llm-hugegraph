@@ -198,41 +198,17 @@ class ProjectScopedGraphClient:
         return self.client.update_node_by_name(self._name(original_name), payload)
 
     def delete_node_by_name(self, name: str) -> bool:
-        # 级联删除：在删除节点之前，自动找出并删除所有与该节点连接的边，防止留下悬空脏数据
-        graph = self.read_graph(limit=5000)
-        adjacent_edges = [
-            edge
-            for edge in graph.edges
-            if edge.source == name or edge.target == name
-        ]
-        for edge in adjacent_edges:
-            self.delete_edge_by_tuple(
-                edge.source, edge.target, edge.type
-            )
-        res = self.client.delete_node_by_name(self._name(name))
-        if not res:
-            # 兜底：尝试直接通过无前缀 Raw Name 删除
-            res = self.client.delete_node_by_name(name)
-        return res
+        return self.client.delete_node_by_name(self._name(name))
 
     def batch_delete_nodes(self, names: list[str]) -> dict[str, int]:
-        deleted_nodes = 0
-        names_set = set(names)
-        for name in names_set:
-            if self.delete_node_by_name(name):
-                deleted_nodes += 1
-        return {"deleted_nodes": deleted_nodes}
+        return self.client.batch_delete_nodes([self._name(name) for name in names])
 
     def batch_delete_edges(self, edges: list[dict[str, str]]) -> dict[str, int]:
-        deleted_edges = 0
-        for edge_item in edges:
-            src = str(edge_item.get("source") or "")
-            tgt = str(edge_item.get("target") or "")
-            rel = str(edge_item.get("type") or "CALLS")
-            if src and tgt:
-                if self.delete_edge_by_tuple(src, tgt, rel):
-                    deleted_edges += 1
-        return {"deleted_edges": deleted_edges}
+        return self.client.batch_delete_edges([
+            {"source": self._name(item["source"]), "target": self._name(item["target"]),
+             "type": str(item.get("type") or "CALLS")}
+            for item in edges if item.get("source") and item.get("target")
+        ])
 
     def delete_nodes_by_names(self, names: list[str]) -> int:
         internal_names = [self._name(name) for name in names]

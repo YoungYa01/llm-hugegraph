@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
         return text
 
 from .config import get_settings
+from .incident_titles import normalize_incident_title
 from .log_compression import LogCompressionConfig, LogContextCompressor
 
 
@@ -529,7 +530,16 @@ class RcaDecisionService:
         else:
             root_scope = "component"
             instance_resolution = "not_applicable"
+        incident_title = normalize_incident_title(parsed.get("incident_title"))
+        title_source = "llm" if incident_title else "fallback"
+        if rejected_instance_id:
+            # The model named an unsupported instance. Do not retain that claim
+            # in the title after the root-cause scope has been corrected.
+            incident_title = normalize_incident_title(f"{selected}相关异常，具体故障实例待确认")
+            title_source = "scope_correction"
         return {
+            "incident_title": incident_title,
+            "incident_title_source": title_source,
             "selected_candidate": selected,
             "selected_node_id": selected_node_id,
             "selected_candidate_rank": rank,
@@ -569,6 +579,8 @@ class RcaDecisionService:
             steps = ["补充日志、监控和组件健康状态，核对候选根因与故障时间窗口是否一致。"]
         reason = str(top.get("summary") or analysis.get("decision") or "").strip()
         return {
+            "incident_title": "",
+            "incident_title_source": "fallback",
             "selected_candidate": str(top.get("candidate") or ""),
             "selected_candidate_rank": self._safe_int(top.get("rank")) or 0,
             "selected_fault_mode": str(top.get("fault_mode") or ""),
@@ -1177,8 +1189,15 @@ class RcaDecisionService:
             "7.若日志证据只能定位到集群，selected_node_id必须选择集群节点，不得猜测某个成员实例为根因；"
             "服务端会根据HAS_MEMBER/CONTAINS/BELONGS_TO/MEMBER_OF关系展开全部真实成员作为待排查清单。"
             "若逻辑聚合节点只有一个真实实例，正式根因应直接选择该实例；只有多个实例且无法区分时才保留聚合节点。\n"
+            "8.incident_title是故障列表和详情共用的中文短标题，建议12至40字、最多60字，一句话概括异常或故障。"
+            "根据日志上下文与本次根因分析解释异常语义，不要直接复制异常类全名、堆栈、时间戳或排查步骤。"
+            "例如日志确实是java.lang.NullPointerException时可写‘订单服务处理请求时发生空指针异常’；"
+            "Redis集群不可用但无法确定成员时可写‘Redis集群不可用，具体故障实例待确认’。这些只是格式示例，不是预设诊断。"
+            "标题中的服务、影响、故障原因必须有证据，与根因依据及传播路径一致；不要把记录报错的服务直接当作根因。"
+            "只有推测时明确写‘疑似’或‘待确认’，不得把未证实的实例、机制或业务影响写成事实。\n"
             "请严格返回 JSON 对象，不要 Markdown，不要解释，不要代码块。JSON 格式：\n"
             "{"
+            '"incident_title":"面向用户的一句话中文故障摘要",'
             '"selected_node_id":"architecture_graph 中真实 node_id",'
             '"selected_candidate":"该 node_id 对应的真实 name",'
             '"selected_candidate_rank":1,'

@@ -12,7 +12,9 @@ from .models import GraphEdge, GraphNode, GraphResponse
 
 
 class HugeGraphRestError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _json_text(value: Any) -> str:
@@ -156,7 +158,10 @@ class HugeGraphRestClient:
             raise HugeGraphRestError(f"HugeGraph 请求失败: {method} {url}: {exc}") from exc
 
         if response.status_code not in expected:
-            raise HugeGraphRestError(f"HugeGraph HTTP {response.status_code}: {method} {url}: {response.text[:3000]}")
+            raise HugeGraphRestError(
+                f"HugeGraph HTTP {response.status_code}: {method} {url}: {response.text[:3000]}",
+                status_code=response.status_code,
+            )
         if response.status_code == 204 or not response.text:
             return None
         return self._safe_body(response)
@@ -455,35 +460,7 @@ class HugeGraphRestClient:
         )
 
     def delete_node_by_name(self, name: str) -> bool:
-        self.ensure_schema()
-        clean_name = name.split("::")[-1] if "::" in name else name
-        scoped_name = name.startswith("project::")
-        existing = self.find_node_by_name(name)
-        if not existing and not scoped_name:
-            existing = self.find_node_by_name(clean_name)
-
-        if not existing:
-            return False
-
-        vertex_id = str(existing.get("id") or "")
-        if not vertex_id:
-            return False
-
-        # 清理与该节点相连的所有依赖边
-        for edge in self.list_edges(limit=10000):
-            if str(edge.get("outV") or "") == vertex_id or str(edge.get("inV") or "") == vertex_id:
-                try:
-                    self.delete_edge_by_id(str(edge.get("id") or ""))
-                except Exception:
-                    pass
-
-        for encoded in self._encoded_id_candidates(vertex_id):
-            try:
-                self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
-                return True
-            except HugeGraphRestError:
-                continue
-        return False
+        return self.batch_delete_nodes([name])["deleted_nodes"] > 0
 
     def find_node_by_name(self, name: str) -> dict[str, Any] | None:
         vertices = self.list_vertices(limit=10000)
@@ -592,18 +569,9 @@ class HugeGraphRestClient:
         return count
 
     def delete_edge_by_tuple(self, source_name: str, target_name: str, relation_type: str = "CALLS") -> bool:
-        self.ensure_schema()
-        for edge in self.list_edges(limit=10000):
-            props = edge.get("properties", {}) or {}
-            if str(props.get(self.pk_relation_type) or "CALLS") != relation_type:
-                continue
-            out_v = str(edge.get("outV") or "")
-            in_v = str(edge.get("inV") or "")
-            out_node = self._vertex_name_by_id(out_v)
-            in_node = self._vertex_name_by_id(in_v)
-            if out_node == source_name and in_node == target_name:
-                return self.delete_edge_by_id(str(edge.get("id") or ""))
-        return False
+        return self.batch_delete_edges([
+            {"source": source_name, "target": target_name, "type": relation_type}
+        ])["deleted_edges"] > 0
 
     def delete_edge_by_id(self, edge_id: str) -> bool:
         if not edge_id:
@@ -612,15 +580,61 @@ class HugeGraphRestClient:
         try:
             self._request("DELETE", f"graph/edges/{encoded}", expected=(200, 202, 204))
             return True
-        except HugeGraphRestError:
-            return False
+        except HugeGraphRestError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
 
     def delete_nodes_by_names(self, names: list[str]) -> int:
+        return self.batch_delete_nodes(names)["deleted_nodes"]
+
+    def _delete_snapshot(self, entity: str, label: str) -> list[dict[str, Any]]:
+        """Read one complete snapshot, not one full scan per target/edge endpoint.
+
+        HugeGraph paging must not be combined with label filters on older
+        servers. Filter the label locally and keep paging until its cursor ends.
+        Finish the read before deleting so mutations cannot invalidate cursors.
+        """
+        records: dict[str, dict[str, Any]] = {}
+        page = ""
+        seen_pages: set[str] = set()
+        while True:
+            data = self._request("GET", f"graph/{entity}", params={"page": page, "limit": 2000})
+            if not isinstance(data, dict) or not isinstance(data.get(entity), list) or "page" not in data:
+                raise HugeGraphRestError("HugeGraph 未返回完整分页信息，已停止删除，避免使用截断的图谱数据")
+            for item in data[entity]:
+                if item.get("label") == label and item.get("id") is not None:
+                    records[str(item["id"])] = item
+            next_page = data.get("page")
+            if not next_page:
+                return list(records.values())
+            page = str(next_page)
+            if page in seen_pages:
+                raise HugeGraphRestError("HugeGraph 返回重复分页游标，已停止删除")
+            seen_pages.add(page)
+
+    def _delete_vertex_by_id(self, vertex_id: str) -> bool:
+        last_error: HugeGraphRestError | None = None
+        for encoded in self._encoded_id_candidates(vertex_id):
+            try:
+                self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
+                return True
+            except HugeGraphRestError as exc:
+                # Retry only URL-format/not-found variants, never a timeout or
+                # server error: the previous delete may already have committed.
+                if exc.status_code not in (400, 404):
+                    raise
+                last_error = exc
+        if last_error and last_error.status_code != 404:
+            raise last_error
+        return False
+
+    def batch_delete_nodes(self, names: list[str]) -> dict[str, int]:
         self.ensure_schema()
         target_names = {str(name or "") for name in names if str(name or "")}
         if not target_names:
-            return 0
-        vertices = self.list_vertices(limit=100000)
+            return {"deleted_nodes": 0, "deleted_edges": 0, "not_found_nodes": 0}
+        vertices = self._delete_snapshot("vertices", self.node_label)
         targets = [
             vertex
             for vertex in vertices
@@ -628,21 +642,45 @@ class HugeGraphRestClient:
         ]
         target_ids = {str(vertex.get("id") or "") for vertex in targets if str(vertex.get("id") or "")}
         if not target_ids:
-            return 0
-        for edge in self.list_edges(limit=200000):
+            return {"deleted_nodes": 0, "deleted_edges": 0, "not_found_nodes": len(target_names)}
+        adjacent = []
+        for edge in self._delete_snapshot("edges", self.edge_label):
             if str(edge.get("outV") or "") in target_ids or str(edge.get("inV") or "") in target_ids:
-                self.delete_edge_by_id(str(edge.get("id") or ""))
-        deleted = 0
-        for vertex in targets:
-            vertex_id = str(vertex.get("id") or "")
-            for encoded in self._encoded_id_candidates(vertex_id):
-                try:
-                    self._request("DELETE", f"graph/vertices/{encoded}", params={"label": self.node_label}, expected=(200, 202, 204))
-                    deleted += 1
-                    break
-                except HugeGraphRestError:
-                    continue
-        return deleted
+                adjacent.append(edge)
+        deleted_edges = sum(self.delete_edge_by_id(str(edge["id"])) for edge in adjacent)
+        deleted_nodes = sum(self._delete_vertex_by_id(vertex_id) for vertex_id in sorted(target_ids))
+        return {
+            "deleted_nodes": deleted_nodes,
+            "deleted_edges": deleted_edges,
+            "not_found_nodes": len(target_names) - deleted_nodes,
+        }
+
+    def batch_delete_edges(self, edges: list[dict[str, str]]) -> dict[str, int]:
+        self.ensure_schema()
+        requested = {
+            (item["source"], item["target"], str(item.get("type") or "CALLS"))
+            for item in edges if item.get("source") and item.get("target")
+        }
+        if not requested:
+            return {"deleted_edges": 0, "not_found_edges": 0}
+        vertices = self._delete_snapshot("vertices", self.node_label)
+        id_to_name = {
+            str(vertex["id"]): str((vertex.get("properties") or {}).get(self.pk_name) or "")
+            for vertex in vertices
+        }
+        matched = set()
+        targets = []
+        for edge in self._delete_snapshot("edges", self.edge_label):
+            key = (
+                id_to_name.get(str(edge.get("outV"))),
+                id_to_name.get(str(edge.get("inV"))),
+                str((edge.get("properties") or {}).get(self.pk_relation_type) or "CALLS"),
+            )
+            if key in requested:
+                targets.append(edge)
+                matched.add(key)
+        deleted = sum(self.delete_edge_by_id(str(edge["id"])) for edge in targets)
+        return {"deleted_edges": deleted, "not_found_edges": len(requested - matched)}
 
     def _vertex_name_by_id(self, vertex_id: str) -> str:
         for vertex in self.list_vertices(limit=10000):

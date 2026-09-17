@@ -26,6 +26,18 @@ function durationText(item) {
 		: `${Number(seconds).toFixed(2)}s`;
 }
 
+function parseQualityText(item) {
+	const quality = item.summary?.parse_quality;
+	if (!quality) return "";
+	const parsers = Object.keys(quality.parser_distribution || {});
+	const coverage = Number(quality.event_line_coverage);
+	const parts = [];
+	if (parsers.length) parts.push(parsers.join(" / "));
+	if (Number.isFinite(coverage)) parts.push(`覆盖率 ${Math.round(coverage * 100)}%`);
+	if (quality.unparsed_blocks) parts.push(`${quality.unparsed_blocks} 个未解析块`);
+	return parts.join(" · ");
+}
+
 export function LogsPage({ project }) {
 	const [batches, setBatches] = useState(() => cache.get(project.id) || []);
 	const [loading, setLoading] = useState(() => !cache.has(project.id));
@@ -76,7 +88,7 @@ export function LogsPage({ project }) {
 
 	async function submit(event) {
 		event.preventDefault();
-		if (!file) return toast("请选择有效的日志文件 (.log / .txt / .zip)", "error");
+		if (!file) return toast("请选择有效的日志文件或日志压缩包", "error");
 		setSubmitting(true);
 		try {
 			const data = new FormData();
@@ -142,13 +154,15 @@ export function LogsPage({ project }) {
 			},
 			{
 				title: "事件数",
-				render: (_, item) => (
-					<>
-						<strong>{item.summary?.events ?? "—"} 条</strong> {/*<small style={{ color: "var(--ink-500)" }}>*/}
-						{/*  / {item.summary?.windows ?? "—"} 窗口*/}
-						{/*</small>*/}
-					</>
-				),
+				render: (_, item) => {
+					const qualityText = parseQualityText(item);
+					return (
+						<div>
+							<strong>{item.summary?.events ?? "—"} 条</strong>
+							{qualityText ? <span className="table-subtitle">{qualityText}</span> : null}
+						</div>
+					);
+				},
 			},
 			{
 				title: "挖掘异常段数",
@@ -203,14 +217,14 @@ export function LogsPage({ project }) {
 			<div className="page-header">
 				<div>
 					<h1>日志解析检测</h1>
-					<p>上传 Spring 风格服务日志，由滑动窗口算法生成异常区间、日志根因证据，再与系统架构拓扑联合推理。</p>
+					<p>自动识别 Spring、JSON、容器、Nginx、Syslog 和键值文本日志，再结合系统架构拓扑进行根因推理。</p>
 				</div>
 			</div>
 			<section className="card" style={{ marginBottom: 24 }}>
 				<div className="card-header">
 					<div>
 						<h2>新建分析批次</h2>
-						<p>支持上传单个 .log / .txt 或多服务日志包 ZIP；自动执行日志解析、窗口异常挖掘与图谱 RCA 推理。</p>
+						<p>支持文本、JSON、NDJSON、LOG、OUT、GZIP 或多服务 ZIP；每个文件独立识别格式和编码。</p>
 					</div>
 				</div>
 				<div className="card-body">
@@ -219,12 +233,12 @@ export function LogsPage({ project }) {
 						<Upload
 							action="#"
 							draggable
-							accept=".log,.txt,.zip,text/plain,application/zip"
+							accept=".log,.txt,.out,.json,.jsonl,.ndjson,.access,.error,.zip,.gz,text/plain,application/json,application/zip,application/gzip"
 							limit={1}
 							fileList={fileList}
 							dragIcon={<IconUpload />}
-							dragMainText={file?.name || "点击选择或拖拽日志文件 (ZIP / LOG / TXT)"}
-							dragSubText="Spring Boot 多服务日志建议打包为 ZIP 文件上传"
+							dragMainText={file?.name || "点击选择或拖拽日志文件"}
+							dragSubText="多服务日志建议打包为 ZIP；支持自动格式与编码探测"
 							beforeUpload={({ file: item }) => {
 								setFile(item.fileInstance);
 								return { shouldUpload: false, autoRemove: false };

@@ -1,3 +1,3 @@
-"""Spring microservice log anomaly detection and fault localization."""
+"""Multi-format log anomaly detection and fault localization."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

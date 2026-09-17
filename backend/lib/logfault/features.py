@@ -44,7 +44,9 @@ def build_window_features(events: pd.DataFrame, window_config: dict, feature_con
     features = sorted(frame["feature"].unique().tolist())
     feature_index = {name: index for index, name in enumerate(features)}
 
-    timestamps = frame["timestamp"].astype("int64").to_numpy()
+    # Pandas 3 may preserve Python datetime values as datetime64[us].  Timestamp.value
+    # is always nanoseconds, so normalize the array before searchsorted comparisons.
+    timestamps = frame["timestamp"].astype("datetime64[ns]").astype("int64").to_numpy()
     order = np.argsort(timestamps)
     timestamps = timestamps[order]
     sorted_features = frame["feature"].to_numpy()[order]

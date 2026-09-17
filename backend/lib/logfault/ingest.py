@@ -1,60 +1,23 @@
 from __future__ import annotations
 
 import fnmatch
-import json
-import re
+import gzip
+import shutil
 import tempfile
 import zipfile
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterator
 
 import pandas as pd
 
-
-LOG_START_RE = re.compile(
-    r"^(?P<timestamp>(?:\d{2}/\d{2}/\d{2}|\d{4}[-/]\d{2}[-/]\d{2})\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+"
-    r"(?P<level>TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+---\s+"
-    r"\[(?P<thread>[^\]]+)\]\s+"
-    r"(?P<logger>.*?)\s*:\s*(?P<message>.*)$"
-)
-TRACE_PREFIX_RE = re.compile(r"^\[(?P<trace>[A-Za-z0-9_.-]{4,64})\]\s*(?P<message>.*)$")
-INLINE_TRACE_RE = re.compile(
-    r"(?i)\b(?:trace_?id|request_?id|req_?id|uuid|span_?id|correlation_?id)\s*[=:]\s*['\"]?([A-Za-z0-9_.-]{4,64})['\"]?"
-)
-DOWNSTREAM_RE = re.compile(
-    r"(?i)\b(?:downstream|target\s+physical\s+host|target\s+host|target_?service|calling\s+downstream\s+service)\s*[=:]\s*['\"]?([A-Za-z0-9_.-]{2,64})['\"]?"
-)
-EXCEPTION_CLASS_RE = re.compile(r"(?P<class>[A-Za-z_$][\w.$]*(?:Exception|Error))\b")
-EXCEPTION_HEADER_RE = re.compile(
-    r"^(?:(?P<prefix>Caused by|Suppressed)\s*:\s*)?"
-    r"(?P<class>[A-Za-z_$][\w.$]*(?:Exception|Error))"
-    r"(?::\s*(?P<message>.*))?$",
-    re.IGNORECASE,
-)
-PORT_SUFFIX_RE = re.compile(r"-\d+$")
+from .parsers import ParserRegistry
+from .schema import FileParseResult, ParsedEvent
 
 
-@dataclass
-class ParsedEvent:
-    timestamp: datetime
-    level: str
-    service: str
-    instance: str
-    thread: str
-    logger: str
-    trace_id: str
-    message: str
-    semantic_message: str
-    exception_class: str
-    root_exception_class: str
-    root_cause: str
-    exception_chain: str
-    raw_block: str
-    source_file: str
-    source_line: int
-    downstream_target: str = ""
+DEFAULT_SUFFIXES = {
+    ".log", ".txt", ".out", ".json", ".jsonl", ".ndjson", ".access", ".error", "",
+}
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
@@ -67,25 +30,24 @@ def _matches_any(path: str, patterns: list[str]) -> bool:
     return False
 
 
-def _service_from_file(path: Path) -> str:
-    stem = path.stem
-    stem = re.sub(r"-(?:err|debug)$", "", stem)
-    service = PORT_SUFFIX_RE.sub("", stem)
-    return service or path.parent.name
-
-
-def _instance_from_path(path: Path) -> str:
-    return path.parent.name
-
-
-def discover_log_files(root: Path, include_globs: list[str], exclude_globs: list[str]) -> list[Path]:
-    if root.is_file() and root.suffix.lower() == ".log":
-        return [root]
+def discover_log_files(
+    root: Path,
+    include_globs: list[str],
+    exclude_globs: list[str],
+    supported_suffixes: list[str] | set[str] | None = None,
+) -> list[Path]:
+    suffixes = {str(item).lower() for item in (supported_suffixes or DEFAULT_SUFFIXES)}
+    if root.is_file():
+        if root.suffix.lower() in suffixes:
+            return [root]
+        raise ValueError(f"不支持的日志文件类型: {root.suffix or '<无扩展名>'}")
     if not root.is_dir():
-        raise ValueError(f"输入必须是 .log 文件、目录或 ZIP: {root}")
+        raise ValueError(f"输入必须是日志文件、目录、ZIP 或 GZIP: {root}")
 
     files: list[Path] = []
-    for candidate in root.rglob("*.log"):
+    for candidate in root.rglob("*"):
+        if not candidate.is_file() or candidate.suffix.lower() not in suffixes:
+            continue
         relative = candidate.relative_to(root).as_posix()
         if include_globs and not _matches_any(relative, include_globs):
             continue
@@ -95,211 +57,242 @@ def discover_log_files(root: Path, include_globs: list[str], exclude_globs: list
     return sorted(files)
 
 
-def _parse_timestamp(value: str) -> datetime:
-    formats = (
-        "%y/%m/%d %H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y/%m/%d %H:%M:%S.%f",
-    )
-    for fmt in formats:
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"不支持的日志时间格式: {value}")
-
-
-def _exception_entry(line: str, *, first_message: bool = False) -> dict[str, str] | None:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("at ") or stripped.startswith("... "):
-        return None
-
-    header = EXCEPTION_HEADER_RE.match(stripped)
-    if header:
-        prefix = str(header.group("prefix") or "").lower()
-        kind = "caused_by" if prefix == "caused by" else "suppressed" if prefix == "suppressed" else "direct"
-        return {
-            "class": str(header.group("class") or ""),
-            "message": str(header.group("message") or ""),
-            "kind": kind,
-        }
-
-    # 常见包装文本："nested exception is ..."、"failed: java.x.Exception: ..."。
-    # 只在首行、Caused by/Suppressed 行或明确包含 exception is 的行中搜索，
-    # 避免把普通业务文本里提到的类名误判为异常栈头。
-    lowered = stripped.lower()
-    eligible = first_message or lowered.startswith(("caused by:", "suppressed:")) or "exception is" in lowered
-    if not eligible:
-        return None
-    token = EXCEPTION_CLASS_RE.search(stripped)
-    if not token:
-        return None
-    class_name = str(token.group("class") or "")
-    remainder = stripped[token.end() :].lstrip(": ")
-    kind = "caused_by" if lowered.startswith("caused by:") else "suppressed" if lowered.startswith("suppressed:") else "direct"
-    return {"class": class_name, "message": remainder, "kind": kind}
-
-
-def _parse_exception_details(first_message: str, continuation_lines: list[str]) -> tuple[str, str, str, str]:
-    entries: list[dict[str, str]] = []
-    first_entry = _exception_entry(first_message, first_message=True)
-    if first_entry:
-        entries.append(first_entry)
-    for line in continuation_lines:
-        entry = _exception_entry(line)
-        if entry:
-            entries.append(entry)
-
-    if not entries:
-        return "", "", "", "[]"
-
-    non_suppressed = [entry for entry in entries if entry["kind"] != "suppressed"] or entries
-    first_class = non_suppressed[0]["class"]
-    caused = [entry for entry in non_suppressed if entry["kind"] == "caused_by"]
-    root = caused[-1] if caused else non_suppressed[-1]
-    root_class = root["class"]
-    root_message = root["message"]
-    root_cause = f"{root_class}: {root_message}".rstrip(": ")
-    chain = json.dumps(entries, ensure_ascii=False)
-    return first_class, root_class, root_cause, chain
-
-
-def parse_log_file(path: Path, encoding: str = "utf-8", errors: str = "replace") -> Iterator[ParsedEvent]:
-    service = _service_from_file(path)
-    instance = _instance_from_path(path)
-    current: dict | None = None
-
-    def emit(item: dict | None) -> ParsedEvent | None:
-        if item is None:
-            return None
-        first_message = item["message"]
-        trace_id = ""
-        trace_match = TRACE_PREFIX_RE.match(first_message)
-        if trace_match:
-            trace_id = trace_match.group("trace")
-            first_message = trace_match.group("message")
-
-        continuation = item["continuation"]
-        raw_text = "\n".join([first_message, *continuation])
-
-        if not trace_id:
-            inline_match = INLINE_TRACE_RE.search(raw_text)
-            if inline_match:
-                trace_id = inline_match.group(1)
-
-        downstream_target = ""
-        downstream_match = DOWNSTREAM_RE.search(raw_text)
-        if downstream_match:
-            downstream_target = downstream_match.group(1)
-
-        exception_class, root_exception_class, root_cause, exception_chain = _parse_exception_details(
-            first_message, continuation
-        )
-        semantic_parts = [first_message]
-        if exception_class and exception_class not in first_message:
-            semantic_parts.append(exception_class)
-        if root_cause and root_cause not in first_message and root_cause != exception_class:
-            semantic_parts.append(root_cause)
-        semantic_message = " | ".join(part for part in semantic_parts if part)
-
-        return ParsedEvent(
-            timestamp=item["timestamp"],
-            level=item["level"],
-            service=service,
-            instance=instance,
-            thread=item["thread"],
-            logger=item["logger"],
-            trace_id=trace_id,
-            message=first_message,
-            semantic_message=semantic_message,
-            exception_class=exception_class,
-            root_exception_class=root_exception_class,
-            root_cause=root_cause,
-            exception_chain=exception_chain,
-            raw_block="\n".join(item["raw_lines"]),
-            source_file=str(path),
-            source_line=item["source_line"],
-            downstream_target=downstream_target,
-        )
-
-    with path.open("r", encoding=encoding, errors=errors) as handle:
-        for line_number, raw in enumerate(handle, start=1):
-            line = raw.rstrip("\r\n")
-            match = LOG_START_RE.match(line)
-            if match:
-                event = emit(current)
-                if event is not None:
-                    yield event
-                current = {
-                    "timestamp": _parse_timestamp(match.group("timestamp")),
-                    "level": match.group("level"),
-                    "thread": match.group("thread"),
-                    "logger": match.group("logger").strip(),
-                    "message": match.group("message"),
-                    "continuation": [],
-                    "raw_lines": [line],
-                    "source_line": line_number,
-                }
-            elif current is not None:
-                current["continuation"].append(line)
-                current["raw_lines"].append(line)
-
-    event = emit(current)
-    if event is not None:
-        yield event
-
-
-def _safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
+def _safe_extract_zip(
+    archive: zipfile.ZipFile,
+    destination: Path,
+    *,
+    max_files: int = 2000,
+    max_uncompressed_bytes: int = 1024 * 1024 * 1024,
+) -> None:
     root = destination.resolve()
+    file_count = 0
+    total_size = 0
     for item in archive.infolist():
         target = (root / item.filename).resolve()
         if not target.is_relative_to(root):
             raise ValueError("ZIP 包含不安全的目录路径")
-        archive.extract(item, root)
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        file_count += 1
+        total_size += max(0, int(item.file_size))
+        if file_count > max_files:
+            raise ValueError(f"ZIP 中文件数超过 {max_files} 个限制")
+        if total_size > max_uncompressed_bytes:
+            raise ValueError("ZIP 解压后的总大小超过安全限制")
+        if item.file_size > 10 * 1024 * 1024 and item.compress_size > 0:
+            if item.file_size / item.compress_size > 500:
+                raise ValueError(f"ZIP 文件 {item.filename} 压缩比异常")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(item, "r") as source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
+
+
+def _decode_file(path: Path, configured_encoding: str, errors: str) -> tuple[list[str], str]:
+    raw = path.read_bytes()
+    if not raw:
+        return [], configured_encoding if configured_encoding != "auto" else "utf-8"
+    if raw.count(b"\x00") / len(raw) > 0.05 and not raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        raise ValueError("文件疑似二进制内容")
+    if configured_encoding and configured_encoding.lower() != "auto":
+        return raw.decode(configured_encoding, errors=errors).splitlines(), configured_encoding
+    for encoding, bom in (
+        ("utf-8-sig", b"\xef\xbb\xbf"), ("utf-16", b"\xff\xfe"), ("utf-16", b"\xfe\xff"),
+    ):
+        if raw.startswith(bom):
+            return raw.decode(encoding, errors=errors).splitlines(), encoding
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding, errors="strict").splitlines(), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors=errors).splitlines(), "utf-8-replacement"
+
+
+def _safe_expand_gzip(source: Path, target: Path, max_uncompressed_bytes: int) -> None:
+    total = 0
+    with gzip.open(source, "rb") as compressed, target.open("wb") as output:
+        while True:
+            chunk = compressed.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_uncompressed_bytes:
+                raise ValueError("GZIP 解压后的大小超过安全限制")
+            output.write(chunk)
+
+
+def parse_log_file_with_report(
+    path: Path,
+    *,
+    logical_source: str | None = None,
+    encoding: str = "auto",
+    errors: str = "replace",
+    parser_config: dict | None = None,
+) -> tuple[FileParseResult, list[tuple[str, float]]]:
+    config = parser_config or {}
+    lines, used_encoding = _decode_file(path, encoding, errors)
+    source_file = logical_source or path.name
+    result, scores = ParserRegistry(
+        max_event_lines=int(config.get("max_event_lines", 2000))
+    ).parse(
+        lines,
+        Path(source_file),
+        source_file,
+        sample_size=max(20, int(config.get("detection_sample_lines", 200))),
+        minimum_confidence=max(0.0, float(config.get("minimum_confidence", 0.1))),
+    )
+    result.encoding = used_encoding
+    return result, scores
+
+
+def parse_log_file(
+    path: Path,
+    encoding: str = "auto",
+    errors: str = "replace",
+) -> Iterator[ParsedEvent]:
+    result, _ = parse_log_file_with_report(path, encoding=encoding, errors=errors)
+    yield from result.events
 
 
 def load_events(input_path: str | Path, input_config: dict) -> pd.DataFrame:
     source = Path(input_path)
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
     try:
-        if source.is_file() and source.suffix.lower() == ".zip":
+        suffix = source.suffix.lower()
+        if source.is_file() and suffix == ".zip":
             temp_dir = tempfile.TemporaryDirectory(prefix="logfault-")
             with zipfile.ZipFile(source, "r") as archive:
-                _safe_extract_zip(archive, Path(temp_dir.name))
+                _safe_extract_zip(
+                    archive,
+                    Path(temp_dir.name),
+                    max_files=max(1, int(input_config.get("max_archive_files", 2000))),
+                    max_uncompressed_bytes=max(1, int(input_config.get("max_archive_uncompressed_mb", 1000))) * 1024 * 1024,
+                )
             root = Path(temp_dir.name)
+        elif source.is_file() and suffix == ".gz":
+            temp_dir = tempfile.TemporaryDirectory(prefix="logfault-")
+            expanded = Path(temp_dir.name) / source.stem
+            _safe_expand_gzip(
+                source,
+                expanded,
+                max(1, int(input_config.get("max_archive_uncompressed_mb", 1000))) * 1024 * 1024,
+            )
+            root = expanded
         else:
             root = source
 
         files = discover_log_files(
             root,
-            input_config.get("include_globs", ["**/*.log"]),
+            input_config.get("include_globs", ["**/*"]),
             input_config.get("exclude_globs", []),
+            input_config.get("supported_suffixes", DEFAULT_SUFFIXES),
         )
         if not files:
-            raise ValueError("没有找到符合条件的 .log 文件")
+            raise ValueError("没有找到符合条件的日志文件")
 
-        records = []
+        records: list[dict] = []
+        unparsed_records: list[dict] = []
+        unparsed_total = 0
+        file_reports: list[dict] = []
+        parser_counts: dict[str, int] = {}
+        max_unparsed_records = max(0, int(input_config.get("max_unparsed_records", 1000)))
+        max_unparsed_chars = max(100, int(input_config.get("max_unparsed_record_chars", 20000)))
+
+        def retain_unparsed(item: dict) -> None:
+            if len(unparsed_records) >= max_unparsed_records:
+                return
+            retained = dict(item)
+            raw_text = str(retained.get("raw_text") or "")
+            if len(raw_text) > max_unparsed_chars:
+                retained["raw_text"] = raw_text[:max_unparsed_chars]
+                retained["truncated"] = True
+                retained["original_chars"] = len(raw_text)
+            unparsed_records.append(retained)
+
         for file_path in files:
             try:
-                logical_source = file_path.relative_to(root).as_posix()
+                logical_source = file_path.relative_to(root).as_posix() if root.is_dir() else file_path.name
             except ValueError:
                 logical_source = file_path.name
-            for event in parse_log_file(
-                file_path,
-                encoding=input_config.get("encoding", "utf-8"),
-                errors=input_config.get("encoding_errors", "replace"),
-            ):
+            try:
+                parsed, scores = parse_log_file_with_report(
+                    file_path,
+                    logical_source=logical_source,
+                    encoding=input_config.get("encoding", "auto"),
+                    errors=input_config.get("encoding_errors", "replace"),
+                    parser_config=input_config,
+                )
+            except (OSError, UnicodeError, ValueError) as exc:
+                file_reports.append({
+                    "source_file": logical_source,
+                    "parser": "rejected",
+                    "confidence": 0.0,
+                    "encoding": "",
+                    "total_lines": 0,
+                    "events": 0,
+                    "unparsed_blocks": 1,
+                    "error": str(exc),
+                })
+                unparsed_total += 1
+                retain_unparsed({
+                    "source_file": logical_source,
+                    "start_line": 0,
+                    "end_line": 0,
+                    "raw_text": "",
+                    "reason": str(exc),
+                    "parser_name": "rejected",
+                })
+                continue
+            parser_counts[parsed.parser_name] = parser_counts.get(parsed.parser_name, 0) + len(parsed.events)
+            file_reports.append({
+                "source_file": logical_source,
+                "parser": parsed.parser_name,
+                "confidence": round(parsed.parser_confidence, 4),
+                "encoding": parsed.encoding,
+                "total_lines": parsed.total_lines,
+                "events": len(parsed.events),
+                "unparsed_blocks": len(parsed.unparsed),
+                "candidate_scores": dict(scores),
+            })
+            unparsed_total += len(parsed.unparsed)
+            for item in parsed.unparsed:
+                retain_unparsed(asdict(item))
+            for event in parsed.events:
                 record = asdict(event)
                 record["source_file"] = logical_source
                 record["event_id"] = f"{logical_source}:{event.source_line}"
                 records.append(record)
 
         if not records:
-            raise ValueError("找到日志文件，但没有解析出符合 Spring 格式的日志事件")
+            reasons = sorted({str(item.get("reason") or "") for item in unparsed_records if item.get("reason")})
+            detail = "；".join(reasons[:3])
+            raise ValueError(f"找到日志文件，但没有解析出带有效时间戳的日志事件{f'：{detail}' if detail else ''}")
         frame = pd.DataFrame.from_records(records)
         frame["timestamp"] = pd.to_datetime(frame["timestamp"])
         frame = frame.sort_values(["timestamp", "source_file", "source_line"]).reset_index(drop=True)
+        total_lines = sum(int(item.get("total_lines") or 0) for item in file_reports)
+        covered_lines = sum(
+            max(1, int(record.get("source_line_end") or record["source_line"]) - int(record["source_line"]) + 1)
+            for record in records
+        )
+        frame.attrs["parse_quality"] = {
+            "source_files": len(file_reports),
+            "total_physical_lines": total_lines,
+            "logical_events": len(records),
+            "unparsed_blocks": unparsed_total,
+            "retained_unparsed_records": len(unparsed_records),
+            "event_line_coverage": round(covered_lines / max(1, total_lines), 4),
+            "parser_distribution": parser_counts,
+            "files": file_reports,
+        }
+        frame.attrs["unparsed_records"] = unparsed_records
         return frame
     finally:
         if temp_dir is not None:
             temp_dir.cleanup()
+
+
+__all__ = [
+    "ParsedEvent", "discover_log_files", "load_events", "parse_log_file", "parse_log_file_with_report",
+]

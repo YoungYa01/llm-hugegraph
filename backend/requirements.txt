@@ -7,3 +7,9 @@ langchain-openai
 langchain-core
 json-repair
 pydantic
+pandas
+numpy
+scikit-learn
+joblib
+PyYAML
+drain3

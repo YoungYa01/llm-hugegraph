@@ -92,6 +92,8 @@ def _report(
         "## 结果文件",
         "",
         "- `events.csv`：结构化日志、异常链、模板、traceId 和稳定 event_id。",
+        "- `parse_quality.json`：各文件格式、编码、探测置信度和解析覆盖率。",
+        "- `unparsed_records.jsonl`：未能安全转换为时间序列事件的原始内容及原因。",
         "- `templates.csv`：Drain 模板清单。",
         "- `window_features.csv`：每个窗口内各服务模板频率。",
         "- `window_embeddings.csv`：PCA 向量和异常分数。",
@@ -125,6 +127,8 @@ def run_pipeline(
     output.mkdir(parents=True, exist_ok=True)
 
     target_events = load_events(input_path, config["input"])
+    parse_quality = dict(target_events.attrs.get("parse_quality") or {})
+    unparsed_records = list(target_events.attrs.get("unparsed_records") or [])
     target_events, templates, parser_backend = template_events(target_events, config["parser"])
     target_windowed = build_window_features(target_events, config["window"], config["features"])
 
@@ -187,6 +191,16 @@ def run_pipeline(
 
     _save_frame(target_events, output / "events.csv")
     _save_frame(templates, output / "templates.csv")
+    (output / "parse_quality.json").write_text(
+        json.dumps(parse_quality, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output / "unparsed_records.jsonl").write_text(
+        "".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for item in unparsed_records
+        ),
+        encoding="utf-8",
+    )
 
     window_features = pd.concat([target_windowed.metadata, aligned_target_matrix], axis=1)
     _save_frame(window_features, output / "window_features.csv")
@@ -260,6 +274,7 @@ def run_pipeline(
         "input": str(input_path),
         "output": str(output),
         "parser_backend": parser_backend,
+        "parse_quality": parse_quality,
         "events": len(target_events),
         "templates": len(templates),
         "windows": len(annotated_windows),

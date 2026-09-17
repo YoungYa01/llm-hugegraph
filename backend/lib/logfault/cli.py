@@ -13,12 +13,16 @@ from .pipeline import run_pipeline
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="logfault",
-        description="Spring 微服务日志异常检测与故障链定位",
+        description="多格式服务日志异常检测与故障链定位",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     analyze = subparsers.add_parser("analyze", help="运行完整分析流程")
-    analyze.add_argument("--input", required=True, help="单个 .log、日志目录或 ZIP")
+    analyze.add_argument(
+        "--input",
+        required=True,
+        help="日志文件、日志目录、ZIP 或 GZIP；格式将按内容自动识别",
+    )
     analyze.add_argument("--output", required=True, help="结果输出目录")
     analyze.add_argument("--config", help="YAML 配置文件")
     analyze.add_argument(

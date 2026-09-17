@@ -1514,6 +1514,8 @@ def download_log_artifact(
         "rca_results.json",
         "comprehensive_diagnostic_report.json",
         "anomaly_windows.csv",
+        "parse_quality.json",
+        "unparsed_records.jsonl",
     }
     safe = Path(filename).name
     if safe not in allowed:

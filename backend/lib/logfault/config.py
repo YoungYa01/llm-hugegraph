@@ -9,10 +9,20 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "input": {
-        "include_globs": ["**/*.log"],
-        "exclude_globs": ["**/*-err.log", "**/*-debug.log"],
-        "encoding": "utf-8",
+        "include_globs": ["**/*"],
+        "exclude_globs": [],
+        "supported_suffixes": [
+            ".log", ".txt", ".out", ".json", ".jsonl", ".ndjson", ".access", ".error", "",
+        ],
+        "encoding": "auto",
         "encoding_errors": "replace",
+        "detection_sample_lines": 200,
+        "minimum_confidence": 0.1,
+        "max_event_lines": 2000,
+        "max_archive_files": 2000,
+        "max_archive_uncompressed_mb": 1000,
+        "max_unparsed_records": 1000,
+        "max_unparsed_record_chars": 20000,
     },
     "parser": {
         "backend": "drain3",

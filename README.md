@@ -60,7 +60,12 @@ Redis生产集群 -HAS_MEMBER-> redis-1 / redis-2 / redis-3
 
 ### 4. 再日志解析检测
 
-点击 **日志解析检测**，上传日志文件or压缩包：
+点击 **日志解析检测**，上传日志文件或压缩包。系统会按内容自动识别 Spring/Log4j、
+JSON/NDJSON、Docker JSON、Kubernetes CRI、logfmt、Nginx access、Syslog 和通用文本日志。
+支持 `.log/.txt/.out/.json/.jsonl/.ndjson/.access/.error/.gz`，多服务文件可打包为 ZIP。
+
+每次分析会额外生成 `parse_quality.json` 和 `unparsed_records.jsonl`，分别用于审计格式探测、
+编码、覆盖率以及未能安全转换为时间序列事件的原始内容。
 
 ### 5. 查看故障根因定位
 

@@ -58,14 +58,14 @@ flowchart LR
 | SQLite | 用户、会话、项目、任务状态、故障业务状态、报告状态、审计记录 | 不保存完整图拓扑 |
 | 本地文件系统 | 原始日志、算法中间文件、模型对象、RCA 产物、综合报告文件 | 不承担项目权限判断 |
 | HugeGraph | 静态架构节点/边、动态 Incident/LogEvent/Exception/RCA 节点和关系 | 不保存登录会话和“已解决”业务状态 |
-| LogFaultAlgorithm | Spring 日志结构化、Drain、窗口特征、PCA、异常检测、故障 episode 聚合 | 不知道真实架构和项目权限 |
+| LogFaultAlgorithm | 多格式日志探测与结构化、Drain、窗口特征、PCA、异常检测、故障 episode 聚合 | 不知道真实架构和项目权限 |
 | `RootCauseEngine` | 实体对齐、故障信号分类、图路径搜索、Top-K 启发式排序 | 分数不是经过校准的真实概率 |
 | `RcaDecisionService` | 在完整架构约束下选择/解释最终根因、组织用户可读传播链和排查步骤 | 不允许编造图中不存在的节点、IP 或端口 |
 
 ### 2.2 一条批次的主数据流
 
 ```text
-上传 .log/.zip
+上传日志文件/ZIP/GZIP
   -> log_batches(processing)
   -> 原始文件 data/projects/<project>/logs/<batch>/
   -> load_events() 生成事件表
@@ -93,7 +93,7 @@ flowchart LR
 
 1. 当前正式前端根目录是 `front/`，技术栈为 React 18、Vite、Semi Design、D3。根目录 `scripts/start-frontend.*` 仍指向已经不存在的 `frontend-system/serve.py`，不要使用这些脚本启动当前前端；应在 `front/` 下运行 Vite。
 2. `backend/app/log_precheck.py` 已实现日志时间跨度、跨年、未来时间、分段和时间戳识别率预检，但当前 `/api/projects/{project_id}/logs/analyze` 没有调用它，前端也没有确认时间范围的交互。因此当前版本不会在分析前自动拦截几年以前与当前日志混传。
-3. 前端上传框宣称支持 `.txt`，但当前实际日志算法 `load_events()` 只直接接受 `.log`，ZIP 中也只发现 `.log`。直接上传 `.txt` 通常会在后台分析阶段失败。
+3. 日志入口已统一支持 `.log/.txt/.out/.json/.jsonl/.ndjson/.access/.error`，ZIP 内每个文件会独立探测；完全无法识别或没有有效时间戳的内容进入未解析审计记录，不会伪造事件进入窗口模型。
 4. 架构上传接口把文件按 UTF-8 文本解码；当前页面只引导 `.md/.txt`。它不会解析 PDF、Word 的版式或附件。
 5. “综合分析报告”的当前实现是对已持久化 RCA 数据进行确定性统计汇总，`build_log_batch_report()` 本身不调用大模型。页面上的“智能分析”表示异步汇总流程，不表示又执行一次 LLM 推理。
 6. 架构导入和日志分析使用进程内 `asyncio.create_task()`；服务进程重启后，正在执行的任务不会自动恢复，SQLite 可能留下 `processing` 状态。
@@ -445,10 +445,10 @@ ProjectScopedGraphClient.read_architecture_graph(limit=5000)
 | 项目 | 当前实现 |
 |---|---|
 | HTTP 原始大小 | 不超过 `MAX_UPLOAD_MB`，默认 200 MB |
-| 页面允许后缀 | `.log/.txt/.zip` |
-| 算法实际支持 | 单个 `.log`，或包含 `.log` 的 ZIP；目录仅供内部调用 |
+| 页面允许后缀 | `.log/.txt/.out/.json/.jsonl/.ndjson/.access/.error/.zip/.gz` |
+| 算法实际支持 | 单文件、包含多格式日志的 ZIP、GZIP；目录供内部调用 |
 | ZIP 路径安全 | 算法解压检查目标仍在临时目录内 |
-| 日志格式 | 固定 Spring 风格首行正则，异常栈续行并入上一事件 |
+| 日志格式 | Spring/Log4j、JSON/NDJSON、Docker JSON、Kubernetes CRI、logfmt、Nginx access、Syslog、通用带时间戳文本 |
 | 时间范围预检 | 已有函数但未接入正式上传链路 |
 | 正常训练集 | 后端支持 `train_file`，当前页面没有上传训练集控件 |
 
@@ -474,7 +474,7 @@ ProjectScopedGraphClient.read_architecture_graph(limit=5000)
 ### 9.3 日志结构化：`load_events()`
 
 ```text
-原始 .log/ZIP
+原始日志文件/ZIP/GZIP
  -> discover_log_files()
  -> parse_log_file()
  -> ParsedEvent 列表
@@ -500,7 +500,8 @@ ProjectScopedGraphClient.read_architecture_graph(limit=5000)
 | `source_file/source_line` | ZIP 内相对文件和首行号 |
 | `event_id` | `<source_file>:<source_line>` |
 
-没有解析出符合格式的事件时，批次失败。
+没有解析出带有效时间戳的事件时，批次失败。格式探测和覆盖率写入 `parse_quality.json`，
+未解析内容及原因写入 `unparsed_records.jsonl`。
 
 ### 9.4 模板化：`template_events()`
 
@@ -1072,7 +1073,7 @@ preview_operation()
 
 ### SOP-05：上传日志并监控批次
 
-1. 当前只使用 `.log` 或包含 `.log` 的 ZIP。
+1. 可直接使用受支持的文本/JSON 日志文件，也可将多服务、多格式日志打包为 ZIP。
 2. 上传前人工检查所有日志属于同一次故障调查时间段；当前系统没有自动时间范围确认。
 3. 建议 ZIP 内按服务/实例分目录，文件名保留 `<service>-<port>.log` 形式。
 4. 不要混入几年前历史日志、未来时间日志、不同环境日志或 debug/err 重复副本。
@@ -1210,7 +1211,7 @@ preview_operation()
 | 架构导入完成但边少 | `execution_logs_json`、HugeGraph | `_complete_missing_nodes()/add_edge_by_names()` | LLM 未抽到关系、端点名不一致、边写失败 | 人工补边；检查文档表达和 Schema |
 | HugeGraph 有节点但架构页没有 | kind/meta/prefix/limit | `read_architecture_graph()` | 动态节点、错误项目、前端 cache、绘图上限 | 校正 kind/meta，刷新页面，管理员查全局数据 |
 | 同名节点删后重建异常 | HugeGraph 主键和 label | `upsert_node()/delete_node_by_name()` | 旧 label/边残留、删除未完成 | 查实际 label 和内部名；质量检查后清理 |
-| 上传 `.txt` 后失败 | batch error | `load_events()` | 算法只直接接受 `.log` | 改为 `.log` 或 ZIP 中 `.log` |
+| 上传后没有形成事件 | batch error / `parse_quality.json` | `load_events()` | 格式置信度不足或缺少有效时间戳 | 查看 `unparsed_records.jsonl`，补充解析器或调整日志时间格式 |
 | 未解析出日志事件 | `events.csv` 是否存在 | `LOG_START_RE/parse_log_file()` | 日志 pattern 不符合固定正则 | 调整日志格式或扩展解析器 |
 | 事件很多但 Incident 为 0 | `anomaly_windows.csv`、unassigned | `annotate_windows/_build_seeds()` | 业务 ERROR 未被提升、模型无异常 | 核对规则配置和 `unassigned_error_events.csv` |
 | RCA 根因与日志服务名称不一致 | aliases/meta | `ArchitectureSnapshot.resolve()` | 中英文/连字符别名缺失 | 在架构 meta 补 aliases/service_name，重新分析 |
@@ -1413,7 +1414,7 @@ npm run build
 ### P0：上线前应处理
 
 1. 把日志时间范围预检正式接入“预检 → 用户确认/选择范围 → 再分析”，并把选择范围传入 `load_events()` 过滤。
-2. 统一上传契约：要么日志算法支持 `.txt`，要么前端和接口只允许 `.log/.zip`。
+2. 持续扩充格式样例语料和解析器回归测试，避免格式探测规则退化。
 3. 修复 `scripts/start-frontend.*` 指向旧目录的问题。
 4. 对旧无鉴权兼容写接口增加开关、鉴权或在生产禁用。
 5. 将架构/日志后台任务迁移到持久队列，至少增加启动时扫描并标记失联 processing 任务。
@@ -1438,7 +1439,7 @@ npm run build
 
 ## 22. 交接结论
 
-本系统的完整责任链是：日志算法负责把原始 Spring 日志变成可审计的异常 episode；HugeGraph 提供真实系统结构；确定性 RCA 负责候选搜索和证据边界；大模型在每次请求都带完整压缩架构的前提下选择并组织用户可读结论；SQLite 负责把结果变成可分页、可关闭、可汇总的业务记录。
+本系统的完整责任链是：日志算法负责把多格式原始日志变成统一、可审计的异常 episode；HugeGraph 提供真实系统结构；确定性 RCA 负责候选搜索和证据边界；大模型在每次请求都带完整压缩架构的前提下选择并组织用户可读结论；SQLite 负责把结果变成可分页、可关闭、可汇总的业务记录。
 
 接手人员排查任何问题时，都应先判断问题属于哪一层：
 

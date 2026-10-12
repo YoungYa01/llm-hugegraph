@@ -200,11 +200,14 @@ backend/
 | `ALLOW_REGISTRATION` | `true` | 是否允许后续用户自助注册；首用户仍可注册 |
 | `MAX_UPLOAD_MB` | `200` | HTTP 上传原始文件最大值 |
 | `LLM_ENABLED` | `true` | 架构抽取是否启用模型 |
-| `LLM_BASE_URL` | `http://127.0.0.1:1234` | OpenAI 兼容/llama.cpp 地址 |
-| `LLM_MODEL` | `qwen3.5_14B_Q4_K_M` | 架构抽取模型名 |
+| `LLM_PROTOCOL` | `litellm` | `litellm`、`conversation` 或 `llama_cpp` |
+| `LLM_BASE_URL` | `http://127.0.0.1:4000/v1` | LiteLLM 或 llama.cpp 地址 |
+| `LLM_MODEL` | `analysis-model` | 架构抽取模型名或 LiteLLM 模型别名 |
 | `LLM_API_KEY` | `not-needed` | OpenAI 兼容接口认证值 |
+| `LLM_CONVERSATION_URL` | `http://127.0.0.1/api/conversation` | 日志分析的 Conversation 地址 |
 | `LLM_CHUNK_CHARS` | `700` | 架构文档分片字符数 |
 | `LLM_MAX_TOKENS` | `2048` | 架构抽取响应上限 |
+| `LLM_MAX_WORKERS` | `4` | 架构分片并发请求数 |
 | `HUGEGRAPH_HOST/PORT` | `127.0.0.1/8080` | HugeGraph 地址 |
 | `HUGEGRAPH_GRAPHSPACE` | `DEFAULT` | HugeGraph 图空间 |
 | `HUGEGRAPH_GRAPH` | `hugegraph` | 图名 |
@@ -213,9 +216,13 @@ backend/
 | `LOGFAULT_PROJECT_PATH` | 空 | 外部 LogFaultAlgorithm 路径；为空时尝试仓库同级目录 |
 | `LOGFAULT_CONFIG_PATH` | 空 | 日志算法 YAML 配置路径 |
 | `RCA_TOP_K` | `5` | 确定性根因候选数 |
-| `RCA_DECISION_ENABLED` | `true` | 是否调用 Conversation 决策模型 |
-| `RCA_DECISION_URL` | `http://127.0.0.1/api/conversation` | 决策模型接口 |
+| `RCA_DECISION_ENABLED` | `true` | 是否调用 RCA 决策模型 |
+| `RCA_DECISION_URL` | `http://127.0.0.1:4000/v1` | LiteLLM、Conversation 或 llama.cpp 接口 |
 | `RCA_DECISION_MODEL_CONFIG_ID` | 空 | 远程模型配置 ID |
+| `RCA_DECISION_PROTOCOL` | `litellm` | `litellm`、`conversation` 或 `llama_cpp` |
+| `RCA_DECISION_MODEL` | `rca-model` | RCA 模型名或 LiteLLM 模型别名 |
+| `RCA_DECISION_MAX_WORKERS` | `3` | RCA Incident 并发请求数 |
+| `RCA_DECISION_ISOLATE_CONVERSATIONS` | `true` | 并发时每个 Incident 使用独立会话 |
 | `LOG_COMPRESSION_MAX_CHARS` | `12000` | 送给决策模型的日志上下文字数预算 |
 | `LOG_COMPRESSION_MAX_EVENTS` | `48` | 关键日志最大条数 |
 | `RCA_GRAPH_PRUNING_ENABLED` | `true` | 是否在写 HugeGraph 前剪枝动态子图 |
@@ -226,15 +233,16 @@ backend/
 
 1. 注册必须提供 `employee_id`。
 2. 架构导入和日志 RCA 前，接口再次校验当前用户工号非空。
-3. `LLMAnalyzer` 调用 OpenAI 兼容接口和 `RcaDecisionService` 调用 Conversation 接口时，请求头均带 `X-Ai-Coding-Key: <employee_id>`。
+3. `LLMAnalyzer` 和 `RcaDecisionService` 的 HTTP 请求均带 `X-Ai-Coding-Key: <employee_id>`；会话 ID 规则只适用于 `conversation` 协议。
 4. 架构抽取 `RcaDecisionService(..., continue_conversation=False)`，不会向请求体传 `conversation_id`。
 5. 一次日志批次只创建一个 `IncidentGraphIntegrator` 和一个 `RcaDecisionService`：该批次第一个 Incident 请求不带 `conversation_id`；取得返回值后，后续 Incident 会带该 ID。
 6. 每个 Incident 的请求内容仍包含完整压缩架构 `architecture_graph`，不依赖前一个请求补全拓扑。因此并发顺序不会决定某次请求是否有完整架构。
 7. 环境变量不保存业务 `conversation_id`；进程内服务对象销毁后该 ID 不再复用。
+8. 使用 LiteLLM 时，架构抽取和 RCA 决策均访问 LiteLLM 的 OpenAI 兼容接口；云端 API、自部署 vLLM、SGLang 等后端只需配置在 `backend/litellm_config.yaml`。`conversation_id` 不会传给 LiteLLM。
 
 ### 5.3 依赖
 
-- 后端：Python、FastAPI、Uvicorn、requests、Pydantic、python-multipart、json-repair、LangChain 可选组件。
+- 后端：Python、FastAPI、Uvicorn、requests、Pydantic、python-multipart、json-repair。
 - 日志算法：pandas、numpy、scikit-learn、joblib、PyYAML、drain3 等，通常由同级 `LogFaultAlgorithm/requirements.txt` 安装。
 - 前端：Node.js/npm、React、Vite、Semi UI、D3。
 - 外部服务：HugeGraph REST、Conversation/LLM 服务。
@@ -343,16 +351,14 @@ flowchart TD
     B --> S[ensure_schema]
     B --> C[split_text]
     C --> A[LLMAnalyzer.analyze_architecture]
-    A --> C1[Conversation HTTP]
-    A --> C2[OpenAI chat/completions]
-    A --> C3[可选 LangChain]
-    A --> C4[llama.cpp completion]
-    A --> C5[RuleBasedArchitectureExtractor]
+    A --> C1[LLM_PROTOCOL=conversation]
+    A --> C2[LLM_PROTOCOL=litellm]
+    A --> C3[LLM_PROTOCOL=llama_cpp]
+    A --> C4[RuleBasedArchitectureExtractor]
     C1 --> N[ExtractedGraph]
     C2 --> N
     C3 --> N
     C4 --> N
-    C5 --> N
     N --> M[_merge_graphs]
     M --> E[_complete_missing_nodes]
     E --> V[upsert_node]

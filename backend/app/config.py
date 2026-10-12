@@ -50,20 +50,20 @@ class Settings:
     allow_registration: bool = _bool_env("ALLOW_REGISTRATION", True)
     max_upload_mb: int = _int_env("MAX_UPLOAD_MB", 200)
 
-    # Local LLM. This remains compatible with the user's test.py style:
-    # OpenAI-compatible /v1/chat/completions first, llama.cpp /completion fallback.
+    # Each LLM workflow can use litellm, conversation, or llama_cpp independently.
     llm_enabled: bool = _bool_env("LLM_ENABLED", True)
-    llm_base_url: str = _env("LLM_BASE_URL", "http://127.0.0.1:1234")
-    llm_model: str = _env("LLM_MODEL", "qwen3.5_14B_Q4_K_M")
+    llm_protocol: str = _env("LLM_PROTOCOL", "litellm")
+    llm_base_url: str = _env("LLM_BASE_URL", "http://127.0.0.1:4000/v1")
+    llm_model: str = _env("LLM_MODEL", "analysis-model")
     llm_api_key: str = _env("LLM_API_KEY", "not-needed")
+    llm_conversation_url: str = _env("LLM_CONVERSATION_URL", "http://127.0.0.1/api/conversation")
     llm_timeout_seconds: int = _int_env("LLM_TIMEOUT_SECONDS", 180)
     llm_connect_timeout_seconds: int = _int_env("LLM_CONNECT_TIMEOUT_SECONDS", 10)
     llm_max_tokens: int = _int_env("LLM_MAX_TOKENS", 2048)
     llm_chunk_chars: int = _int_env("LLM_CHUNK_CHARS", 700)
+    llm_max_workers: int = _int_env("LLM_MAX_WORKERS", 4)
     llm_disable_thinking: bool = _bool_env("LLM_DISABLE_THINKING", True)
-    # Default false: avoids LangChain/httpx proxy/credential surprises. Direct HTTP
-    # is the same OpenAI-compatible protocol used by the reference project/server.
-    llm_use_langchain_first: bool = _bool_env("LLM_USE_LANGCHAIN_FIRST", False)
+    llm_cache_salt: str = _env("LLM_CACHE_SALT", "")
     llm_disable_env_proxy: bool = _bool_env("LLM_DISABLE_ENV_PROXY", True)
 
     # HugeGraph REST. The client auto-detects both 1.7 graphspace URL and legacy URL.
@@ -108,12 +108,19 @@ class Settings:
     # Preferred model for choosing the most likely RCA candidate after the
     # deterministic hypothesis list has been generated.
     rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)
-    rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation")
+    rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1:4000/v1")
     rca_decision_model_config_id: str = _env("RCA_DECISION_MODEL_CONFIG_ID", "")
     rca_decision_assistant_role: str = _env("RCA_DECISION_ASSISTANT_ROLE", "general")
     rca_decision_assistant_name: str = _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant")
     rca_decision_assistant_prompt: str = _env("RCA_DECISION_ASSISTANT_PROMPT", "")
     rca_decision_stream: bool = _bool_env("RCA_DECISION_STREAM", False)
+    rca_decision_max_tokens: int = _int_env("RCA_DECISION_MAX_TOKENS", 2048)
+    rca_decision_protocol: str = _env("RCA_DECISION_PROTOCOL", "litellm")
+    rca_decision_model: str = _env("RCA_DECISION_MODEL", "rca-model")
+    rca_decision_api_key: str = _env("RCA_DECISION_API_KEY", "")
+    rca_decision_cache_salt: str = _env("RCA_DECISION_CACHE_SALT", "")
+    rca_decision_max_workers: int = _int_env("RCA_DECISION_MAX_WORKERS", 3)
+    rca_decision_isolate_conversations: bool = _bool_env("RCA_DECISION_ISOLATE_CONVERSATIONS", True)
     rca_decision_code_language: str = _env("RCA_DECISION_CODE_LANGUAGE", "")
     rca_decision_kb_id: str = _env("RCA_DECISION_KB_ID", "")
     rca_decision_kb_name: str = _env("RCA_DECISION_KB_NAME", "")

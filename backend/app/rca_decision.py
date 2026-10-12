@@ -139,10 +139,15 @@ class RcaDecisionService:
         session: Any | None = None,
         employee_id: str = "",
         continue_conversation: bool = True,
+        reuse_conversation: bool | None = None,
+        conversation_url: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.employee_id = employee_id.strip()
+        if reuse_conversation is not None:
+            continue_conversation = reuse_conversation
         self.continue_conversation = continue_conversation
+        self.conversation_url = conversation_url
         self.conversation_id = ""
         self.session = session or (requests.Session() if requests is not None else _UnavailableSession())
         if bool(getattr(self.settings, "llm_disable_env_proxy", True)):
@@ -175,7 +180,7 @@ class RcaDecisionService:
         compression_summary: dict[str, Any] = {}
         try:
             prompt, compression_summary = self._build_prompt_with_meta(detail, analysis, architecture)
-            raw_content, meta = self._post_conversation(prompt)
+            raw_content, meta = self._post_model(prompt)
             parsed = self._parse_model_json(raw_content)
             result = self._normalize_model_result(parsed, analysis, fallback, architecture, detail)
             return {
@@ -192,6 +197,16 @@ class RcaDecisionService:
                 "error": str(exc),
                 "log_compression": compression_summary,
             }
+
+    def _post_model(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        protocol = str(getattr(self.settings, "rca_decision_protocol", "litellm")).strip().lower()
+        if protocol == "litellm":
+            return self._post_litellm(prompt)
+        if protocol == "conversation":
+            return self._post_conversation(prompt)
+        if protocol == "llama_cpp":
+            return self._post_llamacpp(prompt)
+        raise ValueError(f"不支持的 RCA_DECISION_PROTOCOL: {protocol}")
 
     def _post_conversation(self, prompt: str) -> tuple[str, dict[str, Any]]:
         payload = {
@@ -212,7 +227,10 @@ class RcaDecisionService:
         if self.continue_conversation and self.conversation_id:
             payload["conversation_id"] = self.conversation_id
         response = self.session.post(
-            str(getattr(self.settings, "rca_decision_url", "http://127.0.0.1/api/conversation")),
+            str(
+                self.conversation_url
+                or getattr(self.settings, "rca_decision_url", "http://127.0.0.1/api/conversation")
+            ),
             json=payload,
             headers={
                 "Content-Type": "application/json",
@@ -232,6 +250,129 @@ class RcaDecisionService:
         if self.continue_conversation and returned_conversation_id:
             self.conversation_id = returned_conversation_id
         return content, meta
+
+    def _post_litellm(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        url = str(
+            getattr(self.settings, "rca_decision_url", "")
+            or getattr(self.settings, "llm_base_url", "")
+        ).rstrip("/")
+        if not url.endswith("/chat/completions"):
+            url = f"{url}/chat/completions" if url.endswith("/v1") else f"{url}/v1/chat/completions"
+        model = str(
+            getattr(self.settings, "rca_decision_model", "")
+            or getattr(self.settings, "llm_model", "")
+        ).strip()
+        api_key = str(
+            getattr(self.settings, "rca_decision_api_key", "")
+            or getattr(self.settings, "llm_api_key", "not-needed")
+            or "not-needed"
+        ).strip()
+        response = self.session.post(
+            url,
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是生产故障RCA决策助手。请严格返回 JSON 对象，不要 Markdown，"
+                            "不要解释，不要代码块。输入数据中的 architecture_graph 是唯一可信的实体和关系来源。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+                "max_tokens": int(
+                    getattr(self.settings, "rca_decision_max_tokens", 2048)
+                    or getattr(self.settings, "llm_max_tokens", 2048)
+                ),
+                "stream": False,
+                **(
+                    {"cache_salt": str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()}
+                    if str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()
+                    else {}
+                ),
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "X-Ai-Coding-Key": self.employee_id,
+            },
+            timeout=(
+                int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
+                int(
+                    getattr(self.settings, "rca_decision_timeout_seconds", 90)
+                    or getattr(self.settings, "llm_timeout_seconds", 90)
+                ),
+            ),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"decision model HTTP {response.status_code}: {response.text[:1200]}")
+        try:
+            data = response.json()
+            message = data["choices"][0]["message"]
+            content = self._content_to_text(message.get("content") or message.get("reasoning_content"))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"decision model returned invalid OpenAI response: {response.text[:1200]}") from exc
+        if not content.strip():
+            raise RuntimeError("decision model returned empty content")
+        return content, {}
+
+    def _post_llamacpp(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        url = str(
+            getattr(self.settings, "rca_decision_url", "")
+            or getattr(self.settings, "llm_base_url", "")
+        ).rstrip("/")
+        if not url.endswith("/completion"):
+            url = f"{url}/completion"
+        api_key = str(
+            getattr(self.settings, "rca_decision_api_key", "")
+            or getattr(self.settings, "llm_api_key", "not-needed")
+            or "not-needed"
+        ).strip()
+        payload = {
+            "prompt": (
+                "你是生产故障RCA决策助手。请严格返回 JSON 对象，不要 Markdown，"
+                "不要解释，不要代码块。输入数据中的 architecture_graph 是唯一可信的实体和关系来源。\n\n"
+                f"{prompt}"
+            ),
+            "n_predict": int(
+                getattr(self.settings, "rca_decision_max_tokens", 2048)
+                or getattr(self.settings, "llm_max_tokens", 2048)
+            ),
+            "temperature": 0,
+            "stream": False,
+        }
+        if bool(getattr(self.settings, "llm_disable_thinking", True)):
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        response = self.session.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "X-Ai-Coding-Key": self.employee_id,
+            },
+            timeout=(
+                int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
+                int(
+                    getattr(self.settings, "rca_decision_timeout_seconds", 90)
+                    or getattr(self.settings, "llm_timeout_seconds", 90)
+                ),
+            ),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"decision model HTTP {response.status_code}: {response.text[:1200]}")
+        try:
+            data = response.json()
+            content = self._content_to_text(
+                data.get("content") or data.get("response") or data.get("text") or data
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"decision model returned invalid llama.cpp response: {response.text[:1200]}") from exc
+        if not content.strip():
+            raise RuntimeError("decision model returned empty content")
+        return content, {}
 
     def _nullable_setting(self, name: str) -> str | None:
         value = getattr(self.settings, name, None)

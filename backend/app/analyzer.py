@@ -93,10 +93,8 @@ JSON 格式固定为：
 class LLMAnalyzer:
     """Architecture extractor.
 
-    Production rule for this demo: /api/import must not fail just because the
-    local model is slow, returns Qwen reasoning_content only, or returns invalid
-    JSON. We try the local OpenAI-compatible endpoint first, then optional
-    LangChain, then llama.cpp /completion, and finally a deterministic extractor.
+    The selected protocol is configured by LLM_PROTOCOL. The import flow keeps
+    its deterministic fallback when the selected model endpoint fails.
     """
 
     def __init__(self, employee_id: str = "") -> None:
@@ -130,50 +128,45 @@ class LLMAnalyzer:
         errors: list[str] = []
 
         if self.settings.llm_enabled:
-            try:
-                result = self._analyze_with_conversation_http(user_text)
-                self.last_mode = "llm-conversation-http"
-                return result
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                errors.append(f"Conversation HTTP失败: {msg}")
-                self.last_logs.append(errors[-1])
-
-            # Direct HTTP first. It is closer to the user's test.py and avoids
-            # LangChain/httpx proxy surprises by using Session(trust_env=False).
-            try:
-                result = self._analyze_with_openai_http(user_text)
-                self.last_mode = "llm-openai-http"
-                return result
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                errors.append(f"OpenAI兼容HTTP失败: {msg}")
-                self.last_logs.append(errors[-1])
-                # Qwen3 can spend the whole response budget in reasoning_content,
-                # leaving content empty. Retrying other adapters usually repeats
-                # the same failure and wastes minutes, so fall back immediately.
-                if "被截断的思考" in msg or "reasoning_content" in msg or "finish_reason=length" in msg:
-                    self.last_error = " | ".join(errors)
-                    self.last_mode = "rule-fallback"
-                    fallback = RuleBasedArchitectureExtractor().extract(user_text)
-                    self.last_logs.append("模型返回思考过程而不是 JSON，已立即切换规则兜底抽取。")
-                    return fallback.model_dump()
-
-            if self.settings.llm_use_langchain_first:
+            protocol = str(getattr(self.settings, "llm_protocol", "litellm")).strip().lower()
+            if protocol == "conversation":
                 try:
-                    result = self._analyze_with_langchain(user_text)
-                    self.last_mode = "llm-langchain"
+                    result = self._analyze_with_conversation_http(user_text)
+                    self.last_mode = "llm-conversation-http"
                     return result
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"LangChain失败: {exc}")
+                    msg = str(exc)
+                    errors.append(f"Conversation HTTP失败: {msg}")
                     self.last_logs.append(errors[-1])
 
-            try:
-                result = self._analyze_with_llamacpp_completion(user_text)
-                self.last_mode = "llm-llamacpp-completion"
-                return result
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"llama.cpp /completion失败: {exc}")
+            if protocol == "litellm":
+                try:
+                    result = self._analyze_with_litellm_http(user_text)
+                    self.last_mode = "llm-litellm-http"
+                    return result
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    errors.append(f"LiteLLM HTTP失败: {msg}")
+                    self.last_logs.append(errors[-1])
+                    # Qwen3 can spend the whole response budget in reasoning_content,
+                    # leaving content empty. Retrying another adapter repeats the
+                    # same failure and wastes time, so fall back immediately.
+                    if "被截断的思考" in msg or "reasoning_content" in msg or "finish_reason=length" in msg:
+                        self.last_error = " | ".join(errors)
+                        self.last_mode = "rule-fallback"
+                        fallback = RuleBasedArchitectureExtractor().extract(user_text)
+                        self.last_logs.append("模型返回思考过程而不是 JSON，已立即切换规则兜底抽取。")
+                        return fallback.model_dump()
+            elif protocol == "llama_cpp":
+                try:
+                    result = self._analyze_with_llamacpp_completion(user_text)
+                    self.last_mode = "llm-llamacpp-completion"
+                    return result
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"llama.cpp /completion失败: {exc}")
+                    self.last_logs.append(errors[-1])
+            else:
+                errors.append(f"不支持的 LLM_PROTOCOL: {protocol}")
                 self.last_logs.append(errors[-1])
 
         self.last_error = " | ".join(errors)
@@ -215,8 +208,6 @@ class LLMAnalyzer:
         )
 
     def _analyze_with_conversation_http(self, user_text: str) -> dict[str, Any]:
-        if not bool(getattr(self.settings, "rca_decision_enabled", True)):
-            raise RuntimeError("Conversation model is disabled")
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"{self._build_user_prompt(user_text)}\n"
@@ -227,6 +218,7 @@ class LLMAnalyzer:
             session=self.session,
             employee_id=self.employee_id,
             continue_conversation=False,
+            conversation_url=self.settings.llm_conversation_url,
         )._post_conversation(prompt)
         parsed = self._parse_json_lenient(content)
         return self._normalize_graph(parsed).model_dump()
@@ -242,6 +234,9 @@ class LLMAnalyzer:
             "max_tokens": self.settings.llm_max_tokens,
             "stream": False,
         }
+        cache_salt = str(getattr(self.settings, "llm_cache_salt", "") or "").strip()
+        if cache_salt:
+            base_payload["cache_salt"] = cache_salt
         payloads = []
         if self.settings.llm_disable_thinking:
             # llama.cpp/Qwen3 recognizes this. Other local servers usually ignore
@@ -250,7 +245,7 @@ class LLMAnalyzer:
         payloads.append(base_payload)
         return payloads
 
-    def _analyze_with_openai_http(self, user_text: str) -> dict[str, Any]:
+    def _analyze_with_litellm_http(self, user_text: str) -> dict[str, Any]:
         errors: list[str] = []
         chat_urls: list[str] = []
         for base in [self.settings.llm_openai_base_url, normalize_openai_base_url(self.settings.llm_base_url)]:
@@ -347,48 +342,6 @@ class LLMAnalyzer:
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
         raise RuntimeError("; ".join(errors))
-
-    def _create_chat_openai(self):
-        from langchain_openai import ChatOpenAI
-
-        kwargs: dict[str, Any] = {
-            "model": self.settings.llm_model,
-            "base_url": self.settings.llm_openai_base_url,
-            "api_key": self.api_key,
-            "temperature": 0,
-            "max_tokens": self.settings.llm_max_tokens,
-            "timeout": self.settings.llm_timeout_seconds,
-            "max_retries": 0,
-            "default_headers": {"X-Ai-Coding-Key": self.employee_id},
-        }
-        if self.settings.llm_disable_env_proxy:
-            try:
-                import httpx
-
-                kwargs["http_client"] = httpx.Client(
-                    trust_env=False,
-                    timeout=httpx.Timeout(
-                        self.settings.llm_timeout_seconds,
-                        connect=self.settings.llm_connect_timeout_seconds,
-                    ),
-                )
-            except Exception:
-                pass
-        return ChatOpenAI(**kwargs)
-
-    def _analyze_with_langchain(self, user_text: str) -> dict[str, Any]:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        llm = self._create_chat_openai()
-        raw_message = llm.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=self._build_user_prompt(user_text)),
-            ]
-        )
-        content = getattr(raw_message, "content", "") or str(raw_message)
-        parsed = self._parse_json_lenient(content)
-        return self._normalize_graph(parsed).model_dump()
 
     def _content_to_text(self, value: Any) -> str:
         if value is None:

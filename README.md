@@ -58,6 +58,49 @@ Redis生产集群 -HAS_MEMBER-> redis-1 / redis-2 / redis-3
 
 若架构文本没有这些事实，大模型不能凭空补齐；请在前端人工校正后再导入日志。
 
+### 模型调用协议与 LiteLLM 网关
+
+日志分析和 RCA 决策可以独立选择调用协议：
+
+```dotenv
+LLM_PROTOCOL=litellm
+RCA_DECISION_PROTOCOL=litellm
+LLM_BASE_URL=http://127.0.0.1:4000/v1
+LLM_MODEL=analysis-model
+RCA_DECISION_URL=http://127.0.0.1:4000/v1
+RCA_DECISION_MODEL=rca-model
+```
+
+可选值为：
+
+```text
+litellm      通过 LiteLLM 网关调用云厂商或自部署模型
+conversation 现有 conversation 接口直连
+llama_cpp    现有 llama.cpp /completion 接口直连
+```
+
+当日志分析选择 `conversation` 时，使用 `LLM_CONVERSATION_URL`；当 RCA
+选择 `conversation` 时，使用 `RCA_DECISION_URL`。两条链路的协议和地址互不影响。
+
+LiteLLM 作为独立进程运行：
+
+```bash
+cd backend
+python -m venv .venv-litellm
+# Linux/macOS: source .venv-litellm/bin/activate
+# Windows PowerShell: .venv-litellm\Scripts\Activate.ps1
+pip install "litellm[proxy]"
+export LITELLM_MASTER_KEY=sk-local-gateway
+litellm --config litellm_config.yaml --port 4000
+```
+
+默认配置下，项目访问 `http://127.0.0.1:4000/v1`。新增云厂商、vLLM、
+SGLang 或其他 OpenAI 兼容服务时，只修改 `backend/litellm_config.yaml`
+并增加一个模型别名，项目代码和项目依赖不需要修改。
+
+架构文档分片和多个 Incident 的 LLM 请求都支持有上限并发，分别由
+`LLM_MAX_WORKERS` 和 `RCA_DECISION_MAX_WORKERS` 控制。
+
 ### 4. 再日志解析检测
 
 点击 **日志解析检测**，上传日志文件或压缩包。系统会按内容自动识别 Spring/Log4j、

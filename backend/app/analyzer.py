@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import urllib.parse
@@ -20,6 +21,9 @@ except Exception:  # pragma: no cover
 from .config import get_settings
 from .models import ExtractedCall, ExtractedGraph, ExtractedNode
 from .rca_decision import RcaDecisionService
+
+
+logger = logging.getLogger(__name__)
 
 
 class _UnavailableSession:
@@ -272,6 +276,7 @@ class LLMAnalyzer:
         raise RuntimeError("; ".join(errors))
 
     def _post_chat_completion(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> str:
+        logger.info("[LLM] 请求输入 url=%s payload=%s", url, json.dumps(payload, ensure_ascii=False))
         response = self.session.post(
             url,
             json=payload,
@@ -292,9 +297,15 @@ class LLMAnalyzer:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"响应 JSON 中没有 choices[0].message: {json.dumps(data, ensure_ascii=False)[:1000]}") from exc
 
-        content_candidates = [message.get("content"), message.get("reasoning_content")]
-        content = "\n".join(self._content_to_text(x) for x in content_candidates if self._content_to_text(x).strip()).strip()
+        content = self._content_to_text(message.get("content")).strip()
         finish_reason = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
+        logger.info(
+            "[LLM] 模型输出 status=%s finish_reason=%s usage=%s content=%s",
+            response.status_code,
+            finish_reason,
+            json.dumps(data.get("usage"), ensure_ascii=False),
+            content,
+        )
         if not content:
             raise RuntimeError(f"模型返回内容为空 finish_reason={finish_reason}: {json.dumps(data, ensure_ascii=False)[:1200]}")
         if finish_reason == "length" and "{" not in content:
@@ -368,26 +379,32 @@ class LLMAnalyzer:
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
         text = re.sub(r"^```(?:json)?", "", text).strip()
         text = re.sub(r"```$", "", text).strip()
-        # Prefer object output, but accept arrays and normalize below.
-        obj_start = text.find("{")
-        obj_end = text.rfind("}")
-        arr_start = text.find("[")
-        arr_end = text.rfind("]")
-        if obj_start >= 0 and obj_end >= obj_start:
-            candidate = text[obj_start : obj_end + 1]
-        elif arr_start >= 0 and arr_end >= arr_start:
-            candidate = text[arr_start : arr_end + 1]
-        else:
-            candidate = text
-        if not candidate.strip():
+        # Models may mix reasoning text with the JSON answer. Try each complete
+        # JSON value in order and keep the first one that looks like a graph.
+        decoder = json.JSONDecoder()
+        for start_char in ("{", "["):
+            idx = text.find(start_char)
+            while idx >= 0:
+                try:
+                    parsed, _end = decoder.raw_decode(text[idx:])
+                except json.JSONDecodeError:
+                    parsed = None
+                if self._looks_like_graph(parsed):
+                    return parsed
+                idx = text.find(start_char, idx + 1)
+        if not text.strip():
             raise ValueError("模型输出为空，无法解析 JSON")
-        try:
-            return json.loads(candidate)
-        except Exception:
-            repaired = repair_json(candidate)
-            if not str(repaired).strip():
-                raise ValueError(f"JSON 修复后仍为空。原始输出前 1000 字: {text[:1000]}")
-            return json.loads(repaired)
+        repaired = repair_json(text)
+        if not str(repaired).strip():
+            raise ValueError(f"JSON 修复后仍为空。原始输出前 1000 字: {text[:1000]}")
+        return json.loads(repaired)
+
+    def _looks_like_graph(self, data: Any) -> bool:
+        if isinstance(data, list):
+            return bool(data)
+        if isinstance(data, dict):
+            return bool({"services", "nodes", "calls", "edges", "vertices", "relations"} & data.keys())
+        return False
 
     def _normalize_graph(self, data: Any) -> ExtractedGraph:
         if isinstance(data, list):

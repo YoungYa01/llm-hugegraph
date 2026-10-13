@@ -35,3 +35,4 @@ examples/*.zip
 *.sw?
 
 backend/tests/
+backend/litellm_config.yaml

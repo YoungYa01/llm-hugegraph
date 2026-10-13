@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import re
+import threading
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -22,6 +24,8 @@ from .config import get_settings
 from .incident_titles import normalize_incident_title
 from .log_compression import LogCompressionConfig, LogContextCompressor
 
+
+logger = logging.getLogger(__name__)
 
 _KIND_CODES = {
     "Service": "SV",
@@ -133,6 +137,9 @@ class _UnavailableSession:
 class RcaDecisionService:
     """Ask the preferred RCA decision model to choose the strongest hypothesis."""
 
+    _active_calls = 0
+    _active_calls_lock = threading.Lock()
+
     def __init__(
         self,
         settings: Any | None = None,
@@ -162,6 +169,17 @@ class RcaDecisionService:
                 max_message_chars=int(getattr(self.settings, "log_compression_max_message_chars", 700)),
             )
         )
+
+    @classmethod
+    def _acquire_call_slot(cls) -> int:
+        with cls._active_calls_lock:
+            cls._active_calls += 1
+            return cls._active_calls
+
+    @classmethod
+    def _release_call_slot(cls) -> None:
+        with cls._active_calls_lock:
+            cls._active_calls -= 1
 
     def enrich(
         self,
@@ -267,56 +285,77 @@ class RcaDecisionService:
             or getattr(self.settings, "llm_api_key", "not-needed")
             or "not-needed"
         ).strip()
-        response = self.session.post(
-            url,
-            json={
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是生产故障RCA决策助手。请严格返回 JSON 对象，不要 Markdown，"
-                            "不要解释，不要代码块。输入数据中的 architecture_graph 是唯一可信的实体和关系来源。"
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0,
-                "max_tokens": int(
-                    getattr(self.settings, "rca_decision_max_tokens", 2048)
-                    or getattr(self.settings, "llm_max_tokens", 2048)
-                ),
-                "stream": False,
-                **(
-                    {"cache_salt": str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()}
-                    if str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()
-                    else {}
-                ),
-            },
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "X-Ai-Coding-Key": self.employee_id,
-            },
-            timeout=(
-                int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
-                int(
-                    getattr(self.settings, "rca_decision_timeout_seconds", 90)
-                    or getattr(self.settings, "llm_timeout_seconds", 90)
-                ),
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是生产故障RCA决策助手。请严格返回 JSON 对象，不要 Markdown，"
+                        "不要解释，不要代码块。输入数据中的 architecture_graph 是唯一可信的实体和关系来源。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": int(
+                getattr(self.settings, "rca_decision_max_tokens", 2048)
+                or getattr(self.settings, "llm_max_tokens", 2048)
             ),
+            "stream": False,
+            **(
+                {"cache_salt": str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()}
+                if str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()
+                else {}
+            ),
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "X-Ai-Coding-Key": self.employee_id,
+        }
+        concurrency = self._acquire_call_slot()
+        logger.info(
+            "[RCA-LLM] 请求输入 url=%s concurrency=%s payload=%s",
+            url,
+            concurrency,
+            json.dumps(payload, ensure_ascii=False),
         )
-        if response.status_code >= 400:
-            raise RuntimeError(f"decision model HTTP {response.status_code}: {response.text[:1200]}")
         try:
-            data = response.json()
-            message = data["choices"][0]["message"]
-            content = self._content_to_text(message.get("content") or message.get("reasoning_content"))
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"decision model returned invalid OpenAI response: {response.text[:1200]}") from exc
-        if not content.strip():
-            raise RuntimeError("decision model returned empty content")
-        return content, {}
+            response = self.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=(
+                    int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
+                    int(
+                        getattr(self.settings, "rca_decision_timeout_seconds", 90)
+                        or getattr(self.settings, "llm_timeout_seconds", 90)
+                    ),
+                ),
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"decision model HTTP {response.status_code}: {response.text[:1200]}")
+            try:
+                data = response.json()
+                message = data["choices"][0]["message"]
+                content = self._content_to_text(message.get("content"))
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"decision model returned invalid OpenAI response: {response.text[:1200]}") from exc
+            finish_reason = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
+            logger.info(
+                "[RCA-LLM] 模型输出 status=%s finish_reason=%s usage=%s concurrency=%s content=%s",
+                response.status_code,
+                finish_reason,
+                json.dumps(data.get("usage"), ensure_ascii=False),
+                concurrency,
+                content,
+            )
+            if not content.strip():
+                raise RuntimeError("decision model returned empty content")
+            return content, {}
+        finally:
+            self._release_call_slot()
 
     def _post_llamacpp(self, prompt: str) -> tuple[str, dict[str, Any]]:
         url = str(

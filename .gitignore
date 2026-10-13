@@ -9,6 +9,7 @@ backend/tests/
 .env
 # Logs
 logs
+log/
 *.log
 npm-debug.log*
 yarn-debug.log*

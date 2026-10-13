@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from urllib.parse import unquote
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -18,6 +19,16 @@ from .service import GraphBuilderService
 from .system_api import router as system_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+log_dir = Path(__file__).resolve().parents[2] / "log"
+log_dir.mkdir(exist_ok=True)
+llm_handler = logging.FileHandler(log_dir / "llm.log", encoding="utf-8")
+llm_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+for llm_logger_name in ("app.analyzer", "app.rca_decision"):
+    llm_logger = logging.getLogger(llm_logger_name)
+    llm_logger.addHandler(llm_handler)
+    llm_logger.propagate = False
+
 logger = logging.getLogger("logsys-kg-demo")
 
 app = FastAPI(title="LogSys Knowledge Graph RCA System", version="8.0.0")

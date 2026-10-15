@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
     def repair_json(text: str) -> str:
         return text
 
-from .config import get_settings
+from .config import get_settings, normalize_llm_provider, normalize_openai_base_url
 from .incident_titles import normalize_incident_title
 from .log_compression import LogCompressionConfig, LogContextCompressor
 
@@ -131,7 +131,7 @@ class _UnavailableSession:
 
 
 class RcaDecisionService:
-    """Ask the preferred RCA decision model to choose the strongest hypothesis."""
+    """Ask the provider selected by LLM_PROVIDER to choose the strongest hypothesis."""
 
     def __init__(
         self,
@@ -150,11 +150,11 @@ class RcaDecisionService:
         self.log_compressor = LogContextCompressor(
             LogCompressionConfig(
                 enabled=bool(getattr(self.settings, "log_compression_enabled", True)),
-                max_chars=int(getattr(self.settings, "log_compression_max_chars", 12_000)),
-                max_events=int(getattr(self.settings, "log_compression_max_events", 48)),
+                max_chars=int(getattr(self.settings, "log_compression_max_chars", 6_000)),
+                max_events=int(getattr(self.settings, "log_compression_max_events", 16)),
                 context_radius=int(getattr(self.settings, "log_compression_context_radius", 2)),
-                max_patterns=int(getattr(self.settings, "log_compression_max_patterns", 12)),
-                max_message_chars=int(getattr(self.settings, "log_compression_max_message_chars", 700)),
+                max_patterns=int(getattr(self.settings, "log_compression_max_patterns", 6)),
+                max_message_chars=int(getattr(self.settings, "log_compression_max_message_chars", 300)),
             )
         )
 
@@ -169,20 +169,34 @@ class RcaDecisionService:
             architecture,
             detail,
         )
+        if not bool(getattr(self.settings, "llm_enabled", True)):
+            return {**fallback, "error": "LLM is disabled"}
         if not bool(getattr(self.settings, "rca_decision_enabled", True)):
             return {**fallback, "error": "RCA decision model is disabled"}
 
         compression_summary: dict[str, Any] = {}
         try:
             prompt, compression_summary = self._build_prompt_with_meta(detail, analysis, architecture)
-            raw_content, meta = self._post_conversation(prompt)
+            raw_content, meta = self._post_model(prompt)
             parsed = self._parse_model_json(raw_content)
             result = self._normalize_model_result(parsed, analysis, fallback, architecture, detail)
+            provider = normalize_llm_provider(getattr(self.settings, "llm_provider", "company"))
             return {
                 **result,
                 "source": "llm",
-                "model_config_id": str(getattr(self.settings, "rca_decision_model_config_id", "") or ""),
+                "provider": provider,
+                "model": (
+                    self._company_setting("company_llm_model_config_id", "rca_decision_model_config_id", "")
+                    if provider == "company"
+                    else str(getattr(self.settings, "llm_model", "") or "")
+                ),
+                "model_config_id": (
+                    self._company_setting("company_llm_model_config_id", "rca_decision_model_config_id", "")
+                    if provider == "company"
+                    else ""
+                ),
                 "conversation_id": str(meta.get("conversation_id") or ""),
+                "llm_usage": meta.get("usage") if isinstance(meta.get("usage"), dict) else {},
                 "raw_content": raw_content,
                 "log_compression": compression_summary,
             }
@@ -193,34 +207,61 @@ class RcaDecisionService:
                 "log_compression": compression_summary,
             }
 
+    def _post_model(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        provider = normalize_llm_provider(getattr(self.settings, "llm_provider", "company"))
+        if provider == "company":
+            return self._post_conversation(prompt)
+        if provider == "openai":
+            return self._post_openai_chat(prompt)
+        return self._post_llamacpp_completion(prompt)
+
     def _post_conversation(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        disable_thinking = bool(getattr(self.settings, "llm_disable_thinking", True))
+        user_prompt = f"/no_think\n{prompt}" if disable_thinking else prompt
         payload = {
-            "content": prompt,
-            "model_config_id": str(getattr(self.settings, "rca_decision_model_config_id", "") or ""),
-            "attachments": [],
-            "stream": bool(getattr(self.settings, "rca_decision_stream", False)),
-            "code_language": str(getattr(self.settings, "rca_decision_code_language", "") or ""),
-            "assistant_role": str(getattr(self.settings, "rca_decision_assistant_role", "general") or "general"),
-            "assistant_name": str(
-                getattr(self.settings, "rca_decision_assistant_name", "normal_assistant")
-                or "normal_assistant"
+            "content": user_prompt,
+            "model_config_id": self._company_setting(
+                "company_llm_model_config_id", "rca_decision_model_config_id", ""
             ),
-            "assistant_prompt": str(getattr(self.settings, "rca_decision_assistant_prompt", "") or ""),
-            "kb_id": self._nullable_setting("rca_decision_kb_id"),
-            "kb_name": self._nullable_setting("rca_decision_kb_name"),
+            "attachments": [],
+            "stream": bool(
+                self._company_setting("company_llm_stream", "rca_decision_stream", False)
+            ),
+            "code_language": self._company_setting(
+                "company_llm_code_language", "rca_decision_code_language", ""
+            ),
+            "assistant_role": self._company_setting(
+                "company_llm_assistant_role", "rca_decision_assistant_role", "general"
+            ),
+            "assistant_name": self._company_setting(
+                "company_llm_assistant_name", "rca_decision_assistant_name", "normal_assistant"
+            ),
+            "assistant_prompt": self._company_setting(
+                "company_llm_assistant_prompt", "rca_decision_assistant_prompt", ""
+            ),
+            "kb_id": self._nullable_company_setting("company_llm_kb_id", "rca_decision_kb_id"),
+            "kb_name": self._nullable_company_setting("company_llm_kb_name", "rca_decision_kb_name"),
         }
         if self.continue_conversation and self.conversation_id:
             payload["conversation_id"] = self.conversation_id
         response = self.session.post(
-            str(getattr(self.settings, "rca_decision_url", "http://127.0.0.1/api/conversation")),
+            self._company_setting(
+                "company_llm_url", "rca_decision_url", "http://127.0.0.1/api/conversation"
+            ),
             json=payload,
             headers={
                 "Content-Type": "application/json",
                 "X-Ai-Coding-Key": self.employee_id,
             },
             timeout=(
-                int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
-                int(getattr(self.settings, "rca_decision_timeout_seconds", 90)),
+                int(self._company_setting(
+                    "company_llm_connect_timeout_seconds",
+                    "rca_decision_connect_timeout_seconds",
+                    10,
+                )),
+                int(self._company_setting(
+                    "company_llm_timeout_seconds", "rca_decision_timeout_seconds", 90
+                )),
             ),
         )
         if response.status_code >= 400:
@@ -232,6 +273,102 @@ class RcaDecisionService:
         if self.continue_conversation and returned_conversation_id:
             self.conversation_id = returned_conversation_id
         return content, meta
+
+    def _post_openai_chat(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        url = f"{normalize_openai_base_url(str(getattr(self.settings, 'llm_base_url', ''))).rstrip('/')}/chat/completions"
+        disable_thinking = bool(getattr(self.settings, "llm_disable_thinking", True))
+        user_prompt = f"/no_think\n{prompt}" if disable_thinking else prompt
+        payload = {
+            "model": str(getattr(self.settings, "llm_model", "") or ""),
+            "messages": [{"role": "user", "content": user_prompt}],
+            "temperature": 0,
+            "max_tokens": max(128, int(getattr(self.settings, "rca_llm_max_tokens", 2048))),
+            "stream": False,
+        }
+        if disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {str(getattr(self.settings, 'llm_api_key', 'not-needed') or 'not-needed')}",
+        }
+        response = self.session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=(
+                int(getattr(self.settings, "llm_connect_timeout_seconds", 10)),
+                int(getattr(self.settings, "llm_timeout_seconds", 180)),
+            ),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"OpenAI-compatible model HTTP {response.status_code}: {response.text[:1200]}")
+        try:
+            data = response.json()
+            choice = data["choices"][0]
+            message = choice["message"]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"OpenAI-compatible model returned invalid response: {response.text[:1200]}") from exc
+        content = self._content_to_text(message.get("content"))
+        if not content.strip():
+            content = self._content_to_text(message.get("reasoning_content"))
+        if not content.strip():
+            raise RuntimeError("OpenAI-compatible model returned empty content")
+        return content, {
+            "provider": "openai",
+            "model": str(data.get("model") or payload["model"]),
+            "finish_reason": str(choice.get("finish_reason") or ""),
+            "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
+        }
+
+    def _post_llamacpp_completion(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        url = f"{str(getattr(self.settings, 'llm_base_url', '')).rstrip('/')}/completion"
+        disable_thinking = bool(getattr(self.settings, "llm_disable_thinking", True))
+        user_prompt = f"/no_think\n{prompt}" if disable_thinking else prompt
+        payload: dict[str, Any] = {
+            "prompt": user_prompt,
+            "n_predict": max(128, int(getattr(self.settings, "rca_llm_max_tokens", 2048))),
+            "temperature": 0,
+            "stream": False,
+        }
+        if disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        response = self.session.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {str(getattr(self.settings, 'llm_api_key', 'not-needed') or 'not-needed')}",
+            },
+            timeout=(
+                int(getattr(self.settings, "llm_connect_timeout_seconds", 10)),
+                int(getattr(self.settings, "llm_timeout_seconds", 180)),
+            ),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"llama.cpp model HTTP {response.status_code}: {response.text[:1200]}")
+        try:
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"llama.cpp model returned invalid response: {response.text[:1200]}") from exc
+        content = self._content_to_text(
+            data.get("content") or data.get("response") or data.get("text")
+        )
+        if not content.strip():
+            raise RuntimeError("llama.cpp model returned empty content")
+        return content, {"provider": "llamacpp", "model": str(getattr(self.settings, "llm_model", "") or "")}
+
+    def _company_setting(self, name: str, legacy_name: str, default: Any) -> Any:
+        if hasattr(self.settings, name):
+            value = getattr(self.settings, name)
+            if value is not None:
+                return value
+        value = getattr(self.settings, legacy_name, default)
+        return default if value is None else value
+
+    def _nullable_company_setting(self, name: str, legacy_name: str) -> str | None:
+        value = self._company_setting(name, legacy_name, "")
+        text = str(value or "").strip()
+        return text or None
 
     def _nullable_setting(self, name: str) -> str | None:
         value = getattr(self.settings, name, None)
@@ -1144,9 +1281,21 @@ class RcaDecisionService:
                 "repeated_patterns": [],
             }
 
-        catalog = self._architecture_catalog(architecture)
+        full_catalog = self._architecture_catalog(architecture)
+        catalog, architecture_scope = self._incident_architecture_catalog(
+            full_catalog,
+            detail,
+            analysis,
+        )
         architecture_data = self._compact_architecture_prompt(catalog)
-        graph_fingerprint = self._architecture_fingerprint(catalog)
+        graph_fingerprint = self._architecture_fingerprint(full_catalog)
+
+        root_evidence = self._compact_log_record(detail.get("root_evidence"))
+        root_candidates = self._compact_log_records(
+            detail.get("root_candidates"),
+            exclude_event_id=str(root_evidence.get("event_id") or ""),
+        )
+        upstream_effects = self._compact_log_records(detail.get("upstream_effects"))
 
         prompt_data = {
             "architecture_graph": architecture_data,
@@ -1155,9 +1304,9 @@ class RcaDecisionService:
                 "incident_id": detail.get("incident_id") or analysis.get("incident_id"),
                 "root_service_candidate": detail.get("root_service_candidate"),
                 "root_cause_candidate": detail.get("root_cause_candidate"),
-                "root_evidence": self._compact_value(detail.get("root_evidence")),
-                "candidate_reason_logs": self._compact_value(detail.get("root_candidates") or []),
-                "upstream_effect_logs": self._compact_value(detail.get("upstream_effects") or []),
+                "root_evidence": root_evidence,
+                "candidate_reason_logs": root_candidates,
+                "upstream_effect_logs": upstream_effects,
                 "fault_start": detail.get("fault_start"),
                 "fault_end": detail.get("fault_end"),
                 "observed_entities": self._extract_log_entities(detail, timeline),
@@ -1172,7 +1321,8 @@ class RcaDecisionService:
         }
         prompt = (
             "你是生产故障RCA决策助手。architecture_graph是本项目架构的唯一实体和关系来源。"
-            "architecture_graph包含本次请求独立使用的完整紧凑架构，不得依赖其他请求的会话上下文补全图谱。"
+            "architecture_graph包含围绕本次算法候选裁剪出的紧凑关联子图；只能在子图节点中选择根因，"
+            "不得依赖其他请求的会话上下文补全或编造未提供的图谱。"
             "紧凑格式：n节点=[id,name,type,meta]，e关系=[sourceId,targetId,relation,meta]；"
             "type和relation缩写见schema，meta字段见schema.m。architecture_focus仅补充本次候选节点描述。"
             "请结合候选原因日志、架构节点及边判断根因并组织传播路径，不得编造节点、ID、关系、IP、端口或日志证据。\n"
@@ -1215,9 +1365,14 @@ class RcaDecisionService:
         summary = dict(log_context.get("summary") or {})
         summary["architecture"] = {
             "fingerprint": graph_fingerprint,
-            "included": True,
+            "included": bool(catalog["nodes"]),
+            "scope": architecture_scope["scope"],
+            "seed_node_ids": architecture_scope["seed_node_ids"],
+            "radius": architecture_scope["radius"],
             "nodes": len(catalog["nodes"]),
             "edges": len(catalog["edges"]),
+            "full_nodes": len(full_catalog["nodes"]),
+            "full_edges": len(full_catalog["edges"]),
         }
         return prompt, summary
 
@@ -1289,6 +1444,105 @@ class RcaDecisionService:
             "by_id": by_id,
             "alias_to_id": alias_to_id,
             "adjacency": adjacency,
+        }
+
+    def _incident_architecture_catalog(
+        self,
+        catalog: dict[str, Any],
+        detail: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Keep only the candidate-centered architecture neighborhood for one prompt."""
+
+        radius = max(0, min(int(getattr(self.settings, "rca_prompt_architecture_radius", 2)), 4))
+        max_nodes = max(4, int(getattr(self.settings, "rca_prompt_architecture_max_nodes", 20)))
+        max_seeds = max(1, min(int(getattr(self.settings, "rca_prompt_architecture_max_seeds", 3)), 8))
+        full_node_count = len(catalog.get("nodes") or [])
+        base_scope = {
+            "scope": "full",
+            "seed_node_ids": [],
+            "radius": radius,
+        }
+        if full_node_count <= max_nodes:
+            return catalog, base_scope
+
+        evidence = detail.get("root_evidence") if isinstance(detail.get("root_evidence"), dict) else {}
+        seed_values: list[Any] = [
+            detail.get("root_cause_candidate"),
+            detail.get("root_service_candidate"),
+            analysis.get("resolved_root_service"),
+            evidence.get("instance"),
+            evidence.get("service"),
+        ]
+        hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
+        for item in hypotheses:
+            if isinstance(item, dict):
+                seed_values.append(item.get("candidate"))
+
+        seed_ids: list[str] = []
+        for value in seed_values:
+            node_id = self._resolve_catalog_node_id(value, catalog)
+            if node_id and node_id not in seed_ids:
+                seed_ids.append(node_id)
+            if len(seed_ids) >= max_seeds:
+                break
+        if not seed_ids:
+            # With no architecture-grounded candidate, pruning would be arbitrary.
+            return catalog, base_scope
+
+        distances = {node_id: 0 for node_id in seed_ids}
+        queue = list(seed_ids)
+        cursor = 0
+        while cursor < len(queue):
+            node_id = queue[cursor]
+            cursor += 1
+            distance = distances[node_id]
+            if distance >= radius:
+                continue
+            for neighbor in sorted(catalog["adjacency"].get(node_id, set())):
+                if neighbor in distances:
+                    continue
+                distances[neighbor] = distance + 1
+                queue.append(neighbor)
+
+        node_order = {
+            str(node.get("node_id") or ""): index
+            for index, node in enumerate(catalog.get("nodes") or [])
+        }
+        selected_ids = sorted(
+            distances,
+            key=lambda node_id: (distances[node_id], node_order.get(node_id, 10**9), node_id),
+        )[:max_nodes]
+        selected = set(selected_ids)
+        nodes = [node for node in catalog["nodes"] if node["node_id"] in selected]
+        edges = [
+            edge
+            for edge in catalog["edges"]
+            if edge["source_node_id"] in selected and edge["target_node_id"] in selected
+        ]
+        by_id = {node["node_id"]: node for node in nodes}
+        adjacency: dict[str, set[str]] = {node_id: set() for node_id in by_id}
+        for edge in edges:
+            source = edge["source_node_id"]
+            target = edge["target_node_id"]
+            adjacency[source].add(target)
+            adjacency[target].add(source)
+        subset = {
+            "nodes": nodes,
+            "edges": edges,
+            "by_id": by_id,
+            "alias_to_id": {
+                alias: node_id
+                for alias, node_id in catalog["alias_to_id"].items()
+                if node_id in selected
+            },
+            "adjacency": adjacency,
+        }
+        scope = "related_subgraph" if len(nodes) < full_node_count else "full"
+        return subset, {
+            "scope": scope,
+            "seed_node_ids": seed_ids,
+            "radius": radius,
         }
 
     def _compact_architecture_prompt(self, catalog: dict[str, Any]) -> dict[str, Any]:
@@ -1644,6 +1898,57 @@ class RcaDecisionService:
                 queue.append(neighbor)
         return []
 
+    def _compact_log_record(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        result: dict[str, Any] = {}
+        for key in (
+            "event_id",
+            "timestamp",
+            "service",
+            "instance",
+            "trace_id",
+            "fault_family",
+            "exception_class",
+            "root_exception_class",
+            "root_candidate_score",
+        ):
+            item = value.get(key)
+            if item not in (None, "", [], {}):
+                result[key] = self._compact_value(item)
+        evidence = next(
+            (
+                str(value.get(key) or "").strip()
+                for key in ("root_cause", "semantic_message", "message")
+                if str(value.get(key) or "").strip()
+            ),
+            "",
+        )
+        if evidence:
+            result["evidence"] = evidence if len(evidence) <= 420 else evidence[:419] + "…"
+        return result
+
+    def _compact_log_records(
+        self,
+        value: Any,
+        *,
+        exclude_event_id: str = "",
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        records: list[dict[str, Any]] = []
+        for item in value:
+            compact = self._compact_log_record(item)
+            if not compact:
+                continue
+            if exclude_event_id and str(compact.get("event_id") or "") == exclude_event_id:
+                continue
+            records.append(compact)
+            if len(records) >= limit:
+                break
+        return records
+
     def _compact_hypotheses(self, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
@@ -1662,7 +1967,8 @@ class RcaDecisionService:
             "validation_suggestions",
         )
         result: list[dict[str, Any]] = []
-        for item in value[:8]:
+        limit = max(1, min(int(getattr(self.settings, "rca_prompt_max_hypotheses", 3)), 8))
+        for item in value[:limit]:
             if not isinstance(item, dict):
                 continue
             result.append({key: self._compact_value(item.get(key)) for key in allowed if key in item})

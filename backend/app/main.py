@@ -58,18 +58,46 @@ async def request_log_middleware(request: Request, call_next):
 def health() -> dict:
     return {
         "status": "ok",
-        "llm_base_url": settings.llm_openai_base_url,
-        "llm_model": settings.llm_model,
+        "llm_provider": settings.llm_provider,
+        "llm_base_url": (
+            settings.company_llm_url
+            if settings.llm_provider == "company"
+            else settings.llm_base_url
+        ),
+        "llm_model": (
+            settings.company_llm_model_config_id
+            if settings.llm_provider == "company"
+            else settings.llm_model
+        ),
         "llm_api_key_is_blank": not bool(settings.llm_api_key),
         "llm_enabled": settings.llm_enabled,
+        "llm_max_workers": settings.llm_max_workers,
         "llm_use_langchain_first": settings.llm_use_langchain_first,
         "llm_disable_env_proxy": settings.llm_disable_env_proxy,
         "rca_decision_model": {
             "enabled": settings.rca_decision_enabled,
-            "url": settings.rca_decision_url,
-            "model_config_id": settings.rca_decision_model_config_id,
-            "assistant_role": settings.rca_decision_assistant_role,
-            "assistant_name": settings.rca_decision_assistant_name,
+            "provider": settings.llm_provider,
+            "max_tokens": settings.rca_llm_max_tokens,
+            "max_workers": settings.rca_decision_max_workers,
+            "isolate_conversations": settings.rca_decision_isolate_conversations,
+            "company_url": settings.company_llm_url if settings.llm_provider == "company" else "",
+            "model": (
+                settings.company_llm_model_config_id
+                if settings.llm_provider == "company"
+                else settings.llm_model
+            ),
+            "architecture_prompt": {
+                "radius": settings.rca_prompt_architecture_radius,
+                "max_nodes": settings.rca_prompt_architecture_max_nodes,
+                "max_seeds": settings.rca_prompt_architecture_max_seeds,
+                "max_hypotheses": settings.rca_prompt_max_hypotheses,
+            },
+            "log_compression": {
+                "max_chars": settings.log_compression_max_chars,
+                "max_events": settings.log_compression_max_events,
+                "max_patterns": settings.log_compression_max_patterns,
+                "max_message_chars": settings.log_compression_max_message_chars,
+            },
         },
         "logfault": {
             "project_path": settings.logfault_project_path,

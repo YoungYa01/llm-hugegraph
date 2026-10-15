@@ -47,11 +47,11 @@ _SPACE_RE = re.compile(r"\s+")
 @dataclass(frozen=True)
 class LogCompressionConfig:
     enabled: bool = True
-    max_chars: int = 12_000
-    max_events: int = 48
+    max_chars: int = 6_000
+    max_events: int = 16
     context_radius: int = 2
-    max_patterns: int = 12
-    max_message_chars: int = 700
+    max_patterns: int = 6
+    max_message_chars: int = 300
 
     def normalized(self) -> "LogCompressionConfig":
         return LogCompressionConfig(

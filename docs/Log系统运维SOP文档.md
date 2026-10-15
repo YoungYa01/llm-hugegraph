@@ -60,7 +60,7 @@ flowchart LR
 | HugeGraph | 静态架构节点/边、动态 Incident/LogEvent/Exception/RCA 节点和关系 | 不保存登录会话和“已解决”业务状态 |
 | LogFaultAlgorithm | 多格式日志探测与结构化、Drain、窗口特征、PCA、异常检测、故障 episode 聚合 | 不知道真实架构和项目权限 |
 | `RootCauseEngine` | 实体对齐、故障信号分类、图路径搜索、Top-K 启发式排序 | 分数不是经过校准的真实概率 |
-| `RcaDecisionService` | 在完整架构约束下选择/解释最终根因、组织用户可读传播链和排查步骤 | 不允许编造图中不存在的节点、IP 或端口 |
+| `RcaDecisionService` | 在候选关联架构子图约束下选择/解释最终根因、组织用户可读传播链和排查步骤 | 不允许编造图中不存在的节点、IP 或端口 |
 
 ### 2.2 一条批次的主数据流
 
@@ -122,7 +122,7 @@ flowchart LR
 | `backend/app/scoped_graph.py` | 项目命名空间、静态架构投影、故障融合子图 |
 | `backend/app/log_integration.py` | LogFaultAlgorithm 适配、Incident 导入、动态图写入 |
 | `backend/app/rca_engine.py` | 确定性 RCA 候选、图搜索、评分和验证建议 |
-| `backend/app/rca_decision.py` | 完整架构压缩、Conversation LLM 调用、结果校验和实例清单 |
+| `backend/app/rca_decision.py` | 候选架构子图裁剪、统一 LLM 调用、结果校验和实例清单 |
 | `backend/app/log_compression.py` | 送给 LLM 的时间线压缩 |
 | `backend/app/rca_optimization.py` | 图谱写入前的时间线选择和 RCA 子图剪枝 |
 | `backend/app/log_reports.py` | 批次综合报告汇总 |
@@ -199,12 +199,14 @@ backend/
 | `SESSION_EXPIRE_HOURS` | `24` | 登录会话有效期 |
 | `ALLOW_REGISTRATION` | `true` | 是否允许后续用户自助注册；首用户仍可注册 |
 | `MAX_UPLOAD_MB` | `200` | HTTP 上传原始文件最大值 |
-| `LLM_ENABLED` | `true` | 架构抽取是否启用模型 |
-| `LLM_BASE_URL` | `http://127.0.0.1:1234` | OpenAI 兼容/llama.cpp 地址 |
-| `LLM_MODEL` | `qwen3.5_14B_Q4_K_M` | 架构抽取模型名 |
+| `LLM_ENABLED` | `true` | 全局大模型开关；同时影响架构抽取和 RCA |
+| `LLM_PROVIDER` | `openai` | 统一模型协议：`company`、`openai` 或 `llamacpp` |
+| `LLM_BASE_URL` | `http://127.0.0.1:1234` | OpenAI 兼容/llama.cpp 地址；`company` 模式不读取 |
+| `LLM_MODEL` | `qwen3.5_14B_Q4_K_M` | OpenAI 兼容模型名；llama.cpp 可保留描述名 |
 | `LLM_API_KEY` | `not-needed` | OpenAI 兼容接口认证值 |
 | `LLM_CHUNK_CHARS` | `700` | 架构文档分片字符数 |
 | `LLM_MAX_TOKENS` | `2048` | 架构抽取响应上限 |
+| `LLM_MAX_WORKERS` | `4` | 架构文档分片的最大并发模型请求数 |
 | `HUGEGRAPH_HOST/PORT` | `127.0.0.1/8080` | HugeGraph 地址 |
 | `HUGEGRAPH_GRAPHSPACE` | `DEFAULT` | HugeGraph 图空间 |
 | `HUGEGRAPH_GRAPH` | `hugegraph` | 图名 |
@@ -213,11 +215,15 @@ backend/
 | `LOGFAULT_PROJECT_PATH` | 空 | 外部 LogFaultAlgorithm 路径；为空时尝试仓库同级目录 |
 | `LOGFAULT_CONFIG_PATH` | 空 | 日志算法 YAML 配置路径 |
 | `RCA_TOP_K` | `5` | 确定性根因候选数 |
-| `RCA_DECISION_ENABLED` | `true` | 是否调用 Conversation 决策模型 |
-| `RCA_DECISION_URL` | `http://127.0.0.1/api/conversation` | 决策模型接口 |
-| `RCA_DECISION_MODEL_CONFIG_ID` | 空 | 远程模型配置 ID |
-| `LOG_COMPRESSION_MAX_CHARS` | `12000` | 送给决策模型的日志上下文字数预算 |
-| `LOG_COMPRESSION_MAX_EVENTS` | `48` | 关键日志最大条数 |
+| `RCA_DECISION_ENABLED` | `true` | 是否为 RCA 启用大模型增强；不负责选择供应商 |
+| `RCA_LLM_MAX_TOKENS` | `2048` | RCA JSON 输出上限，不影响架构抽取 |
+| `RCA_DECISION_MAX_WORKERS` | `3` | 同一批次多个 Incident 的最大并发模型请求数 |
+| `RCA_DECISION_ISOLATE_CONVERSATIONS` | `true` | 每个 Incident 使用独立会话；设为 false 时回退串行共享会话 |
+| `COMPANY_LLM_URL` | `http://127.0.0.1/api/conversation` | `company` 模式的 Conversation 接口 |
+| `COMPANY_LLM_MODEL_CONFIG_ID` | 空 | `company` 模式的远程模型配置 ID |
+| `LOG_COMPRESSION_MAX_CHARS` | `6000` | 送给决策模型的日志上下文字数预算 |
+| `LOG_COMPRESSION_MAX_EVENTS` | `16` | 关键日志最大条数 |
+| `RCA_PROMPT_ARCHITECTURE_MAX_NODES` | `20` | 单次 RCA 请求中的架构节点上限 |
 | `RCA_GRAPH_PRUNING_ENABLED` | `true` | 是否在写 HugeGraph 前剪枝动态子图 |
 
 完整默认值以 `backend/app/config.py` 的 `Settings` 为准。当前 `backend/.env.example` 没列出全部 RCA 决策和图剪枝变量，升级环境时要对照源码补齐。
@@ -226,10 +232,10 @@ backend/
 
 1. 注册必须提供 `employee_id`。
 2. 架构导入和日志 RCA 前，接口再次校验当前用户工号非空。
-3. `LLMAnalyzer` 调用 OpenAI 兼容接口和 `RcaDecisionService` 调用 Conversation 接口时，请求头均带 `X-Ai-Coding-Key: <employee_id>`。
+3. 仅 `company` 协议携带 `X-Ai-Coding-Key: <employee_id>`；OpenAI/llama.cpp 使用 `Authorization: Bearer <LLM_API_KEY>`。
 4. 架构抽取 `RcaDecisionService(..., continue_conversation=False)`，不会向请求体传 `conversation_id`。
-5. 一次日志批次只创建一个 `IncidentGraphIntegrator` 和一个 `RcaDecisionService`：该批次第一个 Incident 请求不带 `conversation_id`；取得返回值后，后续 Incident 会带该 ID。
-6. 每个 Incident 的请求内容仍包含完整压缩架构 `architecture_graph`，不依赖前一个请求补全拓扑。因此并发顺序不会决定某次请求是否有完整架构。
+5. 默认 `RCA_DECISION_ISOLATE_CONVERSATIONS=true`：每个 Incident 创建独立的 `RcaDecisionService`，不携带或共享 `conversation_id`，因此可以有界并发；设为 false 时才串行复用同一个会话。
+6. 每个 Incident 都独立携带候选节点附近的 `architecture_graph` 子图，不依赖前一个请求补全拓扑；小图或无法解析候选时才发送完整紧凑架构。
 7. 环境变量不保存业务 `conversation_id`；进程内服务对象销毁后该 ID 不再复用。
 
 ### 5.3 依赖
@@ -365,7 +371,7 @@ flowchart TD
 
 关键函数转换：
 
-1. `split_text(text, LLM_CHUNK_CHARS)` 按段落和句子把长文档拆为字符块。
+1. `split_text(text, LLM_CHUNK_CHARS)` 按段落和句子把长文档拆为字符块；不同分片按 `LLM_MAX_WORKERS` 有界并发，请求完成后仍按原分片顺序合并。
 2. `LLMAnalyzer._build_user_prompt()` 要求模型返回 `services/calls` JSON。
 3. `_parse_json_lenient()` 去除 `<think>`/代码块并尝试 `json_repair`。
 4. `_normalize_graph()` 接受 `services/nodes/vertices` 和 `calls/edges/relations` 等兼容字段，归一为 `ExtractedGraph`。

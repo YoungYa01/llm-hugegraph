@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .analyzer import LLMAnalyzer, split_text
@@ -45,13 +46,33 @@ class GraphBuilderService:
 
         merged = ExtractedGraph()
         total_chunks = len(chunks)
-        for index, chunk in enumerate(chunks, start=1):
-            pct = 20 + int((index / total_chunks) * 50)  # 20% ~ 70%
-            _report(pct, f"LLM 正在抽取分片 ({index}/{total_chunks})，字符数={len(chunk)}...")
-            execution_logs.append(f"LLM 抽取分片 {index}/{total_chunks}，字符数={len(chunk)}")
-            data = self.analyzer.analyze_architecture(chunk)
-            execution_logs.append(f"抽取模式: {self.analyzer.last_mode}")
-            execution_logs.extend(self.analyzer.last_logs)
+        max_workers = max(1, min(int(getattr(self.settings, "llm_max_workers", 4)), total_chunks))
+
+        def _extract(index: int, chunk: str) -> tuple[int, dict[str, Any], str, list[str]]:
+            analyzer = LLMAnalyzer(employee_id=self.analyzer.employee_id)
+            data = analyzer.analyze_architecture(chunk)
+            return index, data, analyzer.last_mode, list(analyzer.last_logs)
+
+        results: dict[int, tuple[dict[str, Any], str, list[str]]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="architecture-llm") as executor:
+            futures = {
+                executor.submit(_extract, index, chunk): (index, chunk)
+                for index, chunk in enumerate(chunks, start=1)
+            }
+            completed = 0
+            for future in as_completed(futures):
+                index, chunk = futures[future]
+                result_index, data, mode, logs = future.result()
+                results[result_index] = (data, mode, logs)
+                completed += 1
+                pct = 20 + int((completed / total_chunks) * 50)  # 20% ~ 70%
+                _report(pct, f"LLM 已完成分片 ({completed}/{total_chunks})，字符数={len(chunk)}...")
+
+        for index in range(1, total_chunks + 1):
+            data, mode, logs = results[index]
+            execution_logs.append(f"LLM 抽取分片 {index}/{total_chunks}，字符数={len(chunks[index - 1])}")
+            execution_logs.append(f"抽取模式: {mode}")
+            execution_logs.extend(logs)
             part = ExtractedGraph.model_validate(data)
             merged = self._merge_graphs(merged, part)
 

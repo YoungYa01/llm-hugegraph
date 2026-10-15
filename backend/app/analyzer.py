@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
     def repair_json(text: str) -> str:
         return text
 
-from .config import get_settings
+from .config import get_settings, normalize_llm_provider
 from .models import ExtractedCall, ExtractedGraph, ExtractedNode
 from .rca_decision import RcaDecisionService
 
@@ -93,10 +93,9 @@ JSON 格式固定为：
 class LLMAnalyzer:
     """Architecture extractor.
 
-    Production rule for this demo: /api/import must not fail just because the
-    local model is slow, returns Qwen reasoning_content only, or returns invalid
-    JSON. We try the local OpenAI-compatible endpoint first, then optional
-    LangChain, then llama.cpp /completion, and finally a deterministic extractor.
+    LLM_PROVIDER selects exactly one remote protocol.  If that provider fails,
+    /api/import falls back to the deterministic extractor instead of sending the
+    document to a different model service.
     """
 
     def __init__(self, employee_id: str = "") -> None:
@@ -131,50 +130,24 @@ class LLMAnalyzer:
 
         if self.settings.llm_enabled:
             try:
-                result = self._analyze_with_conversation_http(user_text)
-                self.last_mode = "llm-conversation-http"
+                provider = normalize_llm_provider(self.settings.llm_provider)
+                if provider == "company":
+                    result = self._analyze_with_conversation_http(user_text)
+                    self.last_mode = "llm-company"
+                elif provider == "openai":
+                    result = self._analyze_with_openai_http(user_text)
+                    self.last_mode = "llm-openai"
+                else:
+                    result = self._analyze_with_llamacpp_completion(user_text)
+                    self.last_mode = "llm-llamacpp"
                 return result
             except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                errors.append(f"Conversation HTTP失败: {msg}")
-                self.last_logs.append(errors[-1])
-
-            # Direct HTTP first. It is closer to the user's test.py and avoids
-            # LangChain/httpx proxy surprises by using Session(trust_env=False).
-            try:
-                result = self._analyze_with_openai_http(user_text)
-                self.last_mode = "llm-openai-http"
-                return result
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                errors.append(f"OpenAI兼容HTTP失败: {msg}")
-                self.last_logs.append(errors[-1])
-                # Qwen3 can spend the whole response budget in reasoning_content,
-                # leaving content empty. Retrying other adapters usually repeats
-                # the same failure and wastes minutes, so fall back immediately.
-                if "被截断的思考" in msg or "reasoning_content" in msg or "finish_reason=length" in msg:
-                    self.last_error = " | ".join(errors)
-                    self.last_mode = "rule-fallback"
-                    fallback = RuleBasedArchitectureExtractor().extract(user_text)
+                provider_name = str(getattr(self.settings, "llm_provider", "") or "unknown")
+                msg = f"{provider_name} 模型调用失败: {exc}"
+                errors.append(msg)
+                self.last_logs.append(msg)
+                if "被截断的思考" in str(exc) or "reasoning_content" in str(exc) or "finish_reason=length" in str(exc):
                     self.last_logs.append("模型返回思考过程而不是 JSON，已立即切换规则兜底抽取。")
-                    return fallback.model_dump()
-
-            if self.settings.llm_use_langchain_first:
-                try:
-                    result = self._analyze_with_langchain(user_text)
-                    self.last_mode = "llm-langchain"
-                    return result
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"LangChain失败: {exc}")
-                    self.last_logs.append(errors[-1])
-
-            try:
-                result = self._analyze_with_llamacpp_completion(user_text)
-                self.last_mode = "llm-llamacpp-completion"
-                return result
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"llama.cpp /completion失败: {exc}")
-                self.last_logs.append(errors[-1])
 
         self.last_error = " | ".join(errors)
         self.last_mode = "rule-fallback"
@@ -215,8 +188,6 @@ class LLMAnalyzer:
         )
 
     def _analyze_with_conversation_http(self, user_text: str) -> dict[str, Any]:
-        if not bool(getattr(self.settings, "rca_decision_enabled", True)):
-            raise RuntimeError("Conversation model is disabled")
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"{self._build_user_prompt(user_text)}\n"
@@ -227,7 +198,7 @@ class LLMAnalyzer:
             session=self.session,
             employee_id=self.employee_id,
             continue_conversation=False,
-        )._post_conversation(prompt)
+        )._post_model(prompt)
         parsed = self._parse_json_lenient(content)
         return self._normalize_graph(parsed).model_dump()
 
@@ -261,7 +232,6 @@ class LLMAnalyzer:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "X-Ai-Coding-Key": self.employee_id,
         }
         for url in chat_urls:
             for payload in self._chat_payloads(user_text):
@@ -311,7 +281,6 @@ class LLMAnalyzer:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "X-Ai-Coding-Key": self.employee_id,
         }
         prompt = f"{SYSTEM_PROMPT}\n\n{self._build_user_prompt(user_text)}"
         payloads = []

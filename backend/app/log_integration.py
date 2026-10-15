@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
 import os
@@ -95,8 +96,7 @@ class IncidentGraphIntegrator:
             "orphan_nodes_skipped": 0,
             "invalid_edges_skipped": 0,
         }
-        # One service instance belongs to one uploaded log batch. Its first
-        # request creates a conversation and every later incident reuses it.
+        self.employee_id = employee_id
         self.decision_service = RcaDecisionService(employee_id=employee_id)
 
     def import_path(
@@ -317,12 +317,41 @@ class IncidentGraphIntegrator:
             )
 
         decisions: dict[int, dict[str, Any]] = {}
-        for item in prepared:
-            decisions[item["index"]] = self.decision_service.enrich(
-                item["detail"],
-                item["data"],
-                architecture,
+        max_workers = (
+            max(
+                1,
+                min(
+                    int(getattr(self.settings, "rca_decision_max_workers", 3)),
+                    len(prepared),
+                ),
             )
+            if prepared
+            else 1
+        )
+        isolate = bool(getattr(self.settings, "rca_decision_isolate_conversations", True))
+
+        def _decide(item: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            service = (
+                RcaDecisionService(
+                    settings=self.settings,
+                    employee_id=self.employee_id,
+                    continue_conversation=False,
+                )
+                if isolate
+                else self.decision_service
+            )
+            return item["index"], service.enrich(item["detail"], item["data"], architecture)
+
+        if isolate and len(prepared) > 1:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rca-llm") as executor:
+                for index, decision in executor.map(_decide, prepared):
+                    decisions[index] = decision
+        else:
+            for item in prepared:
+                index, decision = _decide(item)
+                decisions[index] = decision
+
+        for item in prepared:
             self._begin_graph_buffer()
             self._import_one(
                 item["detail"],

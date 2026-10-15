@@ -41,6 +41,23 @@ def normalize_openai_base_url(url: str) -> str:
     return url if url.endswith("/v1") else f"{url}/v1"
 
 
+def normalize_llm_provider(value: str) -> str:
+    provider = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "company": "company",
+        "openai": "openai",
+        "openai-compatible": "openai",
+        "llamacpp": "llamacpp",
+        "llama.cpp": "llamacpp",
+        "llama-cpp": "llamacpp",
+    }
+    if provider not in aliases:
+        raise ValueError(
+            f"Unsupported LLM_PROVIDER={value!r}; expected company, openai, or llamacpp"
+        )
+    return aliases[provider]
+
+
 @dataclass(frozen=True)
 class Settings:
     # Application system storage and authentication.
@@ -50,9 +67,11 @@ class Settings:
     allow_registration: bool = _bool_env("ALLOW_REGISTRATION", True)
     max_upload_mb: int = _int_env("MAX_UPLOAD_MB", 200)
 
-    # Local LLM. This remains compatible with the user's test.py style:
-    # OpenAI-compatible /v1/chat/completions first, llama.cpp /completion fallback.
+    # One provider is selected for every LLM call in the application.  We do
+    # not silently fall through to a different protocol because that can send
+    # the same prompt to an unintended service.
     llm_enabled: bool = _bool_env("LLM_ENABLED", True)
+    llm_provider: str = _env("LLM_PROVIDER", "openai").lower()
     llm_base_url: str = _env("LLM_BASE_URL", "http://127.0.0.1:1234")
     llm_model: str = _env("LLM_MODEL", "qwen3.5_14B_Q4_K_M")
     llm_api_key: str = _env("LLM_API_KEY", "not-needed")
@@ -60,6 +79,7 @@ class Settings:
     llm_connect_timeout_seconds: int = _int_env("LLM_CONNECT_TIMEOUT_SECONDS", 10)
     llm_max_tokens: int = _int_env("LLM_MAX_TOKENS", 2048)
     llm_chunk_chars: int = _int_env("LLM_CHUNK_CHARS", 700)
+    llm_max_workers: int = _int_env("LLM_MAX_WORKERS", 4)
     llm_disable_thinking: bool = _bool_env("LLM_DISABLE_THINKING", True)
     # Default false: avoids LangChain/httpx proxy/credential surprises. Direct HTTP
     # is the same OpenAI-compatible protocol used by the reference project/server.
@@ -99,15 +119,75 @@ class Settings:
     # Deterministic log compression before the final RCA decision LLM call.
     # max_chars is a hard budget for the compressed log-context JSON only.
     log_compression_enabled: bool = _bool_env("LOG_COMPRESSION_ENABLED", True)
-    log_compression_max_chars: int = _int_env("LOG_COMPRESSION_MAX_CHARS", 12000)
-    log_compression_max_events: int = _int_env("LOG_COMPRESSION_MAX_EVENTS", 48)
+    log_compression_max_chars: int = _int_env("LOG_COMPRESSION_MAX_CHARS", 6000)
+    log_compression_max_events: int = _int_env("LOG_COMPRESSION_MAX_EVENTS", 16)
     log_compression_context_radius: int = _int_env("LOG_COMPRESSION_CONTEXT_RADIUS", 2)
-    log_compression_max_patterns: int = _int_env("LOG_COMPRESSION_MAX_PATTERNS", 12)
-    log_compression_max_message_chars: int = _int_env("LOG_COMPRESSION_MAX_MESSAGE_CHARS", 700)
+    log_compression_max_patterns: int = _int_env("LOG_COMPRESSION_MAX_PATTERNS", 6)
+    log_compression_max_message_chars: int = _int_env("LOG_COMPRESSION_MAX_MESSAGE_CHARS", 300)
 
-    # Preferred model for choosing the most likely RCA candidate after the
+    # Whether RCA should use the provider selected by LLM_PROVIDER after the
     # deterministic hypothesis list has been generated.
     rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)
+    rca_llm_max_tokens: int = _int_env("RCA_LLM_MAX_TOKENS", 2048)
+    rca_prompt_architecture_radius: int = _int_env("RCA_PROMPT_ARCHITECTURE_RADIUS", 2)
+    rca_prompt_architecture_max_nodes: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_NODES", 20)
+    rca_prompt_architecture_max_seeds: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_SEEDS", 3)
+    rca_prompt_max_hypotheses: int = _int_env("RCA_PROMPT_MAX_HYPOTHESES", 3)
+    rca_decision_max_workers: int = _int_env("RCA_DECISION_MAX_WORKERS", 3)
+    rca_decision_isolate_conversations: bool = _bool_env(
+        "RCA_DECISION_ISOLATE_CONVERSATIONS",
+        True,
+    )
+
+    # Company /api/conversation protocol.  The old RCA_DECISION_* names remain
+    # as fallbacks so existing deployments continue to work while migrating to
+    # the clearer COMPANY_LLM_* names.
+    company_llm_url: str = _env(
+        "COMPANY_LLM_URL",
+        _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation"),
+    )
+    company_llm_model_config_id: str = _env(
+        "COMPANY_LLM_MODEL_CONFIG_ID",
+        _env("RCA_DECISION_MODEL_CONFIG_ID", ""),
+    )
+    company_llm_assistant_role: str = _env(
+        "COMPANY_LLM_ASSISTANT_ROLE",
+        _env("RCA_DECISION_ASSISTANT_ROLE", "general"),
+    )
+    company_llm_assistant_name: str = _env(
+        "COMPANY_LLM_ASSISTANT_NAME",
+        _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant"),
+    )
+    company_llm_assistant_prompt: str = _env(
+        "COMPANY_LLM_ASSISTANT_PROMPT",
+        "你是日志系统的大模型助手。严格遵守用户提示，并只返回要求的结果格式。",
+    )
+    company_llm_stream: bool = _bool_env(
+        "COMPANY_LLM_STREAM",
+        _bool_env("RCA_DECISION_STREAM", False),
+    )
+    company_llm_code_language: str = _env(
+        "COMPANY_LLM_CODE_LANGUAGE",
+        _env("RCA_DECISION_CODE_LANGUAGE", ""),
+    )
+    company_llm_kb_id: str = _env(
+        "COMPANY_LLM_KB_ID",
+        _env("RCA_DECISION_KB_ID", ""),
+    )
+    company_llm_kb_name: str = _env(
+        "COMPANY_LLM_KB_NAME",
+        _env("RCA_DECISION_KB_NAME", ""),
+    )
+    company_llm_timeout_seconds: int = _int_env(
+        "COMPANY_LLM_TIMEOUT_SECONDS",
+        _int_env("RCA_DECISION_TIMEOUT_SECONDS", 90),
+    )
+    company_llm_connect_timeout_seconds: int = _int_env(
+        "COMPANY_LLM_CONNECT_TIMEOUT_SECONDS",
+        _int_env("RCA_DECISION_CONNECT_TIMEOUT_SECONDS", 10),
+    )
+
+    # Deprecated compatibility fields.  New code reads COMPANY_LLM_* above.
     rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation")
     rca_decision_model_config_id: str = _env("RCA_DECISION_MODEL_CONFIG_ID", "")
     rca_decision_assistant_role: str = _env("RCA_DECISION_ASSISTANT_ROLE", "general")

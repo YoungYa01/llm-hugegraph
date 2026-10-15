@@ -148,6 +148,69 @@ def _is_technical_error(row: pd.Series | dict[str, Any]) -> bool:
     return any(keyword in _event_text(row) for keyword in ATOMIC_ROOT_KEYWORDS)
 
 
+def _prepare_window_event_index(
+    events: pd.DataFrame,
+    windows: pd.DataFrame,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build one timestamp index and reusable prefix counts for all windows.
+
+    The previous implementation compared every event timestamp with every window.
+    Sorting once lets ``searchsorted`` locate each half-open ``[start, end)`` slice,
+    while prefix sums make the three event counters constant-time per window.
+    """
+
+    window_starts = pd.to_datetime(windows["window_start"], errors="coerce", utc=True)
+    window_ends = pd.to_datetime(windows["window_end"], errors="coerce", utc=True)
+    if window_starts.isna().any() or window_ends.isna().any():
+        raise ValueError("window_start/window_end 包含无效时间")
+
+    event_times = pd.to_datetime(events["timestamp"], errors="coerce", utc=True)
+    valid_positions = np.flatnonzero(event_times.notna().to_numpy())
+    if len(valid_positions) == len(events) and event_times.is_monotonic_increasing:
+        # ``load_events`` already returns chronological data. Avoid copying a
+        # potentially very large DataFrame in the common production path.
+        sorted_events = events
+        sorted_timestamps = event_times.astype("int64").to_numpy()
+    else:
+        valid_times = event_times.iloc[valid_positions].astype("int64").to_numpy()
+        order = np.argsort(valid_times, kind="stable")
+        sorted_events = events.iloc[valid_positions[order]]
+        sorted_timestamps = valid_times[order]
+
+    starts_ns = window_starts.astype("int64").to_numpy()
+    ends_ns = window_ends.astype("int64").to_numpy()
+    left = np.searchsorted(sorted_timestamps, starts_ns, side="left")
+    right = np.searchsorted(sorted_timestamps, ends_ns, side="left")
+
+    if sorted_events.empty:
+        error_flags = np.zeros(0, dtype=np.int64)
+        technical_flags = np.zeros(0, dtype=np.int64)
+        root_signal_flags = np.zeros(0, dtype=np.int64)
+    else:
+        levels = sorted_events["level"].fillna("").astype(str).str.upper()
+        error_flags = levels.isin(ERROR_LEVELS).to_numpy(dtype=np.int64)
+        technical_flags = sorted_events.apply(
+            _is_technical_error,
+            axis=1,
+        ).to_numpy(dtype=np.int64)
+        root_signal_flags = sorted_events.apply(
+            lambda event: any(keyword in _event_text(event) for keyword in ROOT_KEYWORDS),
+            axis=1,
+        ).to_numpy(dtype=np.int64)
+
+    def prefix_sum(flags: np.ndarray) -> np.ndarray:
+        return np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(flags, dtype=np.int64)))
+
+    return (
+        sorted_events,
+        left,
+        right,
+        prefix_sum(error_flags),
+        prefix_sum(technical_flags),
+        prefix_sum(root_signal_flags),
+    )
+
+
 def annotate_windows(
     metadata: pd.DataFrame,
     feature_matrix: pd.DataFrame,
@@ -199,6 +262,15 @@ def annotate_windows(
     protect_technical_errors = bool(explain_config.get("protect_technical_error_windows", True))
     protect_signals = bool(explain_config.get("include_known_root_signals", True))
 
+    (
+        sorted_events,
+        window_left,
+        window_right,
+        error_prefix,
+        technical_error_prefix,
+        root_signal_prefix,
+    ) = _prepare_window_event_index(events, result)
+
     for position, (_, row) in enumerate(result.iterrows()):
         z = np.abs(standardized[position])
         top_indices = np.argsort(z)[::-1][:top_n]
@@ -211,8 +283,9 @@ def annotate_windows(
             for i in top_indices
             if feature_matrix.iloc[position, i] > 0 or z[i] > 0
         ]
-        mask = (events["timestamp"] >= row["window_start"]) & (events["timestamp"] < row["window_end"])
-        window_events = events.loc[mask]
+        left = int(window_left[position])
+        right = int(window_right[position])
+        window_events = sorted_events.iloc[left:right]
         levels = window_events["level"].fillna("").astype(str).str.upper()
         signal_events = window_events.loc[levels.isin(["ERROR", "FATAL", "WARN"])]
         service_source = signal_events if not signal_events.empty else window_events
@@ -225,15 +298,9 @@ def annotate_windows(
             .index.astype(str)
             .tolist()
         )
-        error_count = int(levels.isin(ERROR_LEVELS).sum())
-        technical_error_count = int(
-            window_events.apply(_is_technical_error, axis=1).sum()
-        ) if not window_events.empty else 0
-        root_signal_count = int(
-            window_events.apply(
-                lambda event: any(keyword in _event_text(event) for keyword in ROOT_KEYWORDS), axis=1
-            ).sum()
-        ) if not window_events.empty else 0
+        error_count = int(error_prefix[right] - error_prefix[left])
+        technical_error_count = int(technical_error_prefix[right] - technical_error_prefix[left])
+        root_signal_count = int(root_signal_prefix[right] - root_signal_prefix[left])
 
         reasons: list[str] = []
         model_flag = bool(effective_model_flags[position])

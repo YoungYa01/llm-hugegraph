@@ -9,6 +9,7 @@ backend/tests/
 .env
 # Logs
 logs
+log/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -35,3 +36,6 @@ examples/*.zip
 *.sw?
 
 backend/tests/
+backend/litellm_config.yaml
+AGENTS.md
+.workbuddy/memory/2026-10-16.md

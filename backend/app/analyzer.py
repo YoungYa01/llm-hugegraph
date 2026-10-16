@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import urllib.parse
@@ -17,9 +18,12 @@ except Exception:  # pragma: no cover
     def repair_json(text: str) -> str:
         return text
 
-from .config import get_settings, normalize_llm_provider
+from .config import get_settings
 from .models import ExtractedCall, ExtractedGraph, ExtractedNode
 from .rca_decision import RcaDecisionService
+
+
+logger = logging.getLogger(__name__)
 
 
 class _UnavailableSession:
@@ -93,9 +97,8 @@ JSON 格式固定为：
 class LLMAnalyzer:
     """Architecture extractor.
 
-    LLM_PROVIDER selects exactly one remote protocol.  If that provider fails,
-    /api/import falls back to the deterministic extractor instead of sending the
-    document to a different model service.
+    The selected protocol is configured by LLM_PROTOCOL. The import flow keeps
+    its deterministic fallback when the selected model endpoint fails.
     """
 
     def __init__(self, employee_id: str = "") -> None:
@@ -129,25 +132,46 @@ class LLMAnalyzer:
         errors: list[str] = []
 
         if self.settings.llm_enabled:
-            try:
-                provider = normalize_llm_provider(self.settings.llm_provider)
-                if provider == "company":
+            protocol = str(getattr(self.settings, "llm_protocol", "litellm")).strip().lower()
+            if protocol == "conversation":
+                try:
                     result = self._analyze_with_conversation_http(user_text)
-                    self.last_mode = "llm-company"
-                elif provider == "openai":
-                    result = self._analyze_with_openai_http(user_text)
-                    self.last_mode = "llm-openai"
-                else:
+                    self.last_mode = "llm-conversation-http"
+                    return result
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    errors.append(f"Conversation HTTP失败: {msg}")
+                    self.last_logs.append(errors[-1])
+
+            if protocol == "litellm":
+                try:
+                    result = self._analyze_with_litellm_http(user_text)
+                    self.last_mode = "llm-litellm-http"
+                    return result
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    errors.append(f"LiteLLM HTTP失败: {msg}")
+                    self.last_logs.append(errors[-1])
+                    # Qwen3 can spend the whole response budget in reasoning_content,
+                    # leaving content empty. Retrying another adapter repeats the
+                    # same failure and wastes time, so fall back immediately.
+                    if "被截断的思考" in msg or "reasoning_content" in msg or "finish_reason=length" in msg:
+                        self.last_error = " | ".join(errors)
+                        self.last_mode = "rule-fallback"
+                        fallback = RuleBasedArchitectureExtractor().extract(user_text)
+                        self.last_logs.append("模型返回思考过程而不是 JSON，已立即切换规则兜底抽取。")
+                        return fallback.model_dump()
+            elif protocol == "llama_cpp":
+                try:
                     result = self._analyze_with_llamacpp_completion(user_text)
-                    self.last_mode = "llm-llamacpp"
-                return result
-            except Exception as exc:  # noqa: BLE001
-                provider_name = str(getattr(self.settings, "llm_provider", "") or "unknown")
-                msg = f"{provider_name} 模型调用失败: {exc}"
-                errors.append(msg)
-                self.last_logs.append(msg)
-                if "被截断的思考" in str(exc) or "reasoning_content" in str(exc) or "finish_reason=length" in str(exc):
-                    self.last_logs.append("模型返回思考过程而不是 JSON，已立即切换规则兜底抽取。")
+                    self.last_mode = "llm-llamacpp-completion"
+                    return result
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"llama.cpp /completion失败: {exc}")
+                    self.last_logs.append(errors[-1])
+            else:
+                errors.append(f"不支持的 LLM_PROTOCOL: {protocol}")
+                self.last_logs.append(errors[-1])
 
         self.last_error = " | ".join(errors)
         self.last_mode = "rule-fallback"
@@ -198,7 +222,8 @@ class LLMAnalyzer:
             session=self.session,
             employee_id=self.employee_id,
             continue_conversation=False,
-        )._post_model(prompt)
+            conversation_url=self.settings.llm_conversation_url,
+        )._post_conversation(prompt)
         parsed = self._parse_json_lenient(content)
         return self._normalize_graph(parsed).model_dump()
 
@@ -213,6 +238,9 @@ class LLMAnalyzer:
             "max_tokens": self.settings.llm_max_tokens,
             "stream": False,
         }
+        cache_salt = str(getattr(self.settings, "llm_cache_salt", "") or "").strip()
+        if cache_salt:
+            base_payload["cache_salt"] = cache_salt
         payloads = []
         if self.settings.llm_disable_thinking:
             # llama.cpp/Qwen3 recognizes this. Other local servers usually ignore
@@ -221,7 +249,7 @@ class LLMAnalyzer:
         payloads.append(base_payload)
         return payloads
 
-    def _analyze_with_openai_http(self, user_text: str) -> dict[str, Any]:
+    def _analyze_with_litellm_http(self, user_text: str) -> dict[str, Any]:
         errors: list[str] = []
         chat_urls: list[str] = []
         for base in [self.settings.llm_openai_base_url, normalize_openai_base_url(self.settings.llm_base_url)]:
@@ -247,6 +275,7 @@ class LLMAnalyzer:
         raise RuntimeError("; ".join(errors))
 
     def _post_chat_completion(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> str:
+        logger.info("[LLM] 请求输入 url=%s payload=%s", url, json.dumps(payload, ensure_ascii=False))
         response = self.session.post(
             url,
             json=payload,
@@ -267,9 +296,15 @@ class LLMAnalyzer:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"响应 JSON 中没有 choices[0].message: {json.dumps(data, ensure_ascii=False)[:1000]}") from exc
 
-        content_candidates = [message.get("content"), message.get("reasoning_content")]
-        content = "\n".join(self._content_to_text(x) for x in content_candidates if self._content_to_text(x).strip()).strip()
+        content = self._content_to_text(message.get("content")).strip()
         finish_reason = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
+        logger.info(
+            "[LLM] 模型输出 status=%s finish_reason=%s usage=%s content=%s",
+            response.status_code,
+            finish_reason,
+            json.dumps(data.get("usage"), ensure_ascii=False),
+            content,
+        )
         if not content:
             raise RuntimeError(f"模型返回内容为空 finish_reason={finish_reason}: {json.dumps(data, ensure_ascii=False)[:1200]}")
         if finish_reason == "length" and "{" not in content:
@@ -317,48 +352,6 @@ class LLMAnalyzer:
                 errors.append(str(exc))
         raise RuntimeError("; ".join(errors))
 
-    def _create_chat_openai(self):
-        from langchain_openai import ChatOpenAI
-
-        kwargs: dict[str, Any] = {
-            "model": self.settings.llm_model,
-            "base_url": self.settings.llm_openai_base_url,
-            "api_key": self.api_key,
-            "temperature": 0,
-            "max_tokens": self.settings.llm_max_tokens,
-            "timeout": self.settings.llm_timeout_seconds,
-            "max_retries": 0,
-            "default_headers": {"X-Ai-Coding-Key": self.employee_id},
-        }
-        if self.settings.llm_disable_env_proxy:
-            try:
-                import httpx
-
-                kwargs["http_client"] = httpx.Client(
-                    trust_env=False,
-                    timeout=httpx.Timeout(
-                        self.settings.llm_timeout_seconds,
-                        connect=self.settings.llm_connect_timeout_seconds,
-                    ),
-                )
-            except Exception:
-                pass
-        return ChatOpenAI(**kwargs)
-
-    def _analyze_with_langchain(self, user_text: str) -> dict[str, Any]:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        llm = self._create_chat_openai()
-        raw_message = llm.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=self._build_user_prompt(user_text)),
-            ]
-        )
-        content = getattr(raw_message, "content", "") or str(raw_message)
-        parsed = self._parse_json_lenient(content)
-        return self._normalize_graph(parsed).model_dump()
-
     def _content_to_text(self, value: Any) -> str:
         if value is None:
             return ""
@@ -384,26 +377,32 @@ class LLMAnalyzer:
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
         text = re.sub(r"^```(?:json)?", "", text).strip()
         text = re.sub(r"```$", "", text).strip()
-        # Prefer object output, but accept arrays and normalize below.
-        obj_start = text.find("{")
-        obj_end = text.rfind("}")
-        arr_start = text.find("[")
-        arr_end = text.rfind("]")
-        if obj_start >= 0 and obj_end >= obj_start:
-            candidate = text[obj_start : obj_end + 1]
-        elif arr_start >= 0 and arr_end >= arr_start:
-            candidate = text[arr_start : arr_end + 1]
-        else:
-            candidate = text
-        if not candidate.strip():
+        # Models may mix reasoning text with the JSON answer. Try each complete
+        # JSON value in order and keep the first one that looks like a graph.
+        decoder = json.JSONDecoder()
+        for start_char in ("{", "["):
+            idx = text.find(start_char)
+            while idx >= 0:
+                try:
+                    parsed, _end = decoder.raw_decode(text[idx:])
+                except json.JSONDecodeError:
+                    parsed = None
+                if self._looks_like_graph(parsed):
+                    return parsed
+                idx = text.find(start_char, idx + 1)
+        if not text.strip():
             raise ValueError("模型输出为空，无法解析 JSON")
-        try:
-            return json.loads(candidate)
-        except Exception:
-            repaired = repair_json(candidate)
-            if not str(repaired).strip():
-                raise ValueError(f"JSON 修复后仍为空。原始输出前 1000 字: {text[:1000]}")
-            return json.loads(repaired)
+        repaired = repair_json(text)
+        if not str(repaired).strip():
+            raise ValueError(f"JSON 修复后仍为空。原始输出前 1000 字: {text[:1000]}")
+        return json.loads(repaired)
+
+    def _looks_like_graph(self, data: Any) -> bool:
+        if isinstance(data, list):
+            return bool(data)
+        if isinstance(data, dict):
+            return bool({"services", "nodes", "calls", "edges", "vertices", "relations"} & data.keys())
+        return False
 
     def _normalize_graph(self, data: Any) -> ExtractedGraph:
         if isinstance(data, list):

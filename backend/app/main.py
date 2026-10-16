@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from urllib.parse import unquote
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -18,6 +19,16 @@ from .service import GraphBuilderService
 from .system_api import router as system_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+log_dir = Path(__file__).resolve().parents[2] / "log"
+log_dir.mkdir(exist_ok=True)
+llm_handler = logging.FileHandler(log_dir / "llm.log", encoding="utf-8")
+llm_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+for llm_logger_name in ("app.analyzer", "app.rca_decision"):
+    llm_logger = logging.getLogger(llm_logger_name)
+    llm_logger.addHandler(llm_handler)
+    llm_logger.propagate = False
+
 logger = logging.getLogger("logsys-kg-demo")
 
 app = FastAPI(title="LogSys Knowledge Graph RCA System", version="8.0.0")
@@ -58,40 +69,23 @@ async def request_log_middleware(request: Request, call_next):
 def health() -> dict:
     return {
         "status": "ok",
-        "llm_provider": settings.llm_provider,
-        "llm_base_url": (
-            settings.company_llm_url
-            if settings.llm_provider == "company"
-            else settings.llm_base_url
-        ),
-        "llm_model": (
-            settings.company_llm_model_config_id
-            if settings.llm_provider == "company"
-            else settings.llm_model
-        ),
+        "llm_base_url": settings.llm_base_url,
+        "llm_model": settings.llm_model,
         "llm_api_key_is_blank": not bool(settings.llm_api_key),
         "llm_enabled": settings.llm_enabled,
+        "llm_protocol": settings.llm_protocol,
         "llm_max_workers": settings.llm_max_workers,
-        "llm_use_langchain_first": settings.llm_use_langchain_first,
         "llm_disable_env_proxy": settings.llm_disable_env_proxy,
         "rca_decision_model": {
             "enabled": settings.rca_decision_enabled,
-            "provider": settings.llm_provider,
-            "max_tokens": settings.rca_llm_max_tokens,
+            "protocol": settings.rca_decision_protocol,
+            "url": settings.rca_decision_url,
+            "model": settings.rca_decision_model,
+            "model_config_id": settings.rca_decision_model_config_id,
+            "assistant_role": settings.rca_decision_assistant_role,
+            "assistant_name": settings.rca_decision_assistant_name,
             "max_workers": settings.rca_decision_max_workers,
             "isolate_conversations": settings.rca_decision_isolate_conversations,
-            "company_url": settings.company_llm_url if settings.llm_provider == "company" else "",
-            "model": (
-                settings.company_llm_model_config_id
-                if settings.llm_provider == "company"
-                else settings.llm_model
-            ),
-            "architecture_prompt": {
-                "radius": settings.rca_prompt_architecture_radius,
-                "max_nodes": settings.rca_prompt_architecture_max_nodes,
-                "max_seeds": settings.rca_prompt_architecture_max_seeds,
-                "max_hypotheses": settings.rca_prompt_max_hypotheses,
-            },
             "log_compression": {
                 "max_chars": settings.log_compression_max_chars,
                 "max_events": settings.log_compression_max_events,

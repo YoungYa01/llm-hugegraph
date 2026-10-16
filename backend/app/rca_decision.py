@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import re
+import threading
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -18,10 +20,12 @@ except Exception:  # pragma: no cover
     def repair_json(text: str) -> str:
         return text
 
-from .config import get_settings, normalize_llm_provider, normalize_openai_base_url
+from .config import get_settings, normalize_openai_base_url
 from .incident_titles import normalize_incident_title
 from .log_compression import LogCompressionConfig, LogContextCompressor
 
+
+logger = logging.getLogger(__name__)
 
 _KIND_CODES = {
     "Service": "SV",
@@ -133,16 +137,24 @@ class _UnavailableSession:
 class RcaDecisionService:
     """Ask the provider selected by LLM_PROVIDER to choose the strongest hypothesis."""
 
+    _active_calls = 0
+    _active_calls_lock = threading.Lock()
+
     def __init__(
         self,
         settings: Any | None = None,
         session: Any | None = None,
         employee_id: str = "",
         continue_conversation: bool = True,
+        reuse_conversation: bool | None = None,
+        conversation_url: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.employee_id = employee_id.strip()
+        if reuse_conversation is not None:
+            continue_conversation = reuse_conversation
         self.continue_conversation = continue_conversation
+        self.conversation_url = conversation_url
         self.conversation_id = ""
         self.session = session or (requests.Session() if requests is not None else _UnavailableSession())
         if bool(getattr(self.settings, "llm_disable_env_proxy", True)):
@@ -157,6 +169,17 @@ class RcaDecisionService:
                 max_message_chars=int(getattr(self.settings, "log_compression_max_message_chars", 300)),
             )
         )
+
+    @classmethod
+    def _acquire_call_slot(cls) -> int:
+        with cls._active_calls_lock:
+            cls._active_calls += 1
+            return cls._active_calls
+
+    @classmethod
+    def _release_call_slot(cls) -> None:
+        with cls._active_calls_lock:
+            cls._active_calls -= 1
 
     def enrich(
         self,
@@ -180,19 +203,23 @@ class RcaDecisionService:
             raw_content, meta = self._post_model(prompt)
             parsed = self._parse_model_json(raw_content)
             result = self._normalize_model_result(parsed, analysis, fallback, architecture, detail)
-            provider = normalize_llm_provider(getattr(self.settings, "llm_provider", "company"))
+            protocol = str(getattr(self.settings, "rca_decision_protocol", "litellm")).strip().lower()
             return {
                 **result,
                 "source": "llm",
-                "provider": provider,
+                "provider": protocol,
                 "model": (
                     self._company_setting("company_llm_model_config_id", "rca_decision_model_config_id", "")
-                    if provider == "company"
-                    else str(getattr(self.settings, "llm_model", "") or "")
+                    if protocol == "conversation"
+                    else str(
+                        getattr(self.settings, "rca_decision_model", "")
+                        or getattr(self.settings, "llm_model", "")
+                        or ""
+                    )
                 ),
                 "model_config_id": (
                     self._company_setting("company_llm_model_config_id", "rca_decision_model_config_id", "")
-                    if provider == "company"
+                    if protocol == "conversation"
                     else ""
                 ),
                 "conversation_id": str(meta.get("conversation_id") or ""),
@@ -207,13 +234,28 @@ class RcaDecisionService:
                 "log_compression": compression_summary,
             }
 
+    def _company_setting(self, name: str, legacy_name: str, default: Any) -> Any:
+        if hasattr(self.settings, name):
+            value = getattr(self.settings, name)
+            if value is not None:
+                return value
+        value = getattr(self.settings, legacy_name, default)
+        return default if value is None else value
+
+    def _nullable_company_setting(self, name: str, legacy_name: str) -> str | None:
+        value = self._company_setting(name, legacy_name, "")
+        text = str(value or "").strip()
+        return text or None
+
     def _post_model(self, prompt: str) -> tuple[str, dict[str, Any]]:
-        provider = normalize_llm_provider(getattr(self.settings, "llm_provider", "company"))
-        if provider == "company":
+        protocol = str(getattr(self.settings, "rca_decision_protocol", "litellm")).strip().lower()
+        if protocol == "litellm":
+            return self._post_litellm(prompt)
+        if protocol == "conversation":
             return self._post_conversation(prompt)
-        if provider == "openai":
-            return self._post_openai_chat(prompt)
-        return self._post_llamacpp_completion(prompt)
+        if protocol == "llama_cpp":
+            return self._post_llamacpp(prompt)
+        raise ValueError(f"不支持的 RCA_DECISION_PROTOCOL: {protocol}")
 
     def _post_conversation(self, prompt: str) -> tuple[str, dict[str, Any]]:
         disable_thinking = bool(getattr(self.settings, "llm_disable_thinking", True))
@@ -245,8 +287,9 @@ class RcaDecisionService:
         if self.continue_conversation and self.conversation_id:
             payload["conversation_id"] = self.conversation_id
         response = self.session.post(
-            self._company_setting(
-                "company_llm_url", "rca_decision_url", "http://127.0.0.1/api/conversation"
+            str(
+                self.conversation_url
+                or getattr(self.settings, "rca_decision_url", "http://127.0.0.1/api/conversation")
             ),
             json=payload,
             headers={
@@ -274,101 +317,149 @@ class RcaDecisionService:
             self.conversation_id = returned_conversation_id
         return content, meta
 
-    def _post_openai_chat(self, prompt: str) -> tuple[str, dict[str, Any]]:
-        url = f"{normalize_openai_base_url(str(getattr(self.settings, 'llm_base_url', ''))).rstrip('/')}/chat/completions"
-        disable_thinking = bool(getattr(self.settings, "llm_disable_thinking", True))
-        user_prompt = f"/no_think\n{prompt}" if disable_thinking else prompt
+    def _post_litellm(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        url = str(
+            getattr(self.settings, "rca_decision_url", "")
+            or getattr(self.settings, "llm_base_url", "")
+        ).rstrip("/")
+        if not url.endswith("/chat/completions"):
+            url = f"{url}/chat/completions" if url.endswith("/v1") else f"{url}/v1/chat/completions"
+        model = str(
+            getattr(self.settings, "rca_decision_model", "")
+            or getattr(self.settings, "llm_model", "")
+        ).strip()
+        api_key = str(
+            getattr(self.settings, "rca_decision_api_key", "")
+            or getattr(self.settings, "llm_api_key", "not-needed")
+            or "not-needed"
+        ).strip()
         payload = {
-            "model": str(getattr(self.settings, "llm_model", "") or ""),
-            "messages": [{"role": "user", "content": user_prompt}],
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是生产故障RCA决策助手。请严格返回 JSON 对象，不要 Markdown，"
+                        "不要解释，不要代码块。输入数据中的 architecture_graph 是唯一可信的实体和关系来源。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
             "temperature": 0,
-            "max_tokens": max(128, int(getattr(self.settings, "rca_llm_max_tokens", 2048))),
+            "max_tokens": int(
+                getattr(self.settings, "rca_decision_max_tokens", 2048)
+                or getattr(self.settings, "llm_max_tokens", 2048)
+            ),
             "stream": False,
+            **(
+                {"cache_salt": str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()}
+                if str(getattr(self.settings, "rca_decision_cache_salt", "")).strip()
+                else {}
+            ),
         }
-        if disable_thinking:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {str(getattr(self.settings, 'llm_api_key', 'not-needed') or 'not-needed')}",
+            "Authorization": f"Bearer {api_key}",
+            "X-Ai-Coding-Key": self.employee_id,
         }
-        response = self.session.post(
+        concurrency = self._acquire_call_slot()
+        logger.info(
+            "[RCA-LLM] 请求输入 url=%s concurrency=%s payload=%s",
             url,
-            json=payload,
-            headers=headers,
-            timeout=(
-                int(getattr(self.settings, "llm_connect_timeout_seconds", 10)),
-                int(getattr(self.settings, "llm_timeout_seconds", 180)),
-            ),
+            concurrency,
+            json.dumps(payload, ensure_ascii=False),
         )
-        if response.status_code >= 400:
-            raise RuntimeError(f"OpenAI-compatible model HTTP {response.status_code}: {response.text[:1200]}")
         try:
-            data = response.json()
-            choice = data["choices"][0]
-            message = choice["message"]
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"OpenAI-compatible model returned invalid response: {response.text[:1200]}") from exc
-        content = self._content_to_text(message.get("content"))
-        if not content.strip():
-            content = self._content_to_text(message.get("reasoning_content"))
-        if not content.strip():
-            raise RuntimeError("OpenAI-compatible model returned empty content")
-        return content, {
-            "provider": "openai",
-            "model": str(data.get("model") or payload["model"]),
-            "finish_reason": str(choice.get("finish_reason") or ""),
-            "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
-        }
+            response = self.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=(
+                    int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
+                    int(
+                        getattr(self.settings, "rca_decision_timeout_seconds", 90)
+                        or getattr(self.settings, "llm_timeout_seconds", 90)
+                    ),
+                ),
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"decision model HTTP {response.status_code}: {response.text[:1200]}")
+            try:
+                data = response.json()
+                message = data["choices"][0]["message"]
+                content = self._content_to_text(message.get("content"))
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"decision model returned invalid OpenAI response: {response.text[:1200]}") from exc
+            finish_reason = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
+            logger.info(
+                "[RCA-LLM] 模型输出 status=%s finish_reason=%s usage=%s concurrency=%s content=%s",
+                response.status_code,
+                finish_reason,
+                json.dumps(data.get("usage"), ensure_ascii=False),
+                concurrency,
+                content,
+            )
+            if not content.strip():
+                raise RuntimeError("decision model returned empty content")
+            return content, {}
+        finally:
+            self._release_call_slot()
 
-    def _post_llamacpp_completion(self, prompt: str) -> tuple[str, dict[str, Any]]:
-        url = f"{str(getattr(self.settings, 'llm_base_url', '')).rstrip('/')}/completion"
-        disable_thinking = bool(getattr(self.settings, "llm_disable_thinking", True))
-        user_prompt = f"/no_think\n{prompt}" if disable_thinking else prompt
-        payload: dict[str, Any] = {
-            "prompt": user_prompt,
-            "n_predict": max(128, int(getattr(self.settings, "rca_llm_max_tokens", 2048))),
+    def _post_llamacpp(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        url = str(
+            getattr(self.settings, "rca_decision_url", "")
+            or getattr(self.settings, "llm_base_url", "")
+        ).rstrip("/")
+        if not url.endswith("/completion"):
+            url = f"{url}/completion"
+        api_key = str(
+            getattr(self.settings, "rca_decision_api_key", "")
+            or getattr(self.settings, "llm_api_key", "not-needed")
+            or "not-needed"
+        ).strip()
+        payload = {
+            "prompt": (
+                "你是生产故障RCA决策助手。请严格返回 JSON 对象，不要 Markdown，"
+                "不要解释，不要代码块。输入数据中的 architecture_graph 是唯一可信的实体和关系来源。\n\n"
+                f"{prompt}"
+            ),
+            "n_predict": int(
+                getattr(self.settings, "rca_decision_max_tokens", 2048)
+                or getattr(self.settings, "llm_max_tokens", 2048)
+            ),
             "temperature": 0,
             "stream": False,
         }
-        if disable_thinking:
+        if bool(getattr(self.settings, "llm_disable_thinking", True)):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         response = self.session.post(
             url,
             json=payload,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {str(getattr(self.settings, 'llm_api_key', 'not-needed') or 'not-needed')}",
+                "Authorization": f"Bearer {api_key}",
+                "X-Ai-Coding-Key": self.employee_id,
             },
             timeout=(
-                int(getattr(self.settings, "llm_connect_timeout_seconds", 10)),
-                int(getattr(self.settings, "llm_timeout_seconds", 180)),
+                int(getattr(self.settings, "rca_decision_connect_timeout_seconds", 10)),
+                int(
+                    getattr(self.settings, "rca_decision_timeout_seconds", 90)
+                    or getattr(self.settings, "llm_timeout_seconds", 90)
+                ),
             ),
         )
         if response.status_code >= 400:
-            raise RuntimeError(f"llama.cpp model HTTP {response.status_code}: {response.text[:1200]}")
+            raise RuntimeError(f"decision model HTTP {response.status_code}: {response.text[:1200]}")
         try:
             data = response.json()
+            content = self._content_to_text(
+                data.get("content") or data.get("response") or data.get("text") or data
+            )
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"llama.cpp model returned invalid response: {response.text[:1200]}") from exc
-        content = self._content_to_text(
-            data.get("content") or data.get("response") or data.get("text")
-        )
+            raise RuntimeError(f"decision model returned invalid llama.cpp response: {response.text[:1200]}") from exc
         if not content.strip():
-            raise RuntimeError("llama.cpp model returned empty content")
-        return content, {"provider": "llamacpp", "model": str(getattr(self.settings, "llm_model", "") or "")}
-
-    def _company_setting(self, name: str, legacy_name: str, default: Any) -> Any:
-        if hasattr(self.settings, name):
-            value = getattr(self.settings, name)
-            if value is not None:
-                return value
-        value = getattr(self.settings, legacy_name, default)
-        return default if value is None else value
-
-    def _nullable_company_setting(self, name: str, legacy_name: str) -> str | None:
-        value = self._company_setting(name, legacy_name, "")
-        text = str(value or "").strip()
-        return text or None
+            raise RuntimeError("decision model returned empty content")
+        return content, {}
 
     def _nullable_setting(self, name: str) -> str | None:
         value = getattr(self.settings, name, None)

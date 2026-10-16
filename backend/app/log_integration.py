@@ -4,6 +4,7 @@ import csv
 from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
+import logging
 import os
 import re
 import sys
@@ -21,6 +22,9 @@ from .models import GraphResponse
 from .rca_decision import RcaDecisionService
 from .rca_optimization import prune_pending_graph, select_relevant_timeline, should_write_edge
 from .rca_engine import RootCauseAnalysis, RootCauseEngine
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,6 +100,8 @@ class IncidentGraphIntegrator:
             "orphan_nodes_skipped": 0,
             "invalid_edges_skipped": 0,
         }
+        # Keep one shared service for legacy serial Conversation mode. The
+        # concurrent path creates one isolated service per Incident.
         self.employee_id = employee_id
         self.decision_service = RcaDecisionService(employee_id=employee_id)
 
@@ -317,17 +323,10 @@ class IncidentGraphIntegrator:
             )
 
         decisions: dict[int, dict[str, Any]] = {}
-        max_workers = (
-            max(
-                1,
-                min(
-                    int(getattr(self.settings, "rca_decision_max_workers", 3)),
-                    len(prepared),
-                ),
-            )
-            if prepared
-            else 1
-        )
+        max_workers = max(
+            1,
+            min(int(getattr(self.settings, "rca_decision_max_workers", 3)), len(prepared)),
+        ) if prepared else 1
         isolate = bool(getattr(self.settings, "rca_decision_isolate_conversations", True))
 
         def _decide(item: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -342,6 +341,7 @@ class IncidentGraphIntegrator:
             )
             return item["index"], service.enrich(item["detail"], item["data"], architecture)
 
+        logger.info("[RCA] 并发决策 tasks=%s max_workers=%s", len(prepared), max_workers)
         if isolate and len(prepared) > 1:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rca-llm") as executor:
                 for index, decision in executor.map(_decide, prepared):

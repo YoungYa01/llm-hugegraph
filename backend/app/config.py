@@ -67,23 +67,20 @@ class Settings:
     allow_registration: bool = _bool_env("ALLOW_REGISTRATION", True)
     max_upload_mb: int = _int_env("MAX_UPLOAD_MB", 200)
 
-    # One provider is selected for every LLM call in the application.  We do
-    # not silently fall through to a different protocol because that can send
-    # the same prompt to an unintended service.
+    # Each LLM workflow can use litellm, conversation, or llama_cpp independently.
     llm_enabled: bool = _bool_env("LLM_ENABLED", True)
-    llm_provider: str = _env("LLM_PROVIDER", "openai").lower()
-    llm_base_url: str = _env("LLM_BASE_URL", "http://127.0.0.1:1234")
-    llm_model: str = _env("LLM_MODEL", "qwen3.5_14B_Q4_K_M")
+    llm_protocol: str = _env("LLM_PROTOCOL", "litellm")
+    llm_base_url: str = _env("LLM_BASE_URL", "http://127.0.0.1:4000/v1")
+    llm_model: str = _env("LLM_MODEL", "analysis-model")
     llm_api_key: str = _env("LLM_API_KEY", "not-needed")
+    llm_conversation_url: str = _env("LLM_CONVERSATION_URL", "http://127.0.0.1/api/conversation")
     llm_timeout_seconds: int = _int_env("LLM_TIMEOUT_SECONDS", 180)
     llm_connect_timeout_seconds: int = _int_env("LLM_CONNECT_TIMEOUT_SECONDS", 10)
     llm_max_tokens: int = _int_env("LLM_MAX_TOKENS", 2048)
     llm_chunk_chars: int = _int_env("LLM_CHUNK_CHARS", 700)
     llm_max_workers: int = _int_env("LLM_MAX_WORKERS", 4)
     llm_disable_thinking: bool = _bool_env("LLM_DISABLE_THINKING", True)
-    # Default false: avoids LangChain/httpx proxy/credential surprises. Direct HTTP
-    # is the same OpenAI-compatible protocol used by the reference project/server.
-    llm_use_langchain_first: bool = _bool_env("LLM_USE_LANGCHAIN_FIRST", False)
+    llm_cache_salt: str = _env("LLM_CACHE_SALT", "")
     llm_disable_env_proxy: bool = _bool_env("LLM_DISABLE_ENV_PROXY", True)
 
     # HugeGraph REST. The client auto-detects both 1.7 graphspace URL and legacy URL.
@@ -128,77 +125,32 @@ class Settings:
     # Whether RCA should use the provider selected by LLM_PROVIDER after the
     # deterministic hypothesis list has been generated.
     rca_decision_enabled: bool = _bool_env("RCA_DECISION_ENABLED", True)
-    rca_llm_max_tokens: int = _int_env("RCA_LLM_MAX_TOKENS", 2048)
-    rca_prompt_architecture_radius: int = _int_env("RCA_PROMPT_ARCHITECTURE_RADIUS", 2)
-    rca_prompt_architecture_max_nodes: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_NODES", 20)
-    rca_prompt_architecture_max_seeds: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_SEEDS", 3)
-    rca_prompt_max_hypotheses: int = _int_env("RCA_PROMPT_MAX_HYPOTHESES", 3)
-    rca_decision_max_workers: int = _int_env("RCA_DECISION_MAX_WORKERS", 3)
-    rca_decision_isolate_conversations: bool = _bool_env(
-        "RCA_DECISION_ISOLATE_CONVERSATIONS",
-        True,
-    )
-
-    # Company /api/conversation protocol.  The old RCA_DECISION_* names remain
-    # as fallbacks so existing deployments continue to work while migrating to
-    # the clearer COMPANY_LLM_* names.
-    company_llm_url: str = _env(
-        "COMPANY_LLM_URL",
-        _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation"),
-    )
-    company_llm_model_config_id: str = _env(
-        "COMPANY_LLM_MODEL_CONFIG_ID",
-        _env("RCA_DECISION_MODEL_CONFIG_ID", ""),
-    )
-    company_llm_assistant_role: str = _env(
-        "COMPANY_LLM_ASSISTANT_ROLE",
-        _env("RCA_DECISION_ASSISTANT_ROLE", "general"),
-    )
-    company_llm_assistant_name: str = _env(
-        "COMPANY_LLM_ASSISTANT_NAME",
-        _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant"),
-    )
-    company_llm_assistant_prompt: str = _env(
-        "COMPANY_LLM_ASSISTANT_PROMPT",
-        "你是日志系统的大模型助手。严格遵守用户提示，并只返回要求的结果格式。",
-    )
-    company_llm_stream: bool = _bool_env(
-        "COMPANY_LLM_STREAM",
-        _bool_env("RCA_DECISION_STREAM", False),
-    )
-    company_llm_code_language: str = _env(
-        "COMPANY_LLM_CODE_LANGUAGE",
-        _env("RCA_DECISION_CODE_LANGUAGE", ""),
-    )
-    company_llm_kb_id: str = _env(
-        "COMPANY_LLM_KB_ID",
-        _env("RCA_DECISION_KB_ID", ""),
-    )
-    company_llm_kb_name: str = _env(
-        "COMPANY_LLM_KB_NAME",
-        _env("RCA_DECISION_KB_NAME", ""),
-    )
-    company_llm_timeout_seconds: int = _int_env(
-        "COMPANY_LLM_TIMEOUT_SECONDS",
-        _int_env("RCA_DECISION_TIMEOUT_SECONDS", 90),
-    )
-    company_llm_connect_timeout_seconds: int = _int_env(
-        "COMPANY_LLM_CONNECT_TIMEOUT_SECONDS",
-        _int_env("RCA_DECISION_CONNECT_TIMEOUT_SECONDS", 10),
-    )
-
-    # Deprecated compatibility fields.  New code reads COMPANY_LLM_* above.
-    rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1/api/conversation")
+    rca_decision_url: str = _env("RCA_DECISION_URL", "http://127.0.0.1:4000/v1")
     rca_decision_model_config_id: str = _env("RCA_DECISION_MODEL_CONFIG_ID", "")
     rca_decision_assistant_role: str = _env("RCA_DECISION_ASSISTANT_ROLE", "general")
     rca_decision_assistant_name: str = _env("RCA_DECISION_ASSISTANT_NAME", "normal_assistant")
     rca_decision_assistant_prompt: str = _env("RCA_DECISION_ASSISTANT_PROMPT", "")
     rca_decision_stream: bool = _bool_env("RCA_DECISION_STREAM", False)
+    rca_decision_max_tokens: int = _int_env("RCA_DECISION_MAX_TOKENS", 2048)
+    rca_decision_protocol: str = _env("RCA_DECISION_PROTOCOL", "litellm")
+    rca_decision_model: str = _env("RCA_DECISION_MODEL", "rca-model")
+    rca_decision_api_key: str = _env("RCA_DECISION_API_KEY", "")
+    rca_decision_cache_salt: str = _env("RCA_DECISION_CACHE_SALT", "")
+    rca_decision_max_workers: int = _int_env("RCA_DECISION_MAX_WORKERS", 3)
+    rca_decision_isolate_conversations: bool = _bool_env("RCA_DECISION_ISOLATE_CONVERSATIONS", True)
     rca_decision_code_language: str = _env("RCA_DECISION_CODE_LANGUAGE", "")
     rca_decision_kb_id: str = _env("RCA_DECISION_KB_ID", "")
     rca_decision_kb_name: str = _env("RCA_DECISION_KB_NAME", "")
     rca_decision_timeout_seconds: int = _int_env("RCA_DECISION_TIMEOUT_SECONDS", 90)
     rca_decision_connect_timeout_seconds: int = _int_env("RCA_DECISION_CONNECT_TIMEOUT_SECONDS", 10)
+
+    # Per-incident architecture prompt shaping: seed the prompt from deterministic
+    # RCA candidates and include only the nearby subgraph. Small graphs below the
+    # node cap remain whole.
+    rca_prompt_architecture_radius: int = _int_env("RCA_PROMPT_ARCHITECTURE_RADIUS", 2)
+    rca_prompt_architecture_max_nodes: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_NODES", 20)
+    rca_prompt_architecture_max_seeds: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_SEEDS", 3)
+    rca_prompt_max_hypotheses: int = _int_env("RCA_PROMPT_MAX_HYPOTHESES", 3)
 
     @property
     def llm_openai_base_url(self) -> str:

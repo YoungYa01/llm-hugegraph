@@ -158,10 +158,14 @@ def parse_log_file(
 def load_events(input_path: str | Path, input_config: dict) -> pd.DataFrame:
     source = Path(input_path)
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    # 解压可能占用与日志等量的磁盘，允许指定到空间充足的盘。
+    temp_root = str(input_config.get("temp_dir") or "").strip() or None
+    if temp_root:
+        Path(temp_root).mkdir(parents=True, exist_ok=True)
     try:
         suffix = source.suffix.lower()
         if source.is_file() and suffix == ".zip":
-            temp_dir = tempfile.TemporaryDirectory(prefix="logfault-")
+            temp_dir = tempfile.TemporaryDirectory(prefix="logfault-", dir=temp_root)
             with zipfile.ZipFile(source, "r") as archive:
                 _safe_extract_zip(
                     archive,
@@ -171,7 +175,7 @@ def load_events(input_path: str | Path, input_config: dict) -> pd.DataFrame:
                 )
             root = Path(temp_dir.name)
         elif source.is_file() and suffix == ".gz":
-            temp_dir = tempfile.TemporaryDirectory(prefix="logfault-")
+            temp_dir = tempfile.TemporaryDirectory(prefix="logfault-", dir=temp_root)
             expanded = Path(temp_dir.name) / source.stem
             _safe_expand_gzip(
                 source,

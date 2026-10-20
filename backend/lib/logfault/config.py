@@ -89,6 +89,11 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """深合并 override 到 base 的副本；列表整体替换，不做拼接。"""
+    return _deep_merge(base, override)
+
+
 def load_config(path: str | Path | None) -> dict[str, Any]:
     if path is None:
         return deepcopy(DEFAULT_CONFIG)

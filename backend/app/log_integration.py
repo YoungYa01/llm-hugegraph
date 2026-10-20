@@ -953,6 +953,40 @@ class IncidentGraphIntegrator:
         return text
 
 
+_PIPELINE_MODE_ALIASES = {
+    "full": "full",
+    "batch": "full",
+    "once": "full",
+    "一次性": "full",
+    "stream": "stream",
+    "streaming": "stream",
+    "流式": "stream",
+    "auto": "auto",
+}
+
+# GZIP 不存可靠的原始大小，只能按经验膨胀倍数估算；ZIP 可直接读中央目录里的真实解压大小。
+_GZIP_EXPANSION = 4.0
+
+
+def _estimate_input_mb(path: Path) -> float:
+    """估算输入规模（MB）。ZIP 用条目表里的解压后大小，避免高压缩比导致选错管线。"""
+    try:
+        if path.is_dir():
+            total = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            return total / (1024 ** 2)
+        suffix = path.suffix.lower()
+        if suffix == ".zip":
+            with zipfile.ZipFile(path, "r") as archive:
+                total = sum(max(0, int(item.file_size)) for item in archive.infolist())
+            return total / (1024 ** 2)
+        total = path.stat().st_size
+        if suffix in {".gz", ".gzip"}:
+            total *= _GZIP_EXPANSION
+        return total / (1024 ** 2)
+    except (OSError, zipfile.BadZipFile):
+        return 0.0
+
+
 class LogFaultRunner:
     """Optional adapter for the v1-goat sliding-window algorithm package."""
 
@@ -980,6 +1014,38 @@ class LogFaultRunner:
         finally:
             temp.cleanup()
 
+    def _resolve_pipeline_mode(self, input_path: Path, train_path: Path | None) -> str:
+        raw = str(getattr(self.settings, "logfault_pipeline_mode", "full") or "full").strip().lower()
+        mode = _PIPELINE_MODE_ALIASES.get(raw, raw)
+        if mode not in {"full", "stream", "auto"}:
+            raise ValueError(
+                f"LOGFAULT_PIPELINE_MODE 只能是 full / stream / auto，当前值为 {raw!r}"
+            )
+        if mode == "stream" and train_path is not None:
+            raise ValueError(
+                "流式管线不支持独立训练集：请设置 LOGFAULT_PIPELINE_MODE=full，或去掉训练集文件"
+            )
+        if mode != "auto":
+            return mode
+        # auto：流式不支持独立训练集，只能在规模阈值上做判断。
+        if train_path is not None:
+            return "full"
+        threshold = max(1, int(getattr(self.settings, "logfault_stream_threshold_mb", 150)))
+        estimated = _estimate_input_mb(input_path)
+        return "stream" if estimated >= threshold else "full"
+
+    def _guard_full_mode(self, input_path: Path) -> None:
+        """full 模式会把事件全量读入内存，超过上限直接拒绝，避免解压后 OOM。"""
+        limit = max(1, int(getattr(self.settings, "logfault_full_max_input_mb", 500)))
+        estimated = _estimate_input_mb(input_path)
+        if estimated > limit:
+            raise ValueError(
+                f"输入规模约 {estimated:.0f} MB，超过 full 模式上限 {limit} MB。"
+                "full 模式会把全部事件读入内存，GB 级日志会因内存不足失败。"
+                "请把 LOGFAULT_PIPELINE_MODE 设为 stream（两遍流式，内存占用与日志总量基本无关）"
+                "或 auto（按规模自动选择），也可以调大 LOGFAULT_FULL_MAX_INPUT_MB。"
+            )
+
     def _run_pipeline(self, input_path: Path, output_dir: Path, train_path: Path | None) -> dict[str, Any]:
         project: Path | None = None
         if self.settings.logfault_project_path:
@@ -992,21 +1058,55 @@ class LogFaultRunner:
                 project = bundled
         if project is not None and str(project) not in sys.path:
             sys.path.insert(0, str(project))
-        try:
-            module = importlib.import_module("logfault.pipeline")
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                "无法导入 logfault.pipeline。请把 v1-goat 仓库路径配置到 LOGFAULT_PROJECT_PATH，"
-                "或先用该算法生成 incident_details.json 后走“导入异常链路”。"
-            ) from exc
+
+        mode = self._resolve_pipeline_mode(input_path, train_path)
         config_path = self.settings.logfault_config_path or None
-        run_pipeline = getattr(module, "run_pipeline")
-        return run_pipeline(
-            input_path=input_path,
-            output_dir=output_dir,
-            config_path=config_path,
-            train_input=train_path,
-        )
+        # 解压上限原本固定 1000MB，GB 级压缩包会被误判为 zip bomb，这里按配置放开。
+        # 解压目录同样可配：大包解压体积与日志等量，系统盘紧张时需要换盘。
+        config_override = {
+            "input": {
+                "max_archive_uncompressed_mb": max(
+                    1, int(getattr(self.settings, "logfault_max_archive_mb", 4096))
+                ),
+            }
+        }
+        temp_dir = str(getattr(self.settings, "logfault_temp_dir", "") or "").strip()
+        if temp_dir:
+            config_override["input"]["temp_dir"] = temp_dir
+        if mode == "stream":
+            try:
+                module = importlib.import_module("logfault.stream_pipeline")
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "无法导入 logfault.stream_pipeline：当前 LOGFAULT_PROJECT_PATH 指向的算法包没有流式管线，"
+                    "请指向 backend/lib，或把 LOGFAULT_PIPELINE_MODE 设为 full。"
+                ) from exc
+            summary = module.run_stream_pipeline(
+                input_path=input_path,
+                output_dir=output_dir,
+                config_path=config_path,
+                reorder_seconds=float(getattr(self.settings, "logfault_reorder_seconds", 60)),
+                config_override=config_override,
+            )
+        else:
+            self._guard_full_mode(input_path)
+            try:
+                module = importlib.import_module("logfault.pipeline")
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "无法导入 logfault.pipeline。请把 v1-goat 仓库路径配置到 LOGFAULT_PROJECT_PATH，"
+                    "或先用该算法生成 incident_details.json 后走“导入异常链路”。"
+                ) from exc
+            summary = module.run_pipeline(
+                input_path=input_path,
+                output_dir=output_dir,
+                config_path=config_path,
+                train_input=train_path,
+                config_override=config_override,
+            )
+        if isinstance(summary, dict):
+            summary.setdefault("pipeline_mode", mode)
+        return summary
 
     def _write_rca_artifacts(self, output_dir: Path, analyses: list[dict[str, Any]]) -> None:
         (output_dir / "rca_results.json").write_text(

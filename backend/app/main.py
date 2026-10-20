@@ -97,6 +97,8 @@ def health() -> dict:
             "project_path": settings.logfault_project_path,
             "config_path": settings.logfault_config_path,
             "output_root": settings.logfault_output_root,
+            "pipeline_mode": settings.logfault_pipeline_mode,
+            "stream_threshold_mb": settings.logfault_stream_threshold_mb,
         },
         "rca": {"top_k": settings.rca_top_k},
         "hugegraph": {

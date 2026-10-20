@@ -8,7 +8,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from .config import load_config
+from .config import load_config, merge_config
 from .drain_adapter import template_events
 from .explain import annotate_windows, merge_anomaly_windows
 from .features import build_window_features
@@ -118,8 +118,11 @@ def run_pipeline(
     config_path: str | Path | None = None,
     train_input: str | Path | None = None,
     model_override: str | None = None,
+    config_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = load_config(config_path)
+    if config_override:
+        config = merge_config(config, config_override)
     if model_override:
         config["model"]["type"] = model_override
 

@@ -98,6 +98,17 @@ class Settings:
     logfault_project_path: str = _env("LOGFAULT_PROJECT_PATH", "")
     logfault_config_path: str = _env("LOGFAULT_CONFIG_PATH", "")
     logfault_output_root: str = _env("LOGFAULT_OUTPUT_ROOT", "./runs/kg")
+    # full = 一次性全量读入内存；stream = 两遍流式（内存与日志总量基本无关）；
+    # auto = 低于阈值走 full，达到阈值走 stream。
+    logfault_pipeline_mode: str = _env("LOGFAULT_PIPELINE_MODE", "full")
+    logfault_stream_threshold_mb: int = _int_env("LOGFAULT_STREAM_THRESHOLD_MB", 150)
+    logfault_reorder_seconds: int = _int_env("LOGFAULT_REORDER_SECONDS", 60)
+    # 压缩包解压后的总大小上限（防 zip bomb）。GB 级日志压缩包需要调大。
+    logfault_max_archive_mb: int = _int_env("LOGFAULT_MAX_ARCHIVE_MB", 4096)
+    # full 模式输入规模上限：超过即拒绝，避免解压后全量读入导致 OOM。
+    logfault_full_max_input_mb: int = _int_env("LOGFAULT_FULL_MAX_INPUT_MB", 500)
+    # 压缩包解压的临时目录；留空则用系统临时目录。大包建议指到空间充足的盘。
+    logfault_temp_dir: str = _env("LOGFAULT_TEMP_DIR", "")
     incident_timeline_limit: int = _int_env("INCIDENT_TIMELINE_LIMIT", 120)
     rca_top_k: int = _int_env("RCA_TOP_K", 5)
 

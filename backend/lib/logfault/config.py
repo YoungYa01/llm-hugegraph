@@ -39,7 +39,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ],
     },
     "window": {"size_minutes": 5, "step_minutes": 1, "min_events": 1},
-    "features": {"namespace_by_service": True, "include_levels": False},
+    "features": {
+        "namespace_by_service": True,
+        "include_levels": False,
+        "embedding": {
+            "enabled": False,
+            "pca_components": 16,
+            "text_source": "template",
+        },
+    },
     "pca": {"max_components": 20, "target_variance": 0.95},
     "model": {
         "type": "isolation_forest",

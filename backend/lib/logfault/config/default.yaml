@@ -43,6 +43,14 @@ window:
 features:
   namespace_by_service: true
   include_levels: false
+  # 可选：给检测特征叠加「模板语义向量」，让检测器利用日志语义（而非仅模板计数）。
+  # 默认关闭；开启后复用 LLM 网关 embeddings 接口，对去重后的模板取 embedding。
+  embedding:
+    enabled: false
+    # 语义向量拼到计数特征前先做 PCA 降维到该维数，避免维度爆炸；<=0 表示不降维。
+    pca_components: 16
+    # 单个模板取 embedding 的文本来源：template（Drain 挖出的模板）或 raw（原始 message）。
+    text_source: template
 
 pca:
   max_components: 20

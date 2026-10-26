@@ -35,8 +35,9 @@ from .config import load_config, merge_config
 from .drain_adapter import DrainParser
 from .explain import (
     ERROR_LEVELS,
+    EVENT_TEXT_KEYS,
     ROOT_KEYWORDS,
-    _event_text,
+    _has_keyword,
     _is_technical_error,
     annotate_windows,
     merge_anomaly_windows,
@@ -291,6 +292,15 @@ def _signal_row(event: Any) -> dict[str, Any]:
     }
 
 
+def _signal_text(event: Any) -> str:
+    """等价于 ``_event_text(_signal_row(event))``，但不构造中间字典。
+
+    第一遍要扫过全部事件（2 GB 样本约 560 万条），为 7 个字段建一次 dict 是纯开销；
+    ``ParsedEvent`` 的这些字段本身就是 str，直接取用即可。
+    """
+    return " ".join(getattr(event, key) for key in EVENT_TEXT_KEYS).lower()
+
+
 def _scan(
     files: list[tuple[Path, str]],
     config: dict,
@@ -355,11 +365,15 @@ def _scan(
 
         stamp = _to_ns(event.timestamp)
         level = str(event.level).upper()
-        row = _signal_row(event)
+        is_error = level in ERROR_LEVELS
+        # 根因文本每条事件只拼一次。原写法把 _event_text(row) 写在 any(...) 的
+        # 生成器里，等于每条事件重复拼装并小写 23 遍，是流式扫描的头号热点。
+        text = _signal_text(event)
+        # ERROR/FATAL 必然保留，无需再做关键词扫描
+        root_signal = is_error or _has_keyword(text, ROOT_KEYWORDS)
         # _is_technical_error 对非 ERROR/FATAL 恒为 False，短路可省掉绝大部分文本构造
-        technical = level in ERROR_LEVELS and _is_technical_error(row)
-        root_signal = any(keyword in _event_text(row) for keyword in ROOT_KEYWORDS)
-        keep = level in ERROR_LEVELS or technical or root_signal
+        technical = is_error and _is_technical_error(_signal_row(event), text)
+        keep = is_error or technical or root_signal
 
         # 事件属于所有满足 start <= t < start+size 的窗口，最多 size/step 个
         start = stamp - (stamp % step_ns)

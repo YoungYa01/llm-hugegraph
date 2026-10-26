@@ -87,8 +87,8 @@ LiteLLM 作为独立进程运行：
 ```bash
 cd backend
 python -m venv .venv-litellm
-# Linux/macOS: source .venv-litellm/bin/activate
-# Windows PowerShell: .venv-litellm\Scripts\Activate.ps1
+Linux/macOS: source .venv-litellm/bin/activate
+Windows PowerShell: .venv-litellm\Scripts\Activate.ps1
 pip install "litellm[proxy]"
 $env:LITELLM_MASTER_KEY="sk-local-gateway"
 litellm --config litellm_config.yaml --port 4000

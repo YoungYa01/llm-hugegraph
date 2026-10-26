@@ -98,20 +98,29 @@ def _json_text(value: Any) -> str:
     return str(value)
 
 
-def _flatten(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+def _flatten(value: dict[str, Any], prefix: str = "", *, lower_keys: bool = True) -> dict[str, Any]:
+    """把嵌套字段展开成 ``a.b`` 形式的点号路径。
+
+    ``lower_keys`` 默认开启：下游 ``_pick`` 只在「键已小写」的字典上查表，
+    展开时顺手转小写，省掉每条事件按 15 组别名各重建一次小写字典的开销。
+    """
     flattened: dict[str, Any] = {}
     for key, item in value.items():
         path = f"{prefix}.{key}" if prefix else str(key)
-        flattened[path] = item
+        flattened[path.lower() if lower_keys else path] = item
         if isinstance(item, dict):
-            flattened.update(_flatten(item, path))
+            flattened.update(_flatten(item, path, lower_keys=lower_keys))
     return flattened
 
 
-def _pick(values: dict[str, Any], aliases: Iterable[str]) -> Any:
-    lowered = {key.lower(): value for key, value in values.items()}
+def _pick(lowered: dict[str, Any], aliases: Iterable[str]) -> Any:
+    """在「键已小写」的字典上按别名优先级取第一个非空值。
+
+    调用方须保证 ``lowered`` 的键与 ``aliases`` 元素均为小写。原实现每次调用都
+    重建一份小写键字典，一条 NDJSON 事件要重复小写 15 遍，是解析阶段的主要热点。
+    """
     for alias in aliases:
-        value = lowered.get(alias.lower())
+        value = lowered.get(alias)
         if value is not None and str(value).strip() != "":
             return value
     return ""
@@ -405,10 +414,24 @@ class SpringJavaParser(HeaderBlockParser):
 
 class JsonLogParser(LogParser):
     name = "json"
+    # 别名表统一小写：_pick 在「键已小写」的 _flatten 结果上直接查表。
     timestamp_aliases = ("@timestamp", "timestamp", "time", "ts", "datetime", "event.created")
     level_aliases = ("level", "log.level", "severity", "severitytext", "loglevel")
     message_aliases = ("message", "msg", "log", "event.original", "body")
     service_aliases = ("service.name", "service", "app", "application", "spring.application.name")
+    stack_aliases = (
+        "exception.stacktrace", "exception.stack_trace", "stack_trace", "stacktrace", "error.stack",
+    )
+    instance_aliases = ("service.instance.id", "instance", "pod_name", "kubernetes.pod.name")
+    thread_aliases = ("thread", "thread_name", "thread.name")
+    logger_aliases = ("logger", "logger_name", "log.logger")
+    pid_aliases = ("process.pid", "pid")
+    host_aliases = ("host.name", "hostname", "host")
+    namespace_aliases = ("kubernetes.namespace", "kubernetes.namespace_name", "namespace")
+    container_aliases = ("container.name", "container", "kubernetes.container.name")
+    trace_aliases = ("trace.id", "trace_id", "traceid")
+    span_aliases = ("span.id", "span_id", "spanid")
+    request_aliases = ("request.id", "request_id", "requestid", "correlation_id")
 
     def probe(self, lines: list[str]) -> float:
         nonempty = [line.strip() for line in lines if line.strip()]
@@ -426,6 +449,7 @@ class JsonLogParser(LogParser):
     def parse(self, lines: list[str], source_path: Path, source_file: str, confidence: float) -> FileParseResult:
         result = FileParseResult(parser_name=self.name, parser_confidence=confidence, total_lines=len(lines))
         spring = SpringJavaParser()
+        pick = _pick
         for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 continue
@@ -437,9 +461,10 @@ class JsonLogParser(LogParser):
             if not isinstance(payload, dict):
                 result.unparsed.append(UnparsedRecord(source_file, line_number, line_number, line, "json_value_is_not_object", self.name))
                 continue
+            # 展开与键小写一次完成，后续 15 次字段查找都不再重复处理键
             flat = _flatten(payload)
-            message = _json_text(_pick(flat, self.message_aliases)).rstrip("\r\n")
-            timestamp_value = _pick(flat, self.timestamp_aliases)
+            message = _json_text(pick(flat, self.message_aliases)).rstrip("\r\n")
+            timestamp_value = pick(flat, self.timestamp_aliases)
             timestamp, inferred = parse_timestamp(timestamp_value)
             inner = spring.parse_header(message)
             if timestamp is None and inner:
@@ -452,14 +477,12 @@ class JsonLogParser(LogParser):
                     "json_event_has_no_supported_timestamp", self.name,
                 ))
                 continue
-            level = _pick(flat, self.level_aliases) or (inner or {}).get("level") or (
+            level = pick(flat, self.level_aliases) or (inner or {}).get("level") or (
                 "ERROR" if str(payload.get("stream") or "").lower() == "stderr" else "INFO"
             )
             if inner:
                 message = str(inner.get("message") or message)
-            stack = _json_text(_pick(flat, (
-                "exception.stacktrace", "exception.stack_trace", "stack_trace", "stacktrace", "error.stack",
-            )))
+            stack = _json_text(pick(flat, self.stack_aliases))
             continuation = stack.splitlines() if stack else message.splitlines()[1:]
             if "\n" in message:
                 message = message.splitlines()[0]
@@ -476,19 +499,19 @@ class JsonLogParser(LogParser):
                 end_line=line_number,
                 parser_name=self.name,
                 confidence=confidence,
-                service=_json_text(_pick(flat, self.service_aliases)),
-                instance=_json_text(_pick(flat, ("service.instance.id", "instance", "pod_name", "kubernetes.pod.name"))),
-                thread=_json_text(_pick(flat, ("thread", "thread_name", "thread.name"))) or str((inner or {}).get("thread") or ""),
-                logger=_json_text(_pick(flat, ("logger", "logger_name", "log.logger"))) or str((inner or {}).get("logger") or ""),
-                process_id=_json_text(_pick(flat, ("process.pid", "pid"))) or str((inner or {}).get("process_id") or ""),
-                host=_json_text(_pick(flat, ("host.name", "hostname", "host"))),
-                namespace=_json_text(_pick(flat, ("kubernetes.namespace", "kubernetes.namespace_name", "namespace"))),
-                container=_json_text(_pick(flat, ("container.name", "container", "kubernetes.container.name"))),
+                service=_json_text(pick(flat, self.service_aliases)),
+                instance=_json_text(pick(flat, self.instance_aliases)),
+                thread=_json_text(pick(flat, self.thread_aliases)) or str((inner or {}).get("thread") or ""),
+                logger=_json_text(pick(flat, self.logger_aliases)) or str((inner or {}).get("logger") or ""),
+                process_id=_json_text(pick(flat, self.pid_aliases)) or str((inner or {}).get("process_id") or ""),
+                host=_json_text(pick(flat, self.host_aliases)),
+                namespace=_json_text(pick(flat, self.namespace_aliases)),
+                container=_json_text(pick(flat, self.container_aliases)),
                 attributes=payload,
                 raw_block=line,
-                trace_id_hint=_json_text(_pick(flat, ("trace.id", "trace_id", "traceid"))),
-                span_id_hint=_json_text(_pick(flat, ("span.id", "span_id", "spanid"))),
-                request_id_hint=_json_text(_pick(flat, ("request.id", "request_id", "requestid", "correlation_id"))),
+                trace_id_hint=_json_text(pick(flat, self.trace_aliases)),
+                span_id_hint=_json_text(pick(flat, self.span_aliases)),
+                request_id_hint=_json_text(pick(flat, self.request_aliases)),
             ))
         return result
 

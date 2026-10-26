@@ -50,6 +50,15 @@ INFRASTRUCTURE_FAULT_MODES: frozenset[str] = frozenset(
 # (e.g. root_service_candidate = "Physical-Host-01").
 ANCHOR_FALLBACK_KINDS: frozenset[str] = frozenset({"Host", "Instance", "VM"})
 
+# Fixed confidence values mapped from evidence-driven status.  These are
+# deliberately coarse (not a continuous probability) so the number never
+# masquerades as a statistical estimate.
+_STATUS_CONFIDENCE: dict[str, float] = {
+    "probable": 0.8,
+    "suspected": 0.5,
+    "weak": 0.3,
+}
+
 
 def _compact(value: Any, limit: int = 420) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -379,7 +388,8 @@ class RootCauseEngine:
         # ── Pre-populate self-fault candidates ──────────────────────────────
         # For faults that reside within the anchor service itself (JVM OOM, auth
         # token failure, open circuit-breaker) the SERVICE filter (match < 2)
-        # would otherwise exclude the anchor.  Inject it with a high score.
+        # would otherwise exclude the anchor.  Inject it with the strongest
+        # evidence level: the fault mode is an explicit self-fault signature.
         _SERVICE_INTERNAL_MODES = frozenset({"JVM_OOM", "AUTH_FAILURE", "CIRCUIT_BREAKER_OPEN"})
         if anchor and anchor in self.graph.nodes:
             _anchor_node_ref = self.graph.nodes[anchor]
@@ -390,7 +400,9 @@ class RootCauseEngine:
                             "node": _anchor_node_ref,
                             "signal": _sig,
                             "path": ([anchor], []),
-                            "score": min(_sig.base_score + 0.34, 0.90),
+                            "base_score": _sig.base_score,
+                            "evidence_level": 4,
+                            "match": 2,
                             "reasons": [
                                 f"故障特征匹配：{_sig.description}",
                                 f"{anchor} 自身触发 {_sig.fault_mode}，服务内部故障",
@@ -412,42 +424,39 @@ class RootCauseEngine:
                 if node.kind in self.SERVICE_KINDS and match < 2 and not direct_endpoint:
                     continue
                 depth = len(path[1]) if path else 99
-                score = signal.base_score
                 reasons = [f"故障特征匹配：{signal.description}"]
                 if match >= 2:
-                    score += 0.16
                     reasons.append("节点名称/别名/描述与依赖类型直接匹配")
                 elif match == 1:
-                    score += 0.04
                     reasons.append("节点类型与所在依赖路径匹配")
                 if node.kind in signal.resource_kinds:
-                    score += 0.08
+                    reasons.append("节点类型与故障特征匹配")
                 if path:
-                    topology_score = max(0.05, 0.18 - max(depth - 1, 0) * 0.025)
-                    score += topology_score
                     reasons.append(f"从 {anchor} 沿依赖边 {depth} 跳可达")
                 if direct_endpoint:
-                    score += 0.27
                     reasons.append(f"日志目标 {direct_endpoint} 与节点标识直接匹配")
-                if node.kind == "Cluster":
-                    score += 0.03
-                if node.kind in {"Instance", "Host", "Pod"} and not direct_endpoint:
-                    # Infrastructure-level fault modes originate at Host/Pod layer;
-                    # do NOT penalise these candidates.  For other fault types apply
-                    # a reduced penalty (was -0.20) to still favour explicit evidence.
-                    if signal.fault_mode not in INFRASTRUCTURE_FAULT_MODES and not anchor_is_infra:
-                        score -= 0.15
-                        reasons.append("缺少与该实例直接匹配的端点标识，轻微降权")
-                # Small boost for the directly-reported anchor node.
-                if node.name == anchor and path is not None:
-                    score += 0.04
-                    reasons.append("候选即为故障锚点节点（直接命名的根故障组件）")
+                # Evidence level: deterministic ordering signal derived from
+                # evidence strength, not a weighted heuristic score.
+                #   4 = exact endpoint hit (strongest, uniquely identifies the node)
+                #   3 = node name/alias matches the resource signature
+                #   2 = node type on the dependency path
+                #   1 = reachable on the dependency path only (weakest)
+                if direct_endpoint:
+                    evidence_level = 4
+                elif match >= 2:
+                    evidence_level = 3
+                elif match == 1:
+                    evidence_level = 2
+                else:
+                    evidence_level = 1
                 candidates.append(
                     {
                         "node": node,
                         "signal": signal,
                         "path": path,
-                        "score": max(0.05, min(score, 0.98)),
+                        "base_score": signal.base_score,
+                        "evidence_level": evidence_level,
+                        "match": match,
                         "reasons": reasons,
                         "direct_endpoint": direct_endpoint,
                     }
@@ -469,25 +478,33 @@ class RootCauseEngine:
                 ep = next(iter(sorted(endpoints)))
                 fb["node"] = ArchitectureNode(name=f"未知组件@{ep}", kind="UnresolvedDependency")
                 fb["architecture_node"] = False
-                fb["score"] = min(signals[0].base_score + 0.05, 0.38)
+                fb["base_score"] = signals[0].base_score
+                fb["evidence_level"] = 1
+                fb["match"] = 0
                 fb.setdefault("reasons", []).append(
                     f"日志命中端点 {ep}，但架构图缺少对应节点，请补充拓扑"
                 )
             candidates.append(fb)
 
-        candidates.sort(key=lambda item: (-item["score"], item["node"].name))
+        candidates.sort(
+            key=lambda item: (
+                -item["evidence_level"],
+                -item["base_score"],
+                item["node"].name,
+            )
+        )
         hypotheses: list[RootCauseHypothesis] = []
         for rank, item in enumerate(candidates[: max(1, top_k)], start=1):
             hypotheses.append(self._hypothesis(rank, item, anchor, detail, endpoints))
 
         top = hypotheses[0] if hypotheses else None
-        limitations = ["confidence 是可解释启发式评分，不是统计概率。"]
+        limitations = ["confidence 为证据等级映射的固定值，不是统计概率。"]
         if top and top.missing_evidence:
             limitations.extend(top.missing_evidence)
         if top:
             decision = (
                 f"当前首选根因假设：{top.candidate} / {top.fault_mode}，"
-                f"评分 {top.confidence:.2f}；链路：{' -> '.join(top.chain)}。"
+                f"证据等级 {top.status}；链路：{' -> '.join(top.chain)}。"
             )
         else:
             decision = "没有形成可用根因假设，请补充架构依赖和结构化错误证据。"
@@ -810,12 +827,14 @@ class RootCauseEngine:
         for item in candidates:
             name = item["node"].name
             counts[name] = counts.get(name, 0) + 1
-            if name not in best or item["score"] > best[name]["score"]:
+            if name not in best or item["evidence_level"] > best[name]["evidence_level"]:
                 best[name] = item
         for name, item in best.items():
-            corroboration = min(max(counts[name] - 1, 0) * 0.03, 0.09)
-            if corroboration:
-                item["score"] = min(item["score"] + corroboration, 0.98)
+            if counts[name] > 1:
+                # Multiple independent fault signals point at this node: raise the
+                # evidence level by one tier as corroboration, without inventing a
+                # weighted numeric score.
+                item["evidence_level"] = min(item["evidence_level"] + 1, 3)
                 item["reasons"].append(f"{counts[name]} 类独立故障特征共同指向该节点")
         return list(best.values())
 
@@ -838,7 +857,9 @@ class RootCauseEngine:
             "node": node,
             "signal": signal,
             "path": ([anchor], []) if anchor else None,
-            "score": min(signal.base_score + 0.12, 0.45),
+            "base_score": signal.base_score,
+            "evidence_level": 0,
+            "match": 0,
             "reasons": ["图谱中没有找到与故障特征匹配的依赖节点，暂时保留日志侧候选"],
             "direct_endpoint": "",
             "architecture_node": architecture_node,
@@ -878,8 +899,23 @@ class RootCauseEngine:
         if item.get("fallback"):
             missing.append("请在架构图中补充服务到 Redis/数据库/中间件的 DEPENDS_ON 边及实例拓扑。")
 
-        score = round(float(item["score"]), 3)
-        status = "probable" if score >= 0.75 else "suspected" if score >= 0.50 else "weak"
+        # ── Evidence-driven grading (replaces the weighted heuristic score) ──
+        # Status is derived from evidence strength, not a numeric score:
+        #   probable  → exact endpoint hit (level 4) or explicit self-fault signature
+        #   suspected → name/type match on the dependency path (level 3/2/1)
+        #   weak      → fallback candidate (level 0)
+        # Timeout-only signals never reach `probable`: a timeout cannot by
+        # itself prove a node is down.
+        evidence_level = int(item.get("evidence_level", 0))
+        if item.get("fallback") or evidence_level <= 0:
+            status = "weak"
+        elif signal.timeout_only:
+            status = "suspected"
+        elif evidence_level >= 4:
+            status = "probable"
+        else:
+            status = "suspected"
+        confidence = _STATUS_CONFIDENCE[status]
         summary = f"{node.name} 可能发生{signal.description}"
         if len(chain) > 1:
             summary += f"，故障可能沿 {' -> '.join(chain)} 传播"
@@ -898,7 +934,7 @@ class RootCauseEngine:
             candidate=node.name,
             candidate_kind=node.kind,
             fault_mode=signal.fault_mode,
-            confidence=score,
+            confidence=confidence,
             status=status,
             summary=summary,
             chain=chain,

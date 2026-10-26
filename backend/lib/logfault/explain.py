@@ -7,6 +7,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+try:
+    from .llm_classify import classify_event
+except Exception:  # pragma: no cover - 独立包内相对导入失败时保持可运行
+    classify_event = None
+
 
 ATOMIC_ROOT_KEYWORDS = (
     "rediscommandtimeoutexception",
@@ -52,6 +57,8 @@ UPSTREAM_KEYWORDS = WRAPPER_PROPAGATION_KEYWORDS
 
 ERROR_LEVELS = {"ERROR", "FATAL"}
 TECHNICAL_FAULT_FAMILIES = {"redis", "database", "network", "timeout", "classloading", "memory", "disk", "hardware", "mq"}
+# 参与根因文本匹配的字段，顺序即拼接顺序，全量/流式两条链路共用
+EVENT_TEXT_KEYS = ("message", "semantic_message", "root_cause", "raw_block")
 
 
 INCIDENT_COLUMNS = [
@@ -97,21 +104,36 @@ def _event_text(row: pd.Series | dict[str, Any]) -> str:
     getter = row.get
     return " ".join(
         _string(getter(key, ""))
-        for key in ("message", "semantic_message", "root_cause", "raw_block")
+        for key in EVENT_TEXT_KEYS
     ).lower()
 
 
-def _is_wrapper_error(row: pd.Series | dict[str, Any]) -> bool:
+def _has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    """判断文本是否命中任一关键词。
+
+    单独抽出来是为了强制「先算一次文本、多处复用」。原写法把 ``_event_text(row)``
+    写在 ``any(...)`` 的生成器里，一条事件会被拼装并小写 20 多次。
+    """
+    for keyword in keywords:
+        if keyword in text:
+            return True
+    return False
+
+
+def _is_wrapper_error(row: pd.Series | dict[str, Any], text: str | None = None) -> bool:
     class_name = _string(row.get("root_exception_class") or row.get("exception_class")).lower()
-    text = f"{class_name} {_event_text(row)}"
     if "downstreamserviceexception" in class_name or "gateway" in class_name or "proxyfilter" in class_name:
         return True
-    return any(keyword in text for keyword in WRAPPER_PROPAGATION_KEYWORDS)
+    if text is None:
+        text = _event_text(row)
+    return _has_keyword(f"{class_name} {text}", WRAPPER_PROPAGATION_KEYWORDS)
 
 
-def _fault_family(row: pd.Series | dict[str, Any]) -> str:
+def _fault_family(row: pd.Series | dict[str, Any], text: str | None = None) -> str:
     class_name = _string(row.get("root_exception_class") or row.get("exception_class")).lower()
-    text = f"{class_name} {_event_text(row)}"
+    if text is None:
+        text = _event_text(row)
+    text = f"{class_name} {text}"
     if any(token in text for token in ("outofmemory", "heap space", "metaspace", "gc overhead")):
         return "memory"
     if any(token in text for token in ("read-only file system", "ioexception", "disk")):
@@ -137,15 +159,21 @@ def _fault_family(row: pd.Series | dict[str, Any]) -> str:
     return class_name or "unknown"
 
 
-def _is_technical_error(row: pd.Series | dict[str, Any]) -> bool:
+def _is_technical_error(row: pd.Series | dict[str, Any], text: str | None = None) -> bool:
     """Return True for errors that normally represent a system/infrastructure fault."""
     level = _string(row.get("level")).upper()
     if level not in ERROR_LEVELS:
         return False
-    family = _fault_family(row)
-    if family in TECHNICAL_FAULT_FAMILIES:
+    # 开启 LLM 分类时优先用语义判断，失败/未开启则回退关键词。
+    if classify_event is not None:
+        llm = classify_event(row)
+        if llm is not None and llm.get("fault_family") not in (None, "", "unknown"):
+            return llm["fault_family"] in TECHNICAL_FAULT_FAMILIES
+    if text is None:
+        text = _event_text(row)
+    if _fault_family(row, text) in TECHNICAL_FAULT_FAMILIES:
         return True
-    return any(keyword in _event_text(row) for keyword in ATOMIC_ROOT_KEYWORDS)
+    return _has_keyword(text, ATOMIC_ROOT_KEYWORDS)
 
 
 def _prepare_window_event_index(
@@ -189,14 +217,20 @@ def _prepare_window_event_index(
     else:
         levels = sorted_events["level"].fillna("").astype(str).str.upper()
         error_flags = levels.isin(ERROR_LEVELS).to_numpy(dtype=np.int64)
-        technical_flags = sorted_events.apply(
-            _is_technical_error,
-            axis=1,
-        ).to_numpy(dtype=np.int64)
-        root_signal_flags = sorted_events.apply(
-            lambda event: any(keyword in _event_text(event) for keyword in ROOT_KEYWORDS),
-            axis=1,
-        ).to_numpy(dtype=np.int64)
+        # 文本每条事件只拼一次，再供技术故障判定与根因信号判定复用。
+        # 原实现把 _event_text 写在 any(...) 的生成器里，单条事件要拼 23 遍。
+        records = sorted_events.to_dict("records")
+        texts = [_event_text(record) for record in records]
+        technical_flags = np.fromiter(
+            (int(_is_technical_error(record, text)) for record, text in zip(records, texts)),
+            dtype=np.int64,
+            count=len(records),
+        )
+        root_signal_flags = np.fromiter(
+            (int(_has_keyword(text, ROOT_KEYWORDS)) for text in texts),
+            dtype=np.int64,
+            count=len(records),
+        )
 
     def prefix_sum(flags: np.ndarray) -> np.ndarray:
         return np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(flags, dtype=np.int64)))
@@ -355,8 +389,8 @@ def _candidate_score(
     elif _string(row.get("exception_class")):
         score += 2.0
 
-    is_atomic_root = any(keyword in text for keyword in ATOMIC_ROOT_KEYWORDS)
-    is_wrapper = _is_wrapper_error(row)
+    is_atomic_root = _has_keyword(text, ATOMIC_ROOT_KEYWORDS)
+    is_wrapper = _is_wrapper_error(row, text)
 
     if is_atomic_root:
         score += 10.0
@@ -454,13 +488,14 @@ def _cluster_error_indices(error_events: pd.DataFrame, explain_config: dict) -> 
 
     for index, row in error_events.sort_values(["timestamp", "source_file", "source_line"]).iterrows():
         timestamp = pd.Timestamp(row["timestamp"])
+        text = _event_text(row)
         trace_id = _string(row.get("trace_id"))
         service = _string(row.get("service"))
         downstream = _string(row.get("downstream_target"))
-        family = _fault_family(row)
+        family = _fault_family(row, text)
         exception_key = _string(row.get("root_exception_class")) or _string(row.get("exception_class")) or family
-        is_wrapper = _is_wrapper_error(row)
-        is_atomic = any(k in _event_text(row) for k in ATOMIC_ROOT_KEYWORDS)
+        is_wrapper = _is_wrapper_error(row, text)
+        is_atomic = _has_keyword(text, ATOMIC_ROOT_KEYWORDS)
 
         selected: dict[str, Any] | None = None
         selected_score = -1

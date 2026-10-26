@@ -8,6 +8,11 @@ from typing import Any
 
 from .models import GraphEdge, GraphNode, GraphResponse
 
+try:  # 主线 B：LLM 结构化抽取（可开关，失败自动回退关键词）。
+    from . import llm_log_extractor as _llm_extract
+except Exception:  # pragma: no cover
+    _llm_extract = None
+
 
 # These edges point from a consumer/caller to the component it depends on.  A
 # failure therefore propagates in the reverse direction of the stored edge.
@@ -175,6 +180,9 @@ class RootCauseAnalysis:
     hypotheses: list[RootCauseHypothesis]
     decision: str
     limitations: list[str]
+    # trace_id 因果锚（A1）：同 trace 的报错服务序列（确定性关联证据）。
+    # 为空列表表示无主 trace 或同 trace 服务 <2。
+    trace_chain: list[dict[str, Any]] = field(default_factory=list)
 
     def model_dump(self) -> dict[str, Any]:
         data = asdict(self)
@@ -376,6 +384,12 @@ class RootCauseEngine:
         endpoints = self._endpoint_tokens(detail)
         candidates: list[dict[str, Any]] = []
 
+        # ── trace_id 因果锚（A1）───────────────────────────────────────────
+        # 有主 trace 时，同 trace 的报错服务天然同链（确定性关联）；作为独立的
+        # trace_chain 证据输出，与拓扑传播链（topology_guess）各司其职。
+        primary_trace = str(detail.get("primary_trace_id") or detail.get("trace_id") or "").strip()
+        trace_chain = self._trace_chain(detail, primary_trace) if primary_trace else []
+
         anchor_node = self.graph.nodes.get(anchor) if anchor else None
         anchor_is_infra = anchor_node is not None and anchor_node.kind in ANCHOR_FALLBACK_KINDS
         # Infrastructure anchors (Host/Instance): traverse backwards to all hosted
@@ -516,9 +530,16 @@ class RootCauseEngine:
             hypotheses=hypotheses,
             decision=decision,
             limitations=list(dict.fromkeys(limitations)),
+            trace_chain=trace_chain,
         )
 
     def _signals(self, detail: dict[str, Any]) -> list[FaultSignal]:  # noqa: C901
+        # ── 主线 B：LLM 结构化抽取（增强，失败自动回退关键词）───────────────
+        # 抽取成功且非空时直接采用，替代下方整套关键词 if/elif 枚举。
+        llm_signals = self._signals_via_llm(detail)
+        if llm_signals:
+            return llm_signals
+
         evidence_parts = [
             detail.get("root_cause_candidate"),
             detail.get("root_evidence"),
@@ -759,6 +780,104 @@ class RootCauseEngine:
                 )
             )
         return signals
+
+    def _signals_via_llm(self, detail: dict[str, Any]) -> list[FaultSignal]:
+        """主线 B：用 LLM 结构化抽取构造 FaultSignal，替代关键词枚举。
+
+        抽取失败、开关关闭、结果非法时返回空列表，调用方回退 `_signals` 的关键词逻辑。
+        LLM 抽取的 resource.matched_node_id 已对齐图节点，这里只需把它翻译成
+        FaultSignal 的 resource_tokens / resource_kinds，供后续 `_resource_match`
+        与 `_endpoint_matches` 复用，保证证据分级（evidence_level）逻辑不变。
+        """
+        if _llm_extract is None:
+            return []
+        extracted = _llm_extract.extract_event(detail, self._raw_graph_nodes())
+        if not extracted:
+            return []
+        fault = extracted.get("fault") or {}
+        resource = extracted.get("resource") or {}
+        mode = str(fault.get("type") or "").strip().upper()
+        if not mode:
+            return []
+
+        evidence = str(fault.get("evidence") or "").strip() or _compact(
+            " | ".join(
+                str(item) for item in (
+                    detail.get("root_cause_candidate"),
+                    detail.get("root_evidence"),
+                ) if item
+            ),
+            900,
+        )
+        matched_node = str(resource.get("matched_node_id") or "").strip()
+        resource_instance = str(resource.get("instance") or "").strip()
+
+        # resource_tokens：优先用对齐后的图节点名，其次用日志里的实例名，
+        # 让 `_resource_match` 的 own/context 命中能命中对应节点。
+        resource_tokens: tuple[str, ...] = tuple(
+            dict.fromkeys(token.lower() for token in (matched_node, resource_instance) if token)
+        )
+        resource_kinds = _llm_extract.fault_resource_kinds(mode)
+
+        description = {
+            "JVM_OOM": "JVM 堆内存溢出 (OOM)",
+            "REDIS_UNREACHABLE": "Redis 连接不可达/被拒绝",
+            "REDIS_TIMEOUT": "Redis 命令执行超时",
+            "DB_POOL_EXHAUSTED": "数据库连接池耗尽 (HikariCP)",
+            "DB_DEADLOCK": "数据库事务死锁",
+            "DB_LOCK_TIMEOUT": "数据库行/表锁等待超时",
+            "DATABASE_UNREACHABLE": "数据库连接不可达",
+            "DATABASE_FAILURE": "数据库连接或查询失败",
+            "MESSAGE_BROKER_FAILURE": "消息中间件连接或处理失败",
+            "DISK_IO_FAILURE": "磁盘 I/O 故障或文件系统只读",
+            "CPU_OVERLOAD": "宿主机 CPU 过载/线程争用高延迟",
+            "NETWORK_FAILURE": "物理网络/宿主机硬件故障",
+            "AUTH_FAILURE": "鉴权失败/Token 失效 (HTTP 401)",
+            "CIRCUIT_BREAKER_OPEN": "熔断器打开，下游依赖不可用",
+            "DEPENDENCY_FAILURE": "通用依赖连接/超时故障",
+            "APPLICATION_ERROR": "应用异常，尚未识别到特定依赖类型",
+        }.get(mode, "LLM 抽取的依赖故障")
+        base_score = {
+            "JVM_OOM": 0.44,
+            "REDIS_UNREACHABLE": 0.46,
+            "REDIS_TIMEOUT": 0.30,
+            "DB_POOL_EXHAUSTED": 0.42,
+            "DB_DEADLOCK": 0.48,
+            "DB_LOCK_TIMEOUT": 0.44,
+            "DATABASE_UNREACHABLE": 0.38,
+            "DATABASE_FAILURE": 0.38,
+            "MESSAGE_BROKER_FAILURE": 0.40,
+            "DISK_IO_FAILURE": 0.46,
+            "CPU_OVERLOAD": 0.42,
+            "NETWORK_FAILURE": 0.48,
+            "AUTH_FAILURE": 0.40,
+            "CIRCUIT_BREAKER_OPEN": 0.30,
+            "DEPENDENCY_FAILURE": 0.22,
+            "APPLICATION_ERROR": 0.18,
+        }.get(mode, 0.20)
+
+        return [
+            FaultSignal(
+                mode,
+                resource_tokens,
+                resource_kinds,
+                base_score,
+                description,
+                evidence,
+                timeout_only=_llm_extract.fault_timeout_only(mode),
+            )
+        ]
+
+    def _raw_graph_nodes(self) -> list[Any]:
+        """把 ArchitectureSnapshot 的节点还原成 llm_log_extractor 可消费的 dict 列表。"""
+        return [
+            {
+                "name": node.name,
+                "kind": node.kind,
+                "meta": node.meta,
+            }
+            for node in self.graph.nodes.values()
+        ]
 
     def _resource_match(
         self,
@@ -1203,10 +1322,57 @@ class RootCauseEngine:
                     "source": names[index],
                     "target": names[index - 1],
                     "relation": "FAULT_PROPAGATES_TO",
-                    "basis": f"reverse_of:{stored_relation}",
+                    "basis": "topology_guess",
+                    "reverse_of": stored_relation,
                 }
             )
         return causal_names, steps
+
+    def _trace_chain(self, detail: dict[str, Any], trace_id: str) -> list[dict[str, str]]:
+        """从 timeline 中筛出同 trace 的事件，按时间排序得到「服务序列」链路。
+
+        这是 trace_id 因果锚（确定性关联）：同一 trace_id 的多个服务报错
+        天然属于同一条故障链路，不再靠「图遍历 + 关键词」猜测是否相关。
+
+        返回 steps 列表（相邻服务按时间顺序，relation=TRACE_PARENT_OF，basis=trace_id）；
+        无法形成有效链（<2 个服务）时返回空列表。
+        """
+        events = [
+            event
+            for event in detail.get("timeline") or []
+            if isinstance(event, dict) and str(event.get("trace_id") or "") == trace_id
+        ]
+        if not events:
+            return []
+
+        def _time(event: dict[str, Any]) -> str:
+            return str(event.get("timestamp") or event.get("time") or event.get("detected_at") or "")
+
+        ordered = sorted(events, key=_time)
+
+        # 顺序去重并对齐到图节点：连续同服务的重复事件只保留一次。
+        names: list[str] = []
+        for event in ordered:
+            raw = str(event.get("service") or "").strip()
+            if not raw:
+                continue
+            resolved = self.graph.resolve(raw, self.SERVICE_KINDS) or self.graph.resolve(raw)
+            name = resolved or raw
+            if not names or names[-1] != name:
+                names.append(name)
+
+        if len(names) < 2:
+            return []
+
+        return [
+            {
+                "source": names[index],
+                "target": names[index + 1],
+                "relation": "TRACE_PARENT_OF",
+                "basis": "trace_id",
+            }
+            for index in range(len(names) - 1)
+        ]
 
     def _upstream_extension(self, anchor: str, detail: dict[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
         if not anchor:

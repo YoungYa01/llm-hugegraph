@@ -163,6 +163,16 @@ class Settings:
     rca_prompt_architecture_max_seeds: int = _int_env("RCA_PROMPT_ARCHITECTURE_MAX_SEEDS", 3)
     rca_prompt_max_hypotheses: int = _int_env("RCA_PROMPT_MAX_HYPOTHESES", 3)
 
+    # LLM 结构化日志抽取（主线 B）。默认关闭；开启后命中模板缓存不调 LLM，
+    # 失败自动回退关键词。字段与 app/llm_log_extractor.py 读的环境变量一致。
+    llm_extract_enabled: bool = _bool_env("LLM_EXTRACT_ENABLED", False)
+    llm_extract_model: str = _env("LLM_EXTRACT_MODEL", "")
+    llm_extract_max_tokens: int = _int_env("LLM_EXTRACT_MAX_TOKENS", 512)
+    llm_extract_timeout_seconds: int = _int_env("LLM_EXTRACT_TIMEOUT_SECONDS", 30)
+    llm_extract_cache_ttl_seconds: int = _int_env("LLM_EXTRACT_CACHE_TTL_SECONDS", 3600)
+    llm_extract_negative_ttl_seconds: int = _int_env("LLM_EXTRACT_NEGATIVE_TTL_SECONDS", 60)
+    llm_extract_cache_max_entries: int = _int_env("LLM_EXTRACT_CACHE_MAX_ENTRIES", 4096)
+
     @property
     def llm_openai_base_url(self) -> str:
         return normalize_openai_base_url(self.llm_base_url)
